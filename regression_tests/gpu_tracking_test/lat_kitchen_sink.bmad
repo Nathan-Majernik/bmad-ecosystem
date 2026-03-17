@@ -17,8 +17,8 @@ parameter[geometry] = open
 d_plain: drift, L = 0.5
 q_plain: quadrupole, L = 0.3, k1 = 2.0
 d_aper: drift, L = 0.3,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 qd1: quadrupole, L = 0.3, k1 = -2.0
 
 ! --- Section 2: Quads with features ---
@@ -39,16 +39,16 @@ q_elec: quadrupole, L = 0.3, k1 = -1.5,
 
 d5: drift, L = 0.2
 q_aper: quadrupole, L = 0.3, k1 = 1.5,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 d6: drift, L = 0.2
 q_combo: quadrupole, L = 0.3, k1 = -1.5,
     x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
     fringe_type = full,
     b2 = 0.1, a2 = 0.01,
     a0_elec = 200, b1_elec = 80,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 
 ! --- Section 4: Bends (weak, to avoid blowup) ---
 
@@ -79,23 +79,23 @@ d8: drift, L = 0.2
 p_plain: pipe, L = 0.5
 p_misalign: pipe, L = 0.5, x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005
 p_aper: pipe, L = 0.5,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 p_combo: pipe, L = 0.5,
     x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 
 ! --- Section 7: Elliptical apertures ---
 
 d9: drift, L = 0.2
 d_ellip: drift, L = 0.3, aperture_type = elliptical,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 qf_end: quadrupole, L = 0.3, k1 = 1.5
 q_ellip: quadrupole, L = 0.3, k1 = -1.5, aperture_type = elliptical,
-    x1_limit = 5e-3, x2_limit = 5e-3,
-    y1_limit = 5e-3, y2_limit = 5e-3
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
 
 d_final: drift, L = 0.3
 
