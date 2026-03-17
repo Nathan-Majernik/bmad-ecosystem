@@ -1446,16 +1446,59 @@ endif
 ! Mesh Space charge kick
 
 if (ele%space_charge_method == fft_3d$) then
+
+  dct_ave = sum(particle%vec(5)/particle%beta, particle%state == alive$) / count(particle%state == alive$)
+
+#ifdef USE_GPU_TRACKING
+  ! GPU path: particle data must be uploaded, SC computed on device, then downloaded
+  if (bmad_com%gpu_tracking_on) then
+    block
+    use gpu_tracking_mod, only: gpu_upload_particles, gpu_download_particles, gpu_space_charge_3d
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+    real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:), charge_a(:)
+    integer(C_INT), allocatable :: state_a(:)
+    integer(C_INT) :: np
+    real(rp) :: mc2_val
+
+    np = size(particle)
+    allocate(vx(np), vpx(np), vy(np), vpy(np), vz(np), vpz(np))
+    allocate(state_a(np), beta_a(np), p0c_a(np), t_a(np), charge_a(np))
+
+    do i = 1, np
+      vx(i) = particle(i)%vec(1); vpx(i) = particle(i)%vec(2)
+      vy(i) = particle(i)%vec(3); vpy(i) = particle(i)%vec(4)
+      vz(i) = particle(i)%vec(5); vpz(i) = particle(i)%vec(6)
+      state_a(i) = particle(i)%state; beta_a(i) = particle(i)%beta
+      p0c_a(i) = particle(i)%p0c; t_a(i) = particle(i)%t
+      charge_a(i) = particle(i)%charge
+    enddo
+
+    mc2_val = mass_of(particle(1)%species)
+
+    call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np)
+    call gpu_space_charge_3d(charge_a, np, &
+        int(csr%mesh3d%nhi(1), C_INT), int(csr%mesh3d%nhi(2), C_INT), int(csr%mesh3d%nhi(3), C_INT), &
+        csr%mesh3d%gamma, csr%actual_track_step, mc2_val, dct_ave)
+    call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np, 1, 0)
+
+    do i = 1, np
+      particle(i)%vec(1) = vx(i); particle(i)%vec(2) = vpx(i)
+      particle(i)%vec(3) = vy(i); particle(i)%vec(4) = vpy(i)
+      particle(i)%vec(5) = vz(i); particle(i)%vec(6) = vpz(i)
+      particle(i)%state = state_a(i); particle(i)%beta = beta_a(i)
+    enddo
+
+    deallocate(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, charge_a)
+    end block
+  else
+#endif
+
   if (.not. allocated(csr%position)) allocate(csr%position(size(particle)))
   if (size(csr%position) < size(particle)) then
     deallocate(csr%position)
     allocate(csr%position(size(particle)))
   endif
-
-  ! Do the calculation with respect to the average of (time - time_ref) so that adding a constant time offset
-  ! will not affect the calculation.
-
-  dct_ave = sum(particle%vec(5)/particle%beta, particle%state == alive$) / count(particle%state == alive$)
 
   n = 0
   do i = 1, size(particle)
@@ -1467,26 +1510,28 @@ if (ele%space_charge_method == fft_3d$) then
   enddo
 
   call deposit_particles (csr%position(1:n)%r(1), csr%position(1:n)%r(2), csr%position(1:n)%r(3), csr%mesh3d, qa=csr%position(1:n)%charge)
-  ! OLD ROUTINE: call space_charge_freespace(csr%mesh3d)
   call space_charge_3d(csr%mesh3d)
-   
+
   do i = 1, size(particle)
     p => particle(i)
     if (p%state /= alive$) cycle
     call interpolate_field(p%vec(1), p%vec(3), p%vec(5)-dct_ave*p%beta,  csr%mesh3d, E=Evec)
-    factor = csr%actual_track_step / (p%p0c  * p%beta) 
-    pz0 = sqrt( (1.0_rp + p%vec(6))**2 - p%vec(2)**2 - p%vec(4)**2 ) ! * p0 
-    ! Considering magnetic field also, effectively reduces this force by 1/gamma^2
+    factor = csr%actual_track_step / (p%p0c  * p%beta)
+    pz0 = sqrt( (1.0_rp + p%vec(6))**2 - p%vec(2)**2 - p%vec(4)**2 )
     p%vec(2) = p%vec(2) + Evec(1)*factor / csr%mesh3d%gamma**2
     p%vec(4) = p%vec(4) + Evec(2)*factor / csr%mesh3d%gamma**2
     ef = Evec(3) * factor
-    dpz = sqrt_alpha(1 + p%vec(6), ef*ef + 2 * ef * pz0)  ! = sqrt((ef + pz0)^2 + p%vec(2)**2 + p%vec(4)**2) - (1 + p%vec(6))
+    dpz = sqrt_alpha(1 + p%vec(6), ef*ef + 2 * ef * pz0)
     p%vec(6) = p%vec(6) + dpz
-    ! Set beta
     call convert_pc_to (p%p0c * (1 + p%vec(6)), p%species, beta = new_beta)
     p%vec(5) = p%vec(5) * new_beta / p%beta
     p%beta = new_beta
   enddo
+
+#ifdef USE_GPU_TRACKING
+  endif
+#endif
+
 endif
 
 end subroutine csr_and_sc_apply_kicks

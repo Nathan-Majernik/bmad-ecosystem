@@ -53,10 +53,11 @@
 /* --------------------------------------------------------------------------
  * Cached device buffers
  * -------------------------------------------------------------------------- */
-static double *d_vec[6]  = {NULL,NULL,NULL,NULL,NULL,NULL};
-static int    *d_state   = NULL;
-static double *d_beta    = NULL;
-static double *d_p0c     = NULL;
+/* These are non-static so gpu_spacecharge_kernels.cu can access them */
+double *d_vec[6]  = {NULL,NULL,NULL,NULL,NULL,NULL};
+int    *d_state   = NULL;
+double *d_beta    = NULL;
+double *d_p0c     = NULL;
 static double *d_s       = NULL;
 static double *d_t       = NULL;
 static int     d_cap     = 0;          /* allocated capacity (particles) */

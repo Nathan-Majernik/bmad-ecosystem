@@ -121,6 +121,14 @@ does not produce radiation). The entrance/exit radiation kicks run as separate
 CUDA kernels within the same device upload/download cycle to avoid extra
 host-device transfers.
 
+**Collective effects:** GPU tracking supports 3D FFT space charge
+(`space_charge_method = fft_3d`) and 1D CSR (`csr_method = 1_dim`).
+The 3D FFT solver uses cuFFT for the convolution, with GPU kernels for
+charge deposition (trilinear with atomicAdd), Green function computation,
+field interpolation, and kick application. CSR particle binning and
+kick application run on GPU while the bin-level kick calculation
+(involving iterative root-finding) remains on CPU.
+
 ```bash
 # Enable GPU tracking at runtime
 export ACC_ENABLE_GPU_TRACKING=Y

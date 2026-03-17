@@ -18,6 +18,8 @@ public :: check_entrance_aperture_for_gpu
 public :: gpu_rad_eligible
 public :: track_bunch_thru_elements_gpu
 public :: ele_gpu_can_stay_on_device
+public :: gpu_upload_particles, gpu_download_particles
+public :: gpu_space_charge_3d, gpu_csr_bin_particles, gpu_csr_apply_kicks
 
 ! Whether gpu_tracking_init has been called
 logical, save :: gpu_trk_initialized = .false.
@@ -237,6 +239,40 @@ interface
   subroutine gpu_orbit_check(n) bind(C, name='gpu_orbit_check_')
     use, intrinsic :: iso_c_binding
     integer(C_INT), value, intent(in) :: n
+  end subroutine
+
+  ! ----- Space charge and CSR GPU wrappers -----
+
+  subroutine gpu_space_charge_3d(h_charge, n_particles, &
+      nx, ny, nz, gamma, ds_step, mc2, dct_ave) bind(C, name='gpu_space_charge_3d_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: h_charge(*)
+    integer(C_INT), value, intent(in) :: n_particles, nx, ny, nz
+    real(C_DOUBLE), value, intent(in) :: gamma, ds_step, mc2, dct_ave
+  end subroutine
+
+  subroutine gpu_csr_bin_particles(h_charge, n_particles, &
+      h_bin_charge, h_bin_x0_wt, h_bin_y0_wt, h_bin_n_particle, &
+      z_min, dz_slice, dz_particle, &
+      n_bin, particle_bin_span) bind(C, name='gpu_csr_bin_particles_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: h_charge(*)
+    integer(C_INT), value, intent(in) :: n_particles
+    real(C_DOUBLE), intent(out) :: h_bin_charge(*), h_bin_x0_wt(*), h_bin_y0_wt(*), h_bin_n_particle(*)
+    real(C_DOUBLE), value, intent(in) :: z_min, dz_slice, dz_particle
+    integer(C_INT), value, intent(in) :: n_bin, particle_bin_span
+  end subroutine
+
+  subroutine gpu_csr_apply_kicks(h_kick_csr, h_kick_lsc, &
+      z_center_0, dz_slice, apply_csr, apply_lsc, &
+      n_bin, n_particles) bind(C, name='gpu_csr_apply_kicks_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: h_kick_csr(*), h_kick_lsc(*)
+    real(C_DOUBLE), value, intent(in) :: z_center_0, dz_slice
+    integer(C_INT), value, intent(in) :: apply_csr, apply_lsc, n_bin, n_particles
+  end subroutine
+
+  subroutine gpu_spacecharge_cleanup() bind(C, name='gpu_spacecharge_cleanup_')
   end subroutine
 
 end interface

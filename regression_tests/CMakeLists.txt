@@ -75,6 +75,7 @@ IF ("$ENV{ACC_ENABLE_GPU_TRACKING}" STREQUAL "Y")
     cmake_files/cmake.gpu_tracking_stress_test
     cmake_files/cmake.gpu_bend_benchmark
     cmake_files/cmake.gpu_rad_test
+    cmake_files/cmake.gpu_sc_test
   )
 ENDIF ()
 

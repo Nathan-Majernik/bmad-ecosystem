@@ -45,11 +45,12 @@ IF ("$ENV{ACC_ENABLE_GPU_TRACKING}" STREQUAL "Y")
       MESSAGE(STATUS "GPU tracking CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
       # Build CUDA kernels as a separate static library
       add_library(gpu_tracking_kernels STATIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/low_level/gpu_tracking_kernels.cu)
+        ${CMAKE_CURRENT_SOURCE_DIR}/low_level/gpu_tracking_kernels.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/low_level/gpu_spacecharge_kernels.cu)
       target_compile_definitions(gpu_tracking_kernels PRIVATE USE_GPU_TRACKING)
       set_target_properties(gpu_tracking_kernels PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
-      SET (GPU_TRACKING_LINK_LIBS gpu_tracking_kernels CUDA::cudart CUDA::curand)
+      SET (GPU_TRACKING_LINK_LIBS gpu_tracking_kernels CUDA::cudart CUDA::curand CUDA::cufft)
     ELSE ()
       MESSAGE(WARNING "ACC_ENABLE_GPU_TRACKING=Y but CUDAToolkit not found — GPU tracking disabled")
     ENDIF ()
