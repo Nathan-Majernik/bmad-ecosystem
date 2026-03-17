@@ -225,6 +225,13 @@ interface
     integer(C_INT), value, intent(in) :: fringe_type, edge, time_dir, n
   end subroutine
 
+  subroutine gpu_misalign_3d(h_W, Lx, Ly, Lz, set_flag, n) bind(C, name='gpu_misalign_3d_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: h_W(9)
+    real(C_DOUBLE), value, intent(in) :: Lx, Ly, Lz
+    integer(C_INT), value, intent(in) :: set_flag, n
+  end subroutine
+
   subroutine gpu_misalign(x_off, y_off, tilt, set_flag, n) bind(C, name='gpu_misalign_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: x_off, y_off, tilt
@@ -455,6 +462,68 @@ call gpu_rad_kick(n, stoc_flat, damp_flat, xfer_vec, ref, &
                    bmad_com%synch_rad_scale, i_damp, i_fluct, i_zero_avg)
 
 end subroutine call_gpu_rad_kick
+
+!------------------------------------------------------------------------
+! precompute_misalign_W — compute 3x3 rotation matrix and offset for
+! an element's misalignment by probing offset_particle.
+!
+! Creates 3 test particles at unit offsets, applies offset_particle,
+! and extracts the affine transformation matrix W and offset L.
+!------------------------------------------------------------------------
+subroutine precompute_misalign_W(ele, set_or_unset, W, Lx, Ly, Lz)
+
+use, intrinsic :: iso_c_binding
+
+type (ele_struct), intent(in) :: ele
+logical,           intent(in) :: set_or_unset
+real(C_DOUBLE),    intent(out) :: W(3,3), Lx, Ly, Lz
+
+type (coord_struct) :: orb0, orb_dx, orb_dy, orb_dpx
+real(rp) :: eps
+integer :: edge
+
+eps = 1d-8
+
+! Choose the edge based on set/unset
+if (set_or_unset .eqv. set$) then
+  edge = upstream_end$
+else
+  edge = downstream_end$
+endif
+
+! Create base particle at on-axis orbit
+call init_coord(orb0, ele, edge)
+orb0%vec = 0; orb0%vec(6) = 0
+call offset_particle(ele, set_or_unset, orb0, set_hvkicks = .false.)
+Lx = orb0%vec(1)
+Ly = orb0%vec(3)
+Lz = 0
+
+! Probe x direction
+call init_coord(orb_dx, ele, edge)
+orb_dx%vec = 0; orb_dx%vec(1) = eps
+call offset_particle(ele, set_or_unset, orb_dx, set_hvkicks = .false.)
+W(1,1) = (orb_dx%vec(1) - Lx) / eps
+W(2,1) = (orb_dx%vec(3) - Ly) / eps
+W(3,1) = 0
+
+! Probe y direction
+call init_coord(orb_dy, ele, edge)
+orb_dy%vec = 0; orb_dy%vec(3) = eps
+call offset_particle(ele, set_or_unset, orb_dy, set_hvkicks = .false.)
+W(1,2) = (orb_dy%vec(1) - Lx) / eps
+W(2,2) = (orb_dy%vec(3) - Ly) / eps
+W(3,2) = 0
+
+! Probe px direction (momentum column)
+call init_coord(orb_dpx, ele, edge)
+orb_dpx%vec = 0; orb_dpx%vec(2) = eps
+call offset_particle(ele, set_or_unset, orb_dpx, set_hvkicks = .false.)
+W(1,3) = (orb_dpx%vec(2) - orb0%vec(2)) / eps
+W(2,3) = (orb_dpx%vec(4) - orb0%vec(4)) / eps
+W(3,3) = 1
+
+end subroutine precompute_misalign_W
 
 !------------------------------------------------------------------------
 ! bunch_to_soa — extract particle data from AoS bunch to SoA arrays
@@ -1405,7 +1474,7 @@ function ele_gpu_can_stay_on_device(ele) result (can_stay)
 type (ele_struct), intent(in) :: ele
 logical :: can_stay
 type (fringe_field_info_struct) :: fringe_info
-logical :: has_fringe_needs_cpu, has_complex_misalign
+logical :: has_fringe_needs_cpu
 
 can_stay = .false.
 if (.not. ele_gpu_eligible(ele)) return
@@ -1423,20 +1492,12 @@ if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$) then
   ! No multipoles: can stay on device as drift
 endif
 
-! Check for complex misalignment (pitches, z_offset, or bend misalignment)
-has_complex_misalign = .false.
+! Simple misalignment (x_offset, y_offset, tilt/ref_tilt) handled on GPU
+! for all element types including bends. Pitches and z_offset still need CPU.
 if (ele%bookkeeping_state%has_misalign) then
-  ! Bends with misalignment need curvature-aware offset_particle
-  if (ele%key == sbend$) then
-    has_complex_misalign = .true.
-  endif
-  ! Pitches or z_offset require full offset_particle
   if (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
-      ele%value(z_offset_tot$) /= 0) then
-    has_complex_misalign = .true.
-  endif
+      ele%value(z_offset_tot$) /= 0) return
 endif
-if (has_complex_misalign) return
 
 ! Check for fringe that requires CPU
 has_fringe_needs_cpu = .false.
@@ -1496,6 +1557,7 @@ integer :: ie, j
 type (ele_struct), pointer :: ele
 logical :: on_device, did_track, apply_rad
 logical :: has_misalign, can_stay
+real(C_DOUBLE) :: misalign_W(3,3), misalign_Lx, misalign_Ly, misalign_Lz
 
 ! Persistent host SoA buffers (reused across elements)
 real(C_DOUBLE), allocatable, save :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
@@ -1584,11 +1646,17 @@ do ie = ix_start, ix_end
     ! Entrance aperture check on device (before misalignment, in lab frame)
     call dispatch_aperture_on_device(ele, n, entrance_end$)
 
-    ! Misalignment on device (simple: offset + tilt, non-bend)
+    ! Misalignment on device via 2D offset+tilt kernel.
+    ! For bends, use ref_tilt_tot; for others, use tilt_tot (=roll_tot).
     has_misalign = ele%bookkeeping_state%has_misalign
     if (has_misalign) then
-      call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
-                         ele%value(tilt_tot$), 1, n)
+      if (ele%key == sbend$) then
+        call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                           ele%value(ref_tilt_tot$), 1, n)
+      else
+        call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                           ele%value(tilt_tot$), 1, n)
+      endif
     endif
 
     ! Entrance fringe on device (quad fringe)
@@ -1612,8 +1680,13 @@ do ie = ix_start, ix_end
 
     ! Remove misalignment
     if (has_misalign) then
-      call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
-                         ele%value(tilt_tot$), -1, n)
+      if (ele%key == sbend$) then
+        call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                           ele%value(ref_tilt_tot$), -1, n)
+      else
+        call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                           ele%value(tilt_tot$), -1, n)
+      endif
     endif
 
     ! Exit aperture check on device (after misalignment removed, in lab frame)

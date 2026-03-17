@@ -1747,6 +1747,90 @@ extern "C" void gpu_misalign_(
 }
 
 /* ==========================================================================
+ * 3D MISALIGNMENT KERNEL — general affine coordinate transform
+ *
+ * Applies a precomputed 3x3 rotation W and offset L to transform
+ * particle (x, px, y, py) between lab and body frames.
+ * Handles bends (curvature), pitches, z_offset — any misalignment.
+ *
+ * set_flag=1: lab→body:  r_body = W · (r_lab - L), p_body = W · p_lab
+ * set_flag=-1: body→lab: r_lab = W^T · r_body + L, p_lab = W^T · p_body
+ *
+ * W is column-major (Fortran): W(i,j) at W[j*3+i]
+ * ========================================================================== */
+
+__global__ void misalign_3d_kernel(
+    double *vx, double *vpx, double *vy, double *vpy,
+    double *vz, double *vpz,
+    int *state,
+    const double *W,  /* 9 doubles, 3x3 column-major */
+    double Lx, double Ly, double Lz,
+    int set_flag, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double x = vx[i], px = vpx[i], y = vy[i], py = vpy[i];
+    double rel_p = 1.0 + vpz[i];
+    double pz_sign = 1.0;  /* forward tracking */
+    double pz_sq = rel_p*rel_p - px*px - py*py;
+    if (pz_sq <= 0.0) { state[i] = LOST_PZ; return; }
+    double pz_val = pz_sign * sqrt(pz_sq);
+
+    if (set_flag == 1) {
+        /* lab → body: r_body = W · (r_lab - L) */
+        double rx = x - Lx, ry = y - Ly, rz = 0.0 - Lz;
+        double bx = W[0]*rx + W[3]*ry + W[6]*rz;
+        double by = W[1]*rx + W[4]*ry + W[7]*rz;
+        /* bz = W[2]*rx + W[5]*ry + W[8]*rz; (used for drift correction) */
+
+        /* p_body = W · p_lab */
+        double pbx = W[0]*px + W[3]*py + W[6]*pz_val;
+        double pby = W[1]*px + W[4]*py + W[7]*pz_val;
+
+        vx[i] = bx; vpx[i] = pbx;
+        vy[i] = by; vpy[i] = pby;
+    } else {
+        /* body → lab: r_lab = W^T · r_body + L */
+        double rx = x, ry = y, rz = 0.0;
+        double lx = W[0]*rx + W[1]*ry + W[2]*rz + Lx;
+        double ly = W[3]*rx + W[4]*ry + W[5]*rz + Ly;
+
+        /* p_lab = W^T · p_body */
+        double plx = W[0]*px + W[1]*py + W[2]*pz_val;
+        double ply = W[3]*px + W[4]*py + W[5]*pz_val;
+
+        vx[i] = lx; vpx[i] = plx;
+        vy[i] = ly; vpy[i] = ply;
+    }
+}
+
+/* Device buffer for W matrix */
+static double *d_misalign_W = NULL;
+
+extern "C" void gpu_misalign_3d_(
+    double *h_W,  /* 9 doubles, 3x3 column-major */
+    double Lx, double Ly, double Lz,
+    int set_flag, int n)
+{
+    if (n <= 0) return;
+    if (!d_misalign_W) {
+        cudaMalloc((void**)&d_misalign_W, 9*sizeof(double));
+    }
+    CUDA_CHECK_VOID(cudaMemcpy(d_misalign_W, h_W, 9*sizeof(double), cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    misalign_3d_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3],
+        d_vec[4], d_vec[5], d_state,
+        d_misalign_W, Lx, Ly, Lz, set_flag, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
  * RECTANGULAR APERTURE CHECK KERNEL
  *
  * Checks x1_limit, x2_limit, y1_limit, y2_limit.
