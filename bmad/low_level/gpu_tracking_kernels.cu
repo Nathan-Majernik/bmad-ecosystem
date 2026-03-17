@@ -1542,8 +1542,8 @@ extern "C" void gpu_track_lcavity_dev_(
 #define FRINGE_SOFT_ONLY  2
 #define FRINGE_HARD_ONLY  3
 #define FRINGE_FULL       4
-#define FIRST_EDGE  1
-#define SECOND_EDGE 2
+#define FIRST_EDGE  11  /* first_track_edge$ */
+#define SECOND_EDGE 12  /* second_track_edge$ */
 
 /* Soft quadrupole edge kick (SAD linear model) */
 __device__ void soft_quad_edge_kick_dev(
