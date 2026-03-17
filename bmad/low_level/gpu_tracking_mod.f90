@@ -383,9 +383,9 @@ eligible = .false.
 if (.not. bmad_com%radiation_damping_on .and. .not. bmad_com%radiation_fluctuations_on) return
 if (ele%value(l$) == 0) return
 
-! Drifts don't produce radiation
+! Drifts and pipes don't produce radiation
 select case (ele%key)
-case (drift$)
+case (drift$, pipe$)
   return
 end select
 
@@ -1395,6 +1395,10 @@ logical :: has_fringe_needs_cpu, has_complex_misalign
 can_stay = .false.
 if (.not. ele_gpu_eligible(ele)) return
 
+! Pipe elements can have multipoles, fringe, etc. that require the full
+! track_bunch_thru_pipe_gpu path. Always fall back to per-element for pipes.
+if (ele%key == pipe$) return
+
 ! Check for complex misalignment (pitches, z_offset, or bend misalignment)
 has_complex_misalign = .false.
 if (ele%bookkeeping_state%has_misalign) then
@@ -1413,8 +1417,8 @@ if (has_complex_misalign) return
 ! Check for fringe that requires CPU
 has_fringe_needs_cpu = .false.
 select case (ele%key)
-case (drift$)
-  ! Drifts never have fringe
+case (drift$, pipe$)
+  ! Drifts and pipes never have fringe
 case (lcavity$)
   ! Lcavity fringe is already handled on GPU
 case (quadrupole$, sbend$)
@@ -1592,6 +1596,8 @@ do ie = ix_start, ix_end
       call track_bunch_thru_bend_gpu(bunch, ele, branch%param, did_track)
     case (lcavity$)
       call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
+    case (pipe$)
+      call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, did_track)
     end select
 
     if (.not. did_track) exit
@@ -1672,7 +1678,7 @@ type (lat_param_struct), intent(in) :: param
 integer(C_INT), intent(in) :: np
 
 select case (ele%key)
-case (drift$)
+case (drift$, pipe$)
   call dispatch_drift_body(ele, np)
 case (quadrupole$)
   call dispatch_quad_body(ele, param, np)
