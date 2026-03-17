@@ -435,11 +435,19 @@ static double *d_csr_kick_csr = NULL;
 static double *d_csr_kick_lsc = NULL;
 static int d_csr_bin_cap = 0;
 
-/* External: d_vec, d_state, d_beta, d_p0c from gpu_tracking_kernels.cu */
-extern double *d_vec[6];
-extern int *d_state;
-extern double *d_beta;
-extern double *d_p0c;
+/* Access device buffer pointers from gpu_tracking_kernels.cu via accessor */
+extern "C" void gpu_get_device_ptrs_(
+    double **out_vec0, double **out_vec1, double **out_vec2,
+    double **out_vec3, double **out_vec4, double **out_vec5,
+    int **out_state, double **out_beta, double **out_p0c);
+
+static void get_device_ptrs(
+    double *dvec[6], int **dstate, double **dbeta, double **dp0c)
+{
+    gpu_get_device_ptrs_(&dvec[0], &dvec[1], &dvec[2],
+                         &dvec[3], &dvec[4], &dvec[5],
+                         dstate, dbeta, dp0c);
+}
 
 static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
 {
@@ -503,7 +511,7 @@ static int ensure_csr_bin_buffers(int n_bin)
 /* --------------------------------------------------------------------------
  * gpu_space_charge_3d — full 3D FFT space charge on GPU
  *
- * Particle data must already be on device (d_vec, d_state, d_beta, d_p0c).
+ * Particle data must already be on device (d_vec, dstate, dbeta, dp0c).
  * Modifies vpx, vpy, vpz, vz, beta on device.
  *
  * h_charge: per-particle charge array (host)
@@ -517,6 +525,10 @@ extern "C" void gpu_space_charge_3d_(
 {
     if (n_particles <= 0) return;
     if (ensure_sc_buffers(nx, ny, nz, n_particles) != 0) return;
+
+    /* Get device buffer pointers from main tracking module */
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
 
     int nx2 = 2*nx, ny2 = 2*ny, nz2 = 2*nz;
     int mesh_size = nx * ny * nz;
@@ -538,11 +550,11 @@ extern "C" void gpu_space_charge_3d_(
     int *h_state = (int*)malloc(n_particles * sizeof(int));
     double *h_beta = (double*)malloc(n_particles * sizeof(double));
 
-    CUDA_SC_CHECK(cudaMemcpy(h_x, d_vec[0], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_SC_CHECK(cudaMemcpy(h_y, d_vec[2], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_SC_CHECK(cudaMemcpy(h_z, d_vec[4], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_SC_CHECK(cudaMemcpy(h_state, d_state, n_particles*sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_SC_CHECK(cudaMemcpy(h_beta, d_beta, n_particles*sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_SC_CHECK(cudaMemcpy(h_x, dvec[0], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_SC_CHECK(cudaMemcpy(h_y, dvec[2], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_SC_CHECK(cudaMemcpy(h_z, dvec[4], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_SC_CHECK(cudaMemcpy(h_state, dstate, n_particles*sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_SC_CHECK(cudaMemcpy(h_beta, dbeta, n_particles*sizeof(double), cudaMemcpyDeviceToHost));
 
     double xmin=1e30, xmax=-1e30, ymin=1e30, ymax=-1e30, zmin=1e30, zmax=-1e30;
     for (int i = 0; i < n_particles; i++) {
@@ -569,7 +581,7 @@ extern "C" void gpu_space_charge_3d_(
     CUDA_SC_CHECK(cudaMemset(d_sc_rho, 0, mesh_size * sizeof(double)));
 
     /* We need z_sc = vz - dct_ave*beta on device for deposition.
-     * Compute it in the deposit kernel by passing dct_ave and using d_beta. */
+     * Compute it in the deposit kernel by passing dct_ave and using dbeta. */
     /* Actually, the deposit kernel takes z directly. We need a z_sc array.
      * For simplicity, let's create a temporary z_sc array on device. */
     double *d_z_sc = NULL;
@@ -595,16 +607,16 @@ extern "C" void gpu_space_charge_3d_(
         double *h_vz2 = (double*)malloc(n_particles * sizeof(double));
         double *h_beta2 = (double*)malloc(n_particles * sizeof(double));
         double *h_z_sc = (double*)malloc(n_particles * sizeof(double));
-        CUDA_SC_CHECK(cudaMemcpy(h_vz2, d_vec[4], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_SC_CHECK(cudaMemcpy(h_beta2, d_beta, n_particles*sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_SC_CHECK(cudaMemcpy(h_vz2, dvec[4], n_particles*sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_SC_CHECK(cudaMemcpy(h_beta2, dbeta, n_particles*sizeof(double), cudaMemcpyDeviceToHost));
         for (int i = 0; i < n_particles; i++) h_z_sc[i] = h_vz2[i] - dct_ave * h_beta2[i];
         CUDA_SC_CHECK(cudaMemcpy(d_z_sc, h_z_sc, n_particles*sizeof(double), cudaMemcpyHostToDevice));
         free(h_vz2); free(h_beta2); free(h_z_sc);
     }
 
     deposit_kernel<<<blocks_p, threads>>>(
-        d_vec[0], d_vec[2], d_z_sc,
-        d_sc_charge, d_state,
+        dvec[0], dvec[2], d_z_sc,
+        d_sc_charge, dstate,
         d_sc_rho,
         xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
         nx, ny, nz, n_particles);
@@ -667,9 +679,9 @@ extern "C" void gpu_space_charge_3d_(
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
     sc_interpolate_kick_kernel<<<blocks_p, threads>>>(
-        d_vec[0], d_vec[1], d_vec[2], d_vec[3],
-        d_vec[4], d_vec[5],
-        d_state, d_beta, d_p0c,
+        dvec[0], dvec[1], dvec[2], dvec[3],
+        dvec[4], dvec[5],
+        dstate, dbeta, dp0c,
         d_sc_efield,
         xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
         nx, ny, nz,
@@ -701,6 +713,9 @@ extern "C" void gpu_csr_bin_particles_(
     if (n_particles <= 0 || n_bin <= 0) return;
     if (ensure_csr_bin_buffers(n_bin) != 0) return;
 
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
+
     /* Upload per-particle charge */
     if (d_sc_charge) cudaFree(d_sc_charge);
     cudaMalloc((void**)&d_sc_charge, (size_t)n_particles * sizeof(double));
@@ -717,8 +732,8 @@ extern "C" void gpu_csr_bin_particles_(
     int threads = 256;
     int blocks = (n_particles + threads - 1) / threads;
     csr_bin_kernel<<<blocks, threads>>>(
-        d_vec[4], d_vec[0], d_vec[2],
-        d_sc_charge, d_state,
+        dvec[4], dvec[0], dvec[2],
+        d_sc_charge, dstate,
         d_csr_bin_charge, d_csr_bin_x0_wt, d_csr_bin_y0_wt,
         d_csr_bin_n_particle,
         z_min, dz_slice, dz_particle,
@@ -752,6 +767,9 @@ extern "C" void gpu_csr_apply_kicks_(
     if (n_particles <= 0 || n_bin <= 0) return;
     if (ensure_csr_bin_buffers(n_bin) != 0) return;
 
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
+
     size_t bsz = n_bin * sizeof(double);
     CUDA_SC_CHECK(cudaMemcpy(d_csr_kick_csr, h_kick_csr, bsz, cudaMemcpyHostToDevice));
     CUDA_SC_CHECK(cudaMemcpy(d_csr_kick_lsc, h_kick_lsc, bsz, cudaMemcpyHostToDevice));
@@ -759,7 +777,7 @@ extern "C" void gpu_csr_apply_kicks_(
     int threads = 256;
     int blocks = (n_particles + threads - 1) / threads;
     csr_apply_kick_kernel<<<blocks, threads>>>(
-        d_vec[5], d_vec[4], d_state,
+        dvec[5], dvec[4], dstate,
         d_csr_kick_csr, d_csr_kick_lsc,
         z_center_0, dz_slice,
         apply_csr, apply_lsc,

@@ -54,11 +54,10 @@
 /* --------------------------------------------------------------------------
  * Cached device buffers
  * -------------------------------------------------------------------------- */
-/* These are non-static so gpu_spacecharge_kernels.cu can access them */
-double *d_vec[6]  = {NULL,NULL,NULL,NULL,NULL,NULL};
-int    *d_state   = NULL;
-double *d_beta    = NULL;
-double *d_p0c     = NULL;
+static double *d_vec[6]  = {NULL,NULL,NULL,NULL,NULL,NULL};
+static int    *d_state   = NULL;
+static double *d_beta    = NULL;
+static double *d_p0c     = NULL;
 static double *d_s       = NULL;
 static double *d_t       = NULL;
 static int     d_cap     = 0;          /* allocated capacity (particles) */
@@ -112,6 +111,21 @@ fail:
     if (d_t)     cudaFree(d_t);     d_t     = NULL;
     d_cap = 0;
     return -1;
+}
+
+/* --------------------------------------------------------------------------
+ * Accessor functions for device buffer pointers — used by
+ * gpu_spacecharge_kernels.cu to access the cached particle buffers
+ * without breaking static linkage.
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_get_device_ptrs_(
+    double **out_vec0, double **out_vec1, double **out_vec2,
+    double **out_vec3, double **out_vec4, double **out_vec5,
+    int **out_state, double **out_beta, double **out_p0c)
+{
+    *out_vec0 = d_vec[0]; *out_vec1 = d_vec[1]; *out_vec2 = d_vec[2];
+    *out_vec3 = d_vec[3]; *out_vec4 = d_vec[4]; *out_vec5 = d_vec[5];
+    *out_state = d_state; *out_beta = d_beta; *out_p0c = d_p0c;
 }
 
 /* --------------------------------------------------------------------------
@@ -1510,6 +1524,159 @@ extern "C" void gpu_track_lcavity_dev_(
         cavity_type,
         fringe_at, charge_ratio,
         n_particles);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
+ * QUADRUPOLE FRINGE KERNELS
+ *
+ * Implements soft_quadrupole_edge_kick and hard_multipole_edge_kick
+ * for quadrupoles directly on the GPU.
+ *
+ * Fringe types: none$=0, soft_edge_only$=2, hard_edge_only$=3, full$=4
+ * Edge: first_track_edge$=1, second_track_edge$=2
+ * ========================================================================== */
+
+#define FRINGE_NONE       0
+#define FRINGE_SOFT_ONLY  2
+#define FRINGE_HARD_ONLY  3
+#define FRINGE_FULL       4
+#define FIRST_EDGE  1
+#define SECOND_EDGE 2
+
+/* Soft quadrupole edge kick (SAD linear model) */
+__device__ void soft_quad_edge_kick_dev(
+    double *x, double *px, double *y, double *py, double *z,
+    double rel_p, double k1_rel, double fq1, double fq2,
+    int particle_at, int time_dir)
+{
+    double f1 = k1_rel * fq1;
+    double f2 = k1_rel * fq2;
+
+    if (particle_at == SECOND_EDGE) f1 = -f1;
+    if (time_dir == -1) f2 = -f2;
+
+    double ef1 = exp(f1);
+    double vx = *px / rel_p;
+    double vy = *py / rel_p;
+
+    *z += -(f1 * (*x) + f2 * (1.0 + f1*0.5) * vx / ef1) * vx
+          +(f1 * (*y) + f2 * (1.0 - f1*0.5) * vy * ef1) * vy;
+
+    *x = (*x) * ef1 + vx * f2;
+    *y = (*y) / ef1 - vy * f2;
+    *px = (*px) / ef1;
+    *py = (*py) * ef1;
+}
+
+/* Hard multipole edge kick for quadrupole (n_max=1 specialization).
+ * Uses complex arithmetic with (real, imag) pairs. */
+__device__ void hard_quad_edge_kick_dev(
+    double *x, double *px, double *y, double *py, double *z,
+    double rel_p, double k1, double charge_dir, int particle_at)
+{
+    double cab = charge_dir * k1 / (12.0 * rel_p);
+    if (particle_at == FIRST_EDGE) cab = -cab;
+
+    double xv = *x, yv = *y;
+
+    /* poly = (x+iy)^2 = (x^2-y^2, 2xy) */
+    double poly_r = xv*xv - yv*yv, poly_i = 2.0*xv*yv;
+    /* dpoly/dx = 2*(x+iy) */
+    double dpx_r = 2.0*xv, dpx_i = 2.0*yv;
+    /* dpoly/dy = i * dpoly/dx = (-2y, 2x) */
+    double dpy_r = -2.0*yv, dpy_i = 2.0*xv;
+    /* d2poly/dxx = 2, d2poly/dxy = 2i, d2poly/dyy = -2 */
+    double cn = 2.0;
+
+    /* fx: xny = (x, -2y), poly*xny, cab*real(...) */
+    double xny_r = xv, xny_i = -cn*yv;
+    double fx = cab * (poly_r*xny_r - poly_i*xny_i);
+
+    /* dfx/dx: cab*real(dpoly_dx*xny + poly) */
+    double dfx_dx = cab * (dpx_r*xny_r - dpx_i*xny_i + poly_r);
+
+    /* dfx/dy: cab*real(dpoly_dy*xny + poly*(0,-cn)) */
+    double dfx_dy = cab * (dpy_r*xny_r - dpy_i*xny_i + cn*poly_i);
+
+    /* d2fx/dxx: cab*real(2*xny + 2*dpoly_dx) */
+    double d2fx_dxx = cab * (2.0*xny_r + 2.0*dpx_r);
+    /* d2fx/dxy: cab*real(2i*xny + dpoly_dx*(0,-cn) + dpoly_dy) */
+    double d2fx_dxy = cab * (-2.0*xny_i + cn*dpx_i + dpy_r);
+    /* d2fx/dyy: cab*real(-2*xny + 2*dpoly_dy*(0,-cn)) */
+    double d2fx_dyy = cab * (-2.0*xny_r + 2.0*cn*dpy_i);
+
+    /* fy: xny2 = (y, cn*x), dxny2_dx = (0, cn) */
+    double xny2_r = yv, xny2_i = cn*xv;
+    double fy = cab * (poly_r*xny2_r - poly_i*xny2_i);
+
+    /* dfy/dx: cab*real(dpoly_dx*xny2 + poly*(0,cn)) */
+    double dfy_dx = cab * (dpx_r*xny2_r - dpx_i*xny2_i - cn*poly_i);
+    /* dfy/dy: cab*real(dpoly_dy*xny2 + poly) */
+    double dfy_dy = cab * (dpy_r*xny2_r - dpy_i*xny2_i + poly_r);
+
+    /* d2fy/dxy: cab*real(2i*xny2 + dpoly_dx + dpoly_dy*(0,cn)) */
+    double d2fy_dxy = cab * (-2.0*xny2_i + dpx_r - cn*dpy_i);
+
+    /* Denominator */
+    double denom = (1.0 - dfx_dx) * (1.0 - dfy_dy) - dfx_dy * dfy_dx;
+
+    double pxv = *px, pyv = *py;
+
+    *x = xv - fx;
+    *y = yv - fy;
+    *px = pxv + ((1.0 - dfy_dy - denom) * pxv + dfy_dx * pyv) / denom;
+    *py = pyv + (dfx_dy * pxv + (1.0 - dfx_dx - denom) * pyv) / denom;
+    *z = *z + ((*px) * fx + (*py) * fy) / rel_p;
+}
+
+/* Combined quad fringe kernel */
+__global__ void quad_fringe_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state,
+    double k1, double fq1, double fq2, double charge_dir,
+    int fringe_type, int edge, int time_dir, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double rel_p = 1.0 + vpz[i];
+    double k1_rel = charge_dir * k1 / rel_p;
+
+    int do_hard = (fringe_type == FRINGE_HARD_ONLY || fringe_type == FRINGE_FULL);
+    int do_soft = (fringe_type == FRINGE_SOFT_ONLY || fringe_type == FRINGE_FULL);
+
+    if (edge == FIRST_EDGE) {
+        if (do_hard)
+            hard_quad_edge_kick_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i],
+                                    rel_p, k1, charge_dir, edge);
+        if (do_soft)
+            soft_quad_edge_kick_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i],
+                                    rel_p, k1_rel, fq1, fq2, edge, time_dir);
+    } else {
+        if (do_soft)
+            soft_quad_edge_kick_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i],
+                                    rel_p, k1_rel, fq1, fq2, edge, time_dir);
+        if (do_hard)
+            hard_quad_edge_kick_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i],
+                                    rel_p, k1, charge_dir, edge);
+    }
+}
+
+extern "C" void gpu_quad_fringe_(
+    double k1, double fq1, double fq2, double charge_dir,
+    int fringe_type, int edge, int time_dir, int n)
+{
+    if (n <= 0 || fringe_type == FRINGE_NONE) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    quad_fringe_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state,
+        k1, fq1, fq2, charge_dir,
+        fringe_type, edge, time_dir, n);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 }

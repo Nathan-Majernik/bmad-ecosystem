@@ -158,8 +158,11 @@ else
       if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(branch%ele(i)) .and. &
           .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
           .not. bmad_com%radiation_damping_on .and. .not. bmad_com%radiation_fluctuations_on .and. &
+          .not. bmad_com%csr_and_space_charge_on .and. &
           bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
-          .not. present(bunch_track)) then
+          .not. present(bunch_track) .and. &
+          i < e2%ix_ele .and. i+1 <= branch%n_ele_track .and. &
+          ele_gpu_eligible(branch%ele(i+1))) then
         call track_bunch_thru_elements_gpu(bunch, branch, i, e2%ix_ele, j)
         if (j >= i) then
           i = j + 1

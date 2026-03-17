@@ -218,6 +218,13 @@ interface
 
   ! ----- Cross-element persistence kernels -----
 
+  subroutine gpu_quad_fringe(k1, fq1, fq2, charge_dir, &
+      fringe_type, edge, time_dir, n) bind(C, name='gpu_quad_fringe_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: k1, fq1, fq2, charge_dir
+    integer(C_INT), value, intent(in) :: fringe_type, edge, time_dir, n
+  end subroutine
+
   subroutine gpu_misalign(x_off, y_off, tilt, set_flag, n) bind(C, name='gpu_misalign_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: x_off, y_off, tilt
@@ -1421,7 +1428,9 @@ case (drift$, pipe$)
   ! Drifts and pipes never have fringe
 case (lcavity$)
   ! Lcavity fringe is already handled on GPU
-case (quadrupole$, sbend$)
+case (quadrupole$)
+  ! Quad fringe is now handled on GPU via gpu_quad_fringe
+case (sbend$)
   call init_fringe_info(fringe_info, ele)
   if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
 end select
@@ -1558,6 +1567,9 @@ do ie = ix_start, ix_end
                          ele%value(tilt_tot$), 1, n)
     endif
 
+    ! Entrance fringe on device (quad fringe)
+    call dispatch_fringe_on_device(ele, branch%param, n, first_track_edge$)
+
     ! Radiation entrance
     apply_rad = gpu_rad_eligible(ele)
     if (apply_rad) then
@@ -1570,6 +1582,9 @@ do ie = ix_start, ix_end
 
     ! Radiation exit
     if (apply_rad .and. associated(ele%rad_map)) call call_gpu_rad_kick(n, ele%rad_map%rm1)
+
+    ! Exit fringe on device (quad fringe)
+    call dispatch_fringe_on_device(ele, branch%param, n, second_track_edge$)
 
     ! Remove misalignment
     if (has_misalign) then
@@ -1667,6 +1682,39 @@ nb = n * 8  ! sizeof(double) = 8
 ! For drifts, the drift kernel updates d_s. We need to upload d_s before the
 ! drift and download after. Let's handle this in dispatch_body_kernel_on_device.
 end subroutine upload_s_array
+
+!------------------------------------------------------------------------
+! dispatch_fringe_on_device — apply fringe kicks on device
+!------------------------------------------------------------------------
+subroutine dispatch_fringe_on_device(ele, param, np, edge)
+
+use multipole_mod, only: ab_multipole_kicks
+type (ele_struct), intent(in) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+integer, intent(in) :: edge
+
+integer :: fringe_type_val
+real(rp) :: charge_dir_val, k1_val
+real(rp) :: an_tmp(0:n_pole_maxx), bn_tmp(0:n_pole_maxx)
+integer :: ix_tmp
+
+select case (ele%key)
+case (quadrupole$)
+  fringe_type_val = nint(ele%value(fringe_type$))
+  if (fringe_type_val == none$) return
+
+  ! Compute charge_dir for fringe
+  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                   ele%orientation * bunch%particle(1)%direction
+
+  call gpu_quad_fringe(ele%value(k1$), ele%value(fq1$), ele%value(fq2$), &
+                       charge_dir_val, &
+                       int(fringe_type_val, C_INT), int(edge, C_INT), &
+                       int(bunch%particle(1)%time_dir, C_INT), np)
+end select
+
+end subroutine dispatch_fringe_on_device
 
 !------------------------------------------------------------------------
 ! dispatch_body_kernel_on_device — launch the appropriate body kernel
