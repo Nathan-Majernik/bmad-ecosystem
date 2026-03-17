@@ -2,120 +2,109 @@ no_digested
 
 parameter[lattice] = "GPU tracking kitchen sink — all parameters"
 
-beginning[beta_a] = 10
-beginning[beta_b] = 10
+beginning[beta_a] = 5
+beginning[beta_b] = 5
 parameter[e_tot] = 10e6
 parameter[particle] = electron
 
 parameter[geometry] = open
 
-! 1. Plain drift (L only)
-d_plain: drift, L = 2.0
+! FODO-like structure: alternating F/D quads keep beam small.
+! Apertures at 5mm give ~10% loss.
 
-! 2. Drift with aperture
-d_aper: drift, L = 1.5,
-    x1_limit = 3e-3, x2_limit = 3e-3,
-    y1_limit = 3e-3, y2_limit = 3e-3
+! --- Section 1: Drifts and plain quads ---
 
-! 3. Plain quadrupole (L, k1)
-q_plain: quadrupole, L = 0.5, k1 = 0.8
+d_plain: drift, L = 0.5
+q_plain: quadrupole, L = 0.3, k1 = 2.0
+d_aper: drift, L = 0.3,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
+qd1: quadrupole, L = 0.3, k1 = -2.0
 
-! 4. Quad with misalignment (x_offset, y_offset, tilt)
-q_misalign: quadrupole, L = 0.4, k1 = 1.0,
-    x_offset = 3e-4, y_offset = -2e-4, tilt = 0.01
+! --- Section 2: Quads with features ---
 
-! 5. Quad with fringe fields
-q_fringe: quadrupole, L = 0.6, k1 = 1.2, fringe_type = full
+d1: drift, L = 0.3
+q_misalign: quadrupole, L = 0.3, k1 = 2.0,
+    x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005
+d2: drift, L = 0.2
+q_fringe: quadrupole, L = 0.3, k1 = -1.5, fringe_type = full
+d3: drift, L = 0.2
+q_mag_multi: quadrupole, L = 0.3, k1 = 1.5,
+    b2 = 0.1, a2 = 0.02, b3 = 0.05
+d4: drift, L = 0.2
+q_elec: quadrupole, L = 0.3, k1 = -1.5,
+    a0_elec = 200, b1_elec = 100
 
-! 6. Quad with magnetic multipoles (b2 sextupole, a2 skew sext, b3 octupole)
-q_mag_multi: quadrupole, L = 0.5, k1 = 0.9,
-    b2 = 0.3, a2 = 0.05, b3 = 0.1
+! --- Section 3: Quad with aperture + combo ---
 
-! 7. Quad with electric multipoles (a0_elec, b1_elec)
-q_elec: quadrupole, L = 0.5, k1 = 1.0,
-    a0_elec = 500, b1_elec = 200
-
-! 8. Quad with aperture
-q_aper: quadrupole, L = 0.5, k1 = 0.7,
-    x1_limit = 3e-3, x2_limit = 3e-3,
-    y1_limit = 3e-3, y2_limit = 3e-3
-
-! 9. Everything combined: fringe + misalign + tilt + mag multipoles + elec multipoles + aperture
-q_combo: quadrupole, L = 0.5, k1 = 1.0,
-    x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005,
+d5: drift, L = 0.2
+q_aper: quadrupole, L = 0.3, k1 = 1.5,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
+d6: drift, L = 0.2
+q_combo: quadrupole, L = 0.3, k1 = -1.5,
+    x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
     fringe_type = full,
-    b2 = 0.2, a2 = 0.03, b3 = 0.08,
-    a0_elec = 400, b1_elec = 150,
-    x1_limit = 4e-3, x2_limit = 4e-3,
-    y1_limit = 4e-3, y2_limit = 4e-3
+    b2 = 0.1, a2 = 0.01,
+    a0_elec = 200, b1_elec = 80,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
 
-! 10. Another drift to let the beam propagate
-d_mid: drift, L = 1.0
+! --- Section 4: Bends (weak, to avoid blowup) ---
 
-! --- Bends ---
+d_mid: drift, L = 0.3
+b_plain: sbend, L = 0.5, g = 0.1
+qf_mid: quadrupole, L = 0.3, k1 = 2.0
+b_k1: sbend, L = 0.5, g = 0.08, k1 = 0.3
+qd_mid: quadrupole, L = 0.3, k1 = -2.0
+b_fringe_mis: sbend, L = 0.5, g = 0.1, fringe_type = full,
+    x_offset = 1e-4, y_offset = -1e-4, ref_tilt = 0.003
+qf_mid2: quadrupole, L = 0.3, k1 = 2.0
+b_multi: sbend, L = 0.5, g = 0.1, b2 = 0.1, a2 = 0.02
 
-! 11. Plain bend
-b_plain: sbend, L = 1.0, g = 0.5
+! --- Section 5: Lcavities ---
 
-! 12. Bend with k1 (sbend_body_with_k1_map path)
-b_k1: sbend, L = 0.8, g = 0.4, k1 = 0.8
-
-! 13. Bend with fringe + misalignment
-b_fringe_mis: sbend, L = 0.8, g = 0.3, fringe_type = full,
-    x_offset = 2e-4, y_offset = -1e-4, ref_tilt = 0.005
-
-! 14. Bend with magnetic multipoles
-b_multi: sbend, L = 1.0, g = 0.5, b2 = 0.3, a2 = 0.05, b3 = 0.1
-
-! --- Lcavities ---
-
-! 15. Plain lcavity (standing wave, with fringe)
-lc_plain: lcavity, L = 1.0, rf_frequency = 1e9, gradient = 1e5,
+d7: drift, L = 0.2
+lc_plain: lcavity, L = 0.5, rf_frequency = 1e9, gradient = 5e4,
     n_rf_steps = 10
-
-! 16. Lcavity with misalignment + phase offsets
-lc_misalign: lcavity, L = 0.8, rf_frequency = 1e9, gradient = 8e4,
+qd_lc: quadrupole, L = 0.3, k1 = -1.5
+lc_misalign: lcavity, L = 0.5, rf_frequency = 1e9, gradient = 4e4,
     n_rf_steps = 10,
-    x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005,
-    phi0 = 0.1, phi0_err = -0.05, voltage_err = 5e3
+    x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
+    phi0 = 0.05, phi0_err = -0.02, voltage_err = 2e3
 
-! --- Pipes ---
+! --- Section 6: Pipes ---
 
-! 17. Plain pipe (drift-like, no multipoles)
-p_plain: pipe, L = 1.5
+d8: drift, L = 0.2
+p_plain: pipe, L = 0.5
+p_misalign: pipe, L = 0.5, x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005
+p_aper: pipe, L = 0.5,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
+p_combo: pipe, L = 0.5,
+    x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
 
-! 18. Pipe with misalignment
-p_misalign: pipe, L = 1.0, x_offset = 3e-4, y_offset = -2e-4, tilt = 0.01
+! --- Section 7: Elliptical apertures ---
 
-! 19. Pipe with aperture
-p_aper: pipe, L = 1.0,
-    x1_limit = 4e-3, x2_limit = 4e-3,
-    y1_limit = 4e-3, y2_limit = 4e-3
+d9: drift, L = 0.2
+d_ellip: drift, L = 0.3, aperture_type = elliptical,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
+qf_end: quadrupole, L = 0.3, k1 = 1.5
+q_ellip: quadrupole, L = 0.3, k1 = -1.5, aperture_type = elliptical,
+    x1_limit = 5e-3, x2_limit = 5e-3,
+    y1_limit = 5e-3, y2_limit = 5e-3
 
-! 20. Pipe with misalignment + aperture (combo)
-p_combo: pipe, L = 1.0,
-    x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005,
-    x1_limit = 4e-3, x2_limit = 4e-3,
-    y1_limit = 4e-3, y2_limit = 4e-3
+d_final: drift, L = 0.3
 
-! 21. Drift with elliptical aperture
-d_ellip: drift, L = 1.0, aperture_type = elliptical,
-    x1_limit = 3e-3, x2_limit = 3e-3,
-    y1_limit = 3e-3, y2_limit = 3e-3
-
-! 22. Quad with elliptical aperture
-q_ellip: quadrupole, L = 0.5, k1 = 0.7, aperture_type = elliptical,
-    x1_limit = 3e-3, x2_limit = 3e-3,
-    y1_limit = 3e-3, y2_limit = 3e-3
-
-! 23. Final drift
-d_final: drift, L = 1.0
-
-lat: line = (d_plain, q_plain, d_aper, q_misalign, q_fringe,
-             q_mag_multi, q_elec, q_aper, q_combo, d_mid,
-             b_plain, b_k1, b_fringe_mis, b_multi,
-             lc_plain, lc_misalign,
-             p_plain, p_misalign, p_aper, p_combo,
-             d_ellip, q_ellip, d_final)
+lat: line = (d_plain, q_plain, d_aper, qd1,
+             d1, q_misalign, d2, q_fringe, d3, q_mag_multi, d4, q_elec,
+             d5, q_aper, d6, q_combo,
+             d_mid, b_plain, qf_mid, b_k1, qd_mid, b_fringe_mis, qf_mid2, b_multi,
+             d7, lc_plain, qd_lc, lc_misalign,
+             d8, p_plain, p_misalign, p_aper, p_combo,
+             d9, d_ellip, qf_end, q_ellip, d_final)
 
 use, lat

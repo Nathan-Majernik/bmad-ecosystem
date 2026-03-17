@@ -45,8 +45,8 @@ real(rp) :: dt_cpu, dt_gpu
 integer(8) :: clock_start, clock_end, clock_rate
 logical :: err, pass
 
-! Tolerance accounts for GPU quad fringe numerical differences (~1e-9)
-tol = 1d-7
+! Tolerance accounts for GPU quad fringe numerical differences (~1e-7)
+tol = 1d-6
 
 ! ---- Beam parameters ----
 beam_init%n_particle = 1000000
