@@ -1,0 +1,16 @@
+no_digested
+
+parameter[lattice] = "GPU radiation test — bend at high energy"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 3e9
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+b1: sbend, L = 2.0, g = 0.2
+
+lat: line = (b1)
+
+use, lat

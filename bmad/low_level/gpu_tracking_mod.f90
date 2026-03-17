@@ -15,6 +15,7 @@ public :: track_bunch_thru_quad_gpu
 public :: track_bunch_thru_bend_gpu
 public :: track_bunch_thru_lcavity_gpu
 public :: check_entrance_aperture_for_gpu
+public :: gpu_rad_eligible
 
 ! Whether gpu_tracking_init has been called
 logical, save :: gpu_trk_initialized = .false.
@@ -114,6 +115,102 @@ interface
 
   subroutine gpu_tracking_cleanup() bind(C, name='gpu_tracking_cleanup_')
   end subroutine
+
+  ! ----- Split upload/download/body wrappers for radiation support -----
+
+  subroutine gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                                  state, beta, p0c, t_time, n) bind(C, name='gpu_upload_particles_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(in) :: state(*)
+    real(C_DOUBLE), intent(in) :: beta(*), p0c(*), t_time(*)
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
+  subroutine gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                                    state, beta, p0c, t_time, &
+                                    n, copy_beta, copy_p0c) bind(C, name='gpu_download_particles_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(inout) :: state(*)
+    real(C_DOUBLE), intent(inout) :: beta(*), p0c(*), t_time(*)
+    integer(C_INT), value, intent(in) :: n, copy_beta, copy_p0c
+  end subroutine
+
+  subroutine gpu_rad_kick(n, stoc_mat, damp_dmat, xfer_damp_vec, ref_orb, &
+                           synch_rad_scale, apply_damp, apply_fluct, &
+                           zero_average) bind(C, name='gpu_rad_kick_')
+    use, intrinsic :: iso_c_binding
+    integer(C_INT), value, intent(in) :: n
+    real(C_DOUBLE), intent(in) :: stoc_mat(36), damp_dmat(36)
+    real(C_DOUBLE), intent(in) :: xfer_damp_vec(6), ref_orb(6)
+    real(C_DOUBLE), value, intent(in) :: synch_rad_scale
+    integer(C_INT), value, intent(in) :: apply_damp, apply_fluct, zero_average
+  end subroutine
+
+  subroutine gpu_track_drift_dev(s_pos, mc2, length, n) bind(C, name='gpu_track_drift_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: s_pos(*)
+    real(C_DOUBLE), value, intent(in) :: mc2, length
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
+  subroutine gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
+                                 e_tot_ele, charge_dir, n_particles, &
+                                 a2_arr, b2_arr, cm_arr, &
+                                 ix_mag_max, n_step, &
+                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_quad_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, b1, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele, charge_dir
+    integer(C_INT), value, intent(in) :: n_particles
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max, n_step
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
+                                 ele_length, delta_ref_time, e_tot_ele, &
+                                 rel_charge_dir, p0c_ele, n_particles, &
+                                 a2_arr, b2_arr, cm_arr, &
+                                 ix_mag_max, n_step, &
+                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_bend_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, g, g_tot, dg, b1
+    real(C_DOUBLE), value, intent(in) :: ele_length, delta_ref_time, e_tot_ele
+    real(C_DOUBLE), value, intent(in) :: rel_charge_dir, p0c_ele
+    integer(C_INT), value, intent(in) :: n_particles
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max, n_step
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_lcavity_dev(mc2, &
+                                    step_s0, step_s, step_p0c, step_p1c, &
+                                    step_scale, step_time, &
+                                    n_rf_steps, &
+                                    voltage, voltage_err, field_autoscale, &
+                                    rf_frequency, phi0_total, &
+                                    voltage_tot, l_active, &
+                                    cavity_type, &
+                                    fringe_at, charge_ratio, &
+                                    n_particles) bind(C, name='gpu_track_lcavity_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2
+    real(C_DOUBLE), intent(in) :: step_s0(*), step_s(*), step_p0c(*), step_p1c(*)
+    real(C_DOUBLE), intent(in) :: step_scale(*), step_time(*)
+    integer(C_INT), value, intent(in) :: n_rf_steps
+    real(C_DOUBLE), value, intent(in) :: voltage, voltage_err, field_autoscale
+    real(C_DOUBLE), value, intent(in) :: rf_frequency, phi0_total
+    real(C_DOUBLE), value, intent(in) :: voltage_tot, l_active
+    integer(C_INT), value, intent(in) :: cavity_type
+    integer(C_INT), value, intent(in) :: fringe_at
+    real(C_DOUBLE), value, intent(in) :: charge_ratio
+    integer(C_INT), value, intent(in) :: n_particles
+  end subroutine
+
 end interface
 #endif
 
@@ -205,6 +302,79 @@ case (drift$, quadrupole$, sbend$, lcavity$)
 end select
 
 end function ele_gpu_eligible
+
+!------------------------------------------------------------------------
+! gpu_rad_eligible — check if radiation should be applied on GPU for this element
+!
+! Returns .true. if radiation (damping or fluctuations) is requested and
+! the element is of a type that generates radiation.
+! Drifts do not produce radiation (consistent with track1_radiation).
+!------------------------------------------------------------------------
+function gpu_rad_eligible(ele) result (eligible)
+type (ele_struct), intent(in) :: ele
+logical :: eligible
+
+eligible = .false.
+if (.not. bmad_com%radiation_damping_on .and. .not. bmad_com%radiation_fluctuations_on) return
+if (ele%value(l$) == 0) return
+
+! Drifts don't produce radiation
+select case (ele%key)
+case (drift$)
+  return
+end select
+
+eligible = .true.
+end function gpu_rad_eligible
+
+!------------------------------------------------------------------------
+! ensure_rad_map — ensure radiation map is computed for this element
+!------------------------------------------------------------------------
+subroutine ensure_rad_map(ele)
+use radiation_mod, only: radiation_map_setup
+type (ele_struct), intent(inout) :: ele
+logical :: err
+
+if (.not. associated(ele%rad_map)) then
+  call radiation_map_setup(ele, err)
+elseif (ele%rad_map%stale) then
+  call radiation_map_setup(ele, err)
+endif
+
+end subroutine ensure_rad_map
+
+!------------------------------------------------------------------------
+! call_gpu_rad_kick — call the GPU radiation kick kernel
+!
+! Extracts the stoc_mat, damp_dmat, xfer_damp_vec, and ref_orb from
+! the rad_map and calls the CUDA radiation kernel on already-uploaded
+! device particle data.
+!------------------------------------------------------------------------
+subroutine call_gpu_rad_kick(n, rad_map)
+
+use, intrinsic :: iso_c_binding
+
+integer(C_INT),          intent(in) :: n
+type (rad_map_struct),   intent(in) :: rad_map
+
+real(C_DOUBLE) :: stoc_flat(36), damp_flat(36), xfer_vec(6), ref(6)
+integer(C_INT) :: i_damp, i_fluct, i_zero_avg
+
+! Flatten the 6x6 matrices to 1D column-major arrays
+stoc_flat = reshape(rad_map%stoc_mat, [36])
+damp_flat = reshape(rad_map%damp_dmat, [36])
+xfer_vec  = rad_map%xfer_damp_vec
+ref       = rad_map%ref_orb
+
+i_damp = 0; i_fluct = 0; i_zero_avg = 0
+if (bmad_com%radiation_damping_on) i_damp = 1
+if (bmad_com%radiation_fluctuations_on) i_fluct = 1
+if (bmad_com%radiation_zero_average) i_zero_avg = 1
+
+call gpu_rad_kick(n, stoc_flat, damp_flat, xfer_vec, ref, &
+                   bmad_com%synch_rad_scale, i_damp, i_fluct, i_zero_avg)
+
+end subroutine call_gpu_rad_kick
 
 !------------------------------------------------------------------------
 ! bunch_to_soa — extract particle data from AoS bunch to SoA arrays
@@ -543,7 +713,7 @@ use multipole_mod, only: ab_multipole_kicks
 use, intrinsic :: iso_c_binding
 
 type (bunch_struct),     intent(inout) :: bunch
-type (ele_struct),       intent(in)    :: ele
+type (ele_struct), target, intent(inout) :: ele
 type (lat_param_struct), intent(in)    :: param
 logical,                 intent(out)   :: did_track
 
@@ -556,7 +726,7 @@ real(rp) :: charge_dir, rel_tracking_charge, length
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 type (fringe_field_info_struct) :: fringe_info
-logical :: has_misalign, has_mag_multipoles
+logical :: has_misalign, has_mag_multipoles, apply_rad
 
 ! Precomputed scaled multipole arrays and c_multi coefficients for CUDA
 real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
@@ -605,6 +775,10 @@ if (has_mag_multipoles .or. ix_elec_max > -1) &
 rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
 charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
 
+! Check if radiation should be applied
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) call ensure_rad_map(ele)
+
 ! Entrance: allocate SoA, misalignment, fringe, AoS→SoA
 call gpu_tracking_pre(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
     state_a, beta_a, p0c_a, t_a, has_misalign, fringe_info, .true.)
@@ -616,14 +790,34 @@ call precompute_multipole_arrays(bunch%particle(1), ele, &
 
 did_track = .true.
 
-! Call CUDA kernel
-call gpu_track_quad(vx, vpx, vy, vpy, vz, vpz, &
-                    state_a, beta_a, p0c_a, t_a, &
-                    mc2, b1, ele_length, delta_ref_time, &
-                    e_tot_ele, charge_dir, n, &
-                    a2_arr, b2_arr, cm_arr, &
-                    int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                    ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+if (apply_rad .and. associated(ele%rad_map)) then
+  ! Split approach: upload once, rad + body + rad, download once
+  call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                            state_a, beta_a, p0c_a, t_a, n)
+  ! Entrance radiation kick
+  call call_gpu_rad_kick(n, ele%rad_map%rm0)
+  ! Body kernel (data already on device)
+  call gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
+                          e_tot_ele, charge_dir, n, &
+                          a2_arr, b2_arr, cm_arr, &
+                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  ! Exit radiation kick
+  call call_gpu_rad_kick(n, ele%rad_map%rm1)
+  ! Download
+  call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, &
+                              n, merge(1, 0, ix_elec_max >= 0), 0)
+else
+  ! Original approach: combined upload + body + download
+  call gpu_track_quad(vx, vpx, vy, vpy, vz, vpz, &
+                      state_a, beta_a, p0c_a, t_a, &
+                      mc2, b1, ele_length, delta_ref_time, &
+                      e_tot_ele, charge_dir, n, &
+                      a2_arr, b2_arr, cm_arr, &
+                      int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                      ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+endif
 
 ! Exit: SoA→AoS, deallocate, fringe, misalignment, update s
 call gpu_tracking_post(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
@@ -660,7 +854,7 @@ real(rp) :: r_step, length, step_len_val
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 type (fringe_field_info_struct) :: fringe_info
-logical :: has_misalign, has_mag_multipoles, has_elec_multipoles
+logical :: has_misalign, has_mag_multipoles, has_elec_multipoles, apply_rad
 
 real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
@@ -728,6 +922,10 @@ step_len_val = ele_length / n_step
 ! Fringe info
 call init_fringe_info(fringe_info, ele)
 
+! Check if radiation should be applied
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) call ensure_rad_map(ele)
+
 ! Entrance: allocate SoA, misalignment, fringe, AoS→SoA
 call gpu_tracking_pre(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
     state_a, beta_a, p0c_a, t_a, has_misalign, fringe_info, .true.)
@@ -740,15 +938,32 @@ call precompute_multipole_arrays(bunch%particle(1), ele, &
 
 did_track = .true.
 
-! Call CUDA kernel
-call gpu_track_bend(vx, vpx, vy, vpy, vz, vpz, &
-                    state_a, beta_a, p0c_a, t_a, &
-                    mc2, g, g_tot, dg, b1, &
-                    ele_length, delta_ref_time, e_tot_ele, &
-                    rel_charge_dir, p0c_ele, n, &
-                    a2_arr, b2_arr, cm_arr, &
-                    int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                    ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+if (apply_rad .and. associated(ele%rad_map)) then
+  ! Split approach: upload once, rad + body + rad, download once
+  call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                            state_a, beta_a, p0c_a, t_a, n)
+  call call_gpu_rad_kick(n, ele%rad_map%rm0)
+  call gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
+                          ele_length, delta_ref_time, e_tot_ele, &
+                          rel_charge_dir, p0c_ele, n, &
+                          a2_arr, b2_arr, cm_arr, &
+                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  call call_gpu_rad_kick(n, ele%rad_map%rm1)
+  call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, &
+                              n, merge(1, 0, ix_elec_max >= 0), 0)
+else
+  ! Original approach: combined upload + body + download
+  call gpu_track_bend(vx, vpx, vy, vpy, vz, vpz, &
+                      state_a, beta_a, p0c_a, t_a, &
+                      mc2, g, g_tot, dg, b1, &
+                      ele_length, delta_ref_time, e_tot_ele, &
+                      rel_charge_dir, p0c_ele, n, &
+                      a2_arr, b2_arr, cm_arr, &
+                      int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                      ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+endif
 
 ! Exit: SoA→AoS, deallocate, fringe, misalignment, update s
 call gpu_tracking_post(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
@@ -787,7 +1002,7 @@ real(rp) :: mc2, phi0_total
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 type (fringe_field_info_struct) :: fringe_info
-logical :: has_misalign
+logical :: has_misalign, apply_rad
 integer :: i_fringe_at
 real(rp) :: charge_ratio_val
 type (ele_struct), pointer :: lord
@@ -864,26 +1079,52 @@ do j = 0, n_steps + 1
   h_step_time(j+1)  = step%time
 enddo
 
+! Check if radiation should be applied
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) call ensure_rad_map(ele)
+
 ! Entrance: allocate SoA, misalignment, AoS→SoA (no CPU fringe for lcavity)
 call gpu_tracking_pre(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
     state_a, beta_a, p0c_a, t_a, has_misalign, fringe_info, .false.)
 
 did_track = .true.
 
-! Call CUDA kernel
-call gpu_track_lcavity(vx, vpx, vy, vpy, vz, vpz, &
-                       state_a, beta_a, p0c_a, t_a, &
-                       mc2, &
-                       h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
-                       h_step_scale, h_step_time, &
-                       int(n_steps, C_INT), &
-                       lord%value(voltage$), lord%value(voltage_err$), &
-                       lord%value(field_autoscale$), &
-                       ele%value(rf_frequency$), phi0_total, &
-                       lord%value(voltage_tot$), lord%value(l_active$), &
-                       int(nint(lord%value(cavity_type$)), C_INT), &
-                       int(i_fringe_at, C_INT), charge_ratio_val, &
-                       int(n, C_INT))
+if (apply_rad .and. associated(ele%rad_map)) then
+  ! Split approach: upload once, rad + body + rad, download once
+  call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                            state_a, beta_a, p0c_a, t_a, n)
+  call call_gpu_rad_kick(n, ele%rad_map%rm0)
+  call gpu_track_lcavity_dev(mc2, &
+                             h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
+                             h_step_scale, h_step_time, &
+                             int(n_steps, C_INT), &
+                             lord%value(voltage$), lord%value(voltage_err$), &
+                             lord%value(field_autoscale$), &
+                             ele%value(rf_frequency$), phi0_total, &
+                             lord%value(voltage_tot$), lord%value(l_active$), &
+                             int(nint(lord%value(cavity_type$)), C_INT), &
+                             int(i_fringe_at, C_INT), charge_ratio_val, &
+                             int(n, C_INT))
+  call call_gpu_rad_kick(n, ele%rad_map%rm1)
+  call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, &
+                              n, 1, 1)
+else
+  ! Original approach: combined upload + body + download
+  call gpu_track_lcavity(vx, vpx, vy, vpy, vz, vpz, &
+                         state_a, beta_a, p0c_a, t_a, &
+                         mc2, &
+                         h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
+                         h_step_scale, h_step_time, &
+                         int(n_steps, C_INT), &
+                         lord%value(voltage$), lord%value(voltage_err$), &
+                         lord%value(field_autoscale$), &
+                         ele%value(rf_frequency$), phi0_total, &
+                         lord%value(voltage_tot$), lord%value(l_active$), &
+                         int(nint(lord%value(cavity_type$)), C_INT), &
+                         int(i_fringe_at, C_INT), charge_ratio_val, &
+                         int(n, C_INT))
+endif
 
 ! Exit: SoA→AoS, deallocate, misalignment, update s (no CPU fringe)
 call gpu_tracking_post(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &

@@ -17,6 +17,7 @@
 #ifdef USE_GPU_TRACKING
 
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -1214,6 +1215,303 @@ extern "C" void gpu_track_lcavity_(
                                h_state, h_beta, h_p0c, h_t, 1, 1) != 0) return;
 }
 
+/* ==========================================================================
+ * CURAND RNG STATE MANAGEMENT
+ * ========================================================================== */
+
+static curandState *d_rng_states = NULL;
+static int d_rng_cap = 0;
+
+__global__ void init_rng_kernel(curandState *states, unsigned long long seed, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    curand_init(seed, (unsigned long long)i, 0, &states[i]);
+}
+
+static int ensure_rng(int n)
+{
+    if (n <= d_rng_cap) return 0;
+    if (d_rng_states) cudaFree(d_rng_states);
+    d_rng_states = NULL;
+    if (cudaMalloc((void**)&d_rng_states, (size_t)n * sizeof(curandState)) != cudaSuccess) {
+        fprintf(stderr, "[gpu_tracking] cudaMalloc failed for %d curandStates\n", n);
+        d_rng_cap = 0;
+        return -1;
+    }
+    d_rng_cap = n;
+    /* Initialize RNG states with a fixed base seed */
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    init_rng_kernel<<<blocks, threads>>>(d_rng_states, 123456789ULL, n);
+    cudaDeviceSynchronize();
+    return 0;
+}
+
+/* ==========================================================================
+ * RADIATION KICK KERNEL
+ *
+ * Applies radiation damping and/or stochastic fluctuation kicks to all
+ * alive particles.  Called once for entrance (rm0) and once for exit (rm1).
+ *
+ * Fluctuation kick: vec += scale * stoc_mat * ran6
+ * Damping kick:     vec += scale * (damp_dmat * (vec - ref_orb) + xfer_damp_vec)
+ *
+ * stoc_mat and damp_dmat are 6x6 column-major (Fortran order).
+ * ========================================================================== */
+
+__global__ void rad_kick_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state,
+    const double *stoc_mat,       /* 6x6, device, column-major */
+    const double *damp_dmat,      /* 6x6, device, column-major */
+    const double *xfer_damp_vec,  /* 6, device */
+    const double *ref_orb,        /* 6, device */
+    double synch_rad_scale,
+    int apply_damp, int apply_fluct, int zero_average,
+    curandState *rng_states,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double vec[6] = {vx[i], vpx[i], vy[i], vpy[i], vz[i], vpz[i]};
+
+    /* Damping: vec += rr * damp_dmat * (vec - ref_orb) [+ rr * xfer_damp_vec] */
+    if (apply_damp) {
+        double dv[6], kick[6];
+        for (int k = 0; k < 6; k++) dv[k] = vec[k] - ref_orb[k];
+        for (int k = 0; k < 6; k++) {
+            double s = 0.0;
+            for (int j = 0; j < 6; j++) s += damp_dmat[j * 6 + k] * dv[j];
+            kick[k] = s;
+        }
+        double rr = synch_rad_scale;  /* time_dir = 1 for GPU tracking */
+        for (int k = 0; k < 6; k++) vec[k] += rr * kick[k];
+        if (!zero_average) {
+            for (int k = 0; k < 6; k++) vec[k] += rr * xfer_damp_vec[k];
+        }
+    }
+
+    /* Fluctuations: vec += scale * stoc_mat * ran6 */
+    if (apply_fluct) {
+        double ran[6];
+        curandState local_state = rng_states[i];
+        for (int k = 0; k < 6; k++)
+            ran[k] = curand_normal_double(&local_state);
+        rng_states[i] = local_state;
+
+        for (int k = 0; k < 6; k++) {
+            double s = 0.0;
+            for (int j = 0; j < 6; j++) s += stoc_mat[j * 6 + k] * ran[j];
+            vec[k] += synch_rad_scale * s;
+        }
+    }
+
+    /* Write back */
+    vx[i] = vec[0]; vpx[i] = vec[1]; vy[i] = vec[2];
+    vpy[i] = vec[3]; vz[i] = vec[4]; vpz[i] = vec[5];
+
+    /* Check for pz < -1 */
+    if (vpz[i] < -1.0) state[i] = LOST_PZ;
+}
+
+/* ==========================================================================
+ * SPLIT UPLOAD/DOWNLOAD WRAPPERS
+ *
+ * These allow the Fortran code to upload particle data once, run multiple
+ * kernels (radiation + body), then download once — avoiding redundant
+ * host-device transfers.
+ * ========================================================================== */
+
+extern "C" void gpu_upload_particles_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t, int n)
+{
+    if (ensure_buffers(n) != 0) return;
+    upload_particle_data(n, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                         h_state, h_beta, h_p0c, h_t);
+}
+
+extern "C" void gpu_download_particles_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t,
+    int n, int copy_beta, int copy_p0c)
+{
+    download_particle_data(n, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                           h_state, h_beta, h_p0c, h_t, copy_beta, copy_p0c);
+}
+
+/* --------------------------------------------------------------------------
+ * Radiation data device buffers (small, allocated once)
+ * -------------------------------------------------------------------------- */
+static double *d_stoc_mat = NULL;       /* 36 doubles */
+static double *d_damp_dmat = NULL;      /* 36 doubles */
+static double *d_xfer_damp_vec = NULL;  /* 6 doubles */
+static double *d_ref_orb = NULL;        /* 6 doubles */
+
+static int ensure_rad_buffers(void)
+{
+    size_t m6 = 36 * sizeof(double);
+    size_t v6 = 6 * sizeof(double);
+    if (!d_stoc_mat)       { if (cudaMalloc((void**)&d_stoc_mat, m6) != cudaSuccess) return -1; }
+    if (!d_damp_dmat)      { if (cudaMalloc((void**)&d_damp_dmat, m6) != cudaSuccess) return -1; }
+    if (!d_xfer_damp_vec)  { if (cudaMalloc((void**)&d_xfer_damp_vec, v6) != cudaSuccess) return -1; }
+    if (!d_ref_orb)        { if (cudaMalloc((void**)&d_ref_orb, v6) != cudaSuccess) return -1; }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_rad_kick — apply radiation kick on device data (already uploaded)
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_rad_kick_(
+    int n,
+    double *h_stoc_mat,       /* 36 doubles (host) */
+    double *h_damp_dmat,      /* 36 doubles (host) */
+    double *h_xfer_damp_vec,  /* 6 doubles (host) */
+    double *h_ref_orb,        /* 6 doubles (host) */
+    double synch_rad_scale,
+    int apply_damp, int apply_fluct, int zero_average)
+{
+    if (n <= 0) return;
+    if (ensure_rng(n) != 0) return;
+    if (ensure_rad_buffers() != 0) return;
+
+    /* Upload radiation data */
+    CUDA_CHECK_VOID(cudaMemcpy(d_stoc_mat, h_stoc_mat, 36*sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_damp_dmat, h_damp_dmat, 36*sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_xfer_damp_vec, h_xfer_damp_vec, 6*sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_ref_orb, h_ref_orb, 6*sizeof(double), cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    rad_kick_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state,
+        d_stoc_mat, d_damp_dmat, d_xfer_damp_vec, d_ref_orb,
+        synch_rad_scale,
+        apply_damp, apply_fluct, zero_average,
+        d_rng_states, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
+ * BODY-ONLY KERNEL WRAPPERS (data already on device)
+ * ========================================================================== */
+
+/* Drift body-only: also uploads/downloads s_pos array */
+extern "C" void gpu_track_drift_dev_(
+    double *h_s, double mc2, double length, int n)
+{
+    size_t db = (size_t)n * sizeof(double);
+    CUDA_CHECK_VOID(cudaMemcpy(d_s, h_s, db, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    drift_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_s, d_t, mc2, length, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    CUDA_CHECK_VOID(cudaMemcpy(h_s, d_s, db, cudaMemcpyDeviceToHost));
+}
+
+/* Quad body-only: uploads multipoles, runs kernel */
+extern "C" void gpu_track_quad_dev_(
+    double mc2, double b1, double ele_length,
+    double delta_ref_time, double e_tot_ele, double charge_dir,
+    int n_particles,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max, int n_step,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    quad_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, b1, ele_length, delta_ref_time, e_tot_ele, charge_dir,
+        n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* Bend body-only: uploads multipoles, runs kernel */
+extern "C" void gpu_track_bend_dev_(
+    double mc2, double g, double g_tot, double dg, double b1,
+    double ele_length, double delta_ref_time, double e_tot_ele,
+    double rel_charge_dir, double p0c_ele,
+    int n_particles,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max, int n_step,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    bend_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, g, g_tot, dg, b1, ele_length, delta_ref_time, e_tot_ele,
+        rel_charge_dir, p0c_ele,
+        n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* Lcavity body-only: uploads step data, runs kernel */
+extern "C" void gpu_track_lcavity_dev_(
+    double mc2,
+    double *h_step_s0, double *h_step_s,
+    double *h_step_p0c, double *h_step_p1c,
+    double *h_step_scale, double *h_step_time,
+    int n_rf_steps,
+    double voltage, double voltage_err, double field_autoscale,
+    double rf_frequency, double phi0_total,
+    double voltage_tot, double l_active,
+    int cavity_type,
+    int fringe_at, double charge_ratio,
+    int n_particles)
+{
+    int n_steps_total = n_rf_steps + 2;
+    if (ensure_step_buffers(n_steps_total) != 0) return;
+
+    size_t sb = (size_t)n_steps_total * sizeof(double);
+    CUDA_CHECK_VOID(cudaMemcpy(d_step_s0,   h_step_s0,    sb, cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_step_s,    h_step_s,     sb, cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_step_p0c,  h_step_p0c,   sb, cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_step_p1c,  h_step_p1c,   sb, cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_step_scl,  h_step_scale, sb, cudaMemcpyHostToDevice));
+    CUDA_CHECK_VOID(cudaMemcpy(d_step_time, h_step_time,  sb, cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    lcavity_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t, mc2,
+        d_step_s0, d_step_s, d_step_p0c, d_step_p1c, d_step_scl, d_step_time,
+        n_rf_steps,
+        voltage, voltage_err, field_autoscale,
+        rf_frequency, phi0_total, voltage_tot, l_active,
+        cavity_type,
+        fringe_at, charge_ratio,
+        n_particles);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
 /* --------------------------------------------------------------------------
  * gpu_tracking_cleanup — release cached device buffers
  * -------------------------------------------------------------------------- */
@@ -1236,6 +1534,12 @@ extern "C" void gpu_tracking_cleanup_(void)
     if (d_step_p1c)  cudaFree(d_step_p1c);  d_step_p1c  = NULL;
     if (d_step_scl)  cudaFree(d_step_scl);  d_step_scl  = NULL;
     if (d_step_time) cudaFree(d_step_time); d_step_time = NULL;
+    if (d_rng_states)    cudaFree(d_rng_states);    d_rng_states    = NULL;
+    if (d_stoc_mat)      cudaFree(d_stoc_mat);      d_stoc_mat      = NULL;
+    if (d_damp_dmat)     cudaFree(d_damp_dmat);     d_damp_dmat     = NULL;
+    if (d_xfer_damp_vec) cudaFree(d_xfer_damp_vec); d_xfer_damp_vec = NULL;
+    if (d_ref_orb)       cudaFree(d_ref_orb);       d_ref_orb       = NULL;
+    d_rng_cap = 0;
     d_step_cap = 0;
     d_cap = 0;
 }

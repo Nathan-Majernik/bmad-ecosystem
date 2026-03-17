@@ -69,10 +69,10 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
 
   ! GPU batch tracking (opt-in via bmad_com%gpu_tracking_on).
   ! ele_gpu_eligible checks element type, tracking method, and is_on.
-  ! Runtime conditions (radiation, spin, direction) are checked here.
+  ! Runtime conditions (spin, direction) are checked here.
+  ! Radiation damping and fluctuations are now handled on GPU.
   gpu_did_track = .false.
   if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
-      .not. bmad_com%radiation_damping_on .and. .not. bmad_com%radiation_fluctuations_on .and. &
       .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
       bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
 

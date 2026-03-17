@@ -49,7 +49,7 @@ IF ("$ENV{ACC_ENABLE_GPU_TRACKING}" STREQUAL "Y")
       target_compile_definitions(gpu_tracking_kernels PRIVATE USE_GPU_TRACKING)
       set_target_properties(gpu_tracking_kernels PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
-      SET (GPU_TRACKING_LINK_LIBS gpu_tracking_kernels CUDA::cudart)
+      SET (GPU_TRACKING_LINK_LIBS gpu_tracking_kernels CUDA::cudart CUDA::curand)
     ELSE ()
       MESSAGE(WARNING "ACC_ENABLE_GPU_TRACKING=Y but CUDAToolkit not found — GPU tracking disabled")
     ENDIF ()

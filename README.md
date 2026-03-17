@@ -109,8 +109,17 @@ If the toolkit is not found, the build will proceed without GPU tracking support
 for the `ACC_ENABLE_GPU_TRACKING` environment variable and probes for CUDA hardware.
 
 When enabled, eligible elements are tracked on the GPU while unsupported elements
-fall back silently to CPU tracking. GPU tracking is not compatible with radiation
-damping/fluctuations, spin tracking, or backward tracking.
+fall back silently to CPU tracking. GPU tracking is not compatible with spin
+tracking or backward tracking.
+
+**Radiation support:** GPU tracking supports both radiation damping
+(`bmad_com%radiation_damping_on`) and radiation fluctuations
+(`bmad_com%radiation_fluctuations_on`). The stochastic and damping matrices from
+Bmad's `radiation_map_setup` are applied on the GPU using cuRAND for Gaussian
+random number generation. Supported elements: quadrupole, sbend, lcavity (drift
+does not produce radiation). The entrance/exit radiation kicks run as separate
+CUDA kernels within the same device upload/download cycle to avoid extra
+host-device transfers.
 
 ```bash
 # Enable GPU tracking at runtime
