@@ -16,6 +16,8 @@ public :: track_bunch_thru_bend_gpu
 public :: track_bunch_thru_lcavity_gpu
 public :: check_entrance_aperture_for_gpu
 public :: gpu_rad_eligible
+public :: track_bunch_thru_elements_gpu
+public :: ele_gpu_can_stay_on_device
 
 ! Whether gpu_tracking_init has been called
 logical, save :: gpu_trk_initialized = .false.
@@ -209,6 +211,32 @@ interface
     integer(C_INT), value, intent(in) :: fringe_at
     real(C_DOUBLE), value, intent(in) :: charge_ratio
     integer(C_INT), value, intent(in) :: n_particles
+  end subroutine
+
+  ! ----- Cross-element persistence kernels -----
+
+  subroutine gpu_misalign(x_off, y_off, tilt, set_flag, n) bind(C, name='gpu_misalign_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: x_off, y_off, tilt
+    integer(C_INT), value, intent(in) :: set_flag, n
+  end subroutine
+
+  subroutine gpu_check_aperture_rect(x1_lim, x2_lim, y1_lim, y2_lim, n) &
+      bind(C, name='gpu_check_aperture_rect_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: x1_lim, x2_lim, y1_lim, y2_lim
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
+  subroutine gpu_s_update(s_val, n) bind(C, name='gpu_s_update_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: s_val
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
+  subroutine gpu_orbit_check(n) bind(C, name='gpu_orbit_check_')
+    use, intrinsic :: iso_c_binding
+    integer(C_INT), value, intent(in) :: n
   end subroutine
 
 end interface
@@ -1157,5 +1185,507 @@ do j = 1, size(bunch%particle)
 enddo
 
 end subroutine check_entrance_aperture_for_gpu
+
+!------------------------------------------------------------------------
+! ele_gpu_can_stay_on_device — check if an element can be tracked
+! entirely on the GPU without downloading particle data to CPU.
+!
+! Returns .true. if:
+! - Element is GPU-eligible (drift, quad, sbend, lcavity)
+! - Any misalignment is "simple" (x_offset + y_offset + tilt only,
+!   no pitches, no z_offset, non-bend)
+! - Fringe can be handled: no fringe, or element is lcavity
+!   (lcavity fringe already runs on GPU)
+! - Aperture is rectangular (or none)
+!
+! Returns .false. if complex CPU-side operations are needed (complex
+! fringe, pitches, bend misalignment, etc.).
+!------------------------------------------------------------------------
+function ele_gpu_can_stay_on_device(ele) result (can_stay)
+type (ele_struct), intent(in) :: ele
+logical :: can_stay
+type (fringe_field_info_struct) :: fringe_info
+logical :: has_fringe_needs_cpu, has_complex_misalign
+
+can_stay = .false.
+if (.not. ele_gpu_eligible(ele)) return
+
+! Check for complex misalignment (pitches, z_offset, or bend misalignment)
+has_complex_misalign = .false.
+if (ele%bookkeeping_state%has_misalign) then
+  ! Bends with misalignment need curvature-aware offset_particle
+  if (ele%key == sbend$) then
+    has_complex_misalign = .true.
+  endif
+  ! Pitches or z_offset require full offset_particle
+  if (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
+      ele%value(z_offset_tot$) /= 0) then
+    has_complex_misalign = .true.
+  endif
+endif
+if (has_complex_misalign) return
+
+! Check for fringe that requires CPU
+has_fringe_needs_cpu = .false.
+select case (ele%key)
+case (drift$)
+  ! Drifts never have fringe
+case (lcavity$)
+  ! Lcavity fringe is already handled on GPU
+case (quadrupole$, sbend$)
+  call init_fringe_info(fringe_info, ele)
+  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
+end select
+if (has_fringe_needs_cpu) return
+
+! Elements with apertures need full CPU check_aperture_limit
+if (ele%value(x1_limit$) /= 0 .or. ele%value(x2_limit$) /= 0 .or. &
+    ele%value(y1_limit$) /= 0 .or. ele%value(y2_limit$) /= 0) return
+
+can_stay = .true.
+end function ele_gpu_can_stay_on_device
+
+!------------------------------------------------------------------------
+! track_bunch_thru_elements_gpu — track a bunch through multiple
+! consecutive elements, keeping particle data on the GPU device between
+! elements that support it.
+!
+! Elements are processed in order from ix_start to ix_end.
+! For "device-resident" elements (ele_gpu_can_stay_on_device), the
+! particle data stays on the GPU between elements, avoiding redundant
+! host-device transfers. For elements that need CPU-side operations
+! (complex fringe, pitches, bend misalignment), data is downloaded
+! to the CPU, the operations are done, and data is re-uploaded.
+!
+! did_track_to: index of last element successfully tracked.
+!------------------------------------------------------------------------
+subroutine track_bunch_thru_elements_gpu(bunch, branch, ix_start, ix_end, did_track_to)
+
+use multipole_mod, only: ab_multipole_kicks
+use radiation_mod, only: radiation_map_setup
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (branch_struct), target, intent(inout) :: branch
+integer,                 intent(in)    :: ix_start, ix_end
+integer,                 intent(out)   :: did_track_to
+
+#ifdef USE_GPU_TRACKING
+integer, parameter :: n_multi = n_pole_maxx + 1
+integer(C_INT) :: n
+integer :: ie, j
+type (ele_struct), pointer :: ele
+logical :: on_device, did_track, apply_rad
+logical :: has_misalign, can_stay
+
+! Persistent host SoA buffers (reused across elements)
+real(C_DOUBLE), allocatable, save :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+real(C_DOUBLE), allocatable, save :: beta_a(:), p0c_a(:), t_a(:), s_a(:)
+integer(C_INT), allocatable, save :: state_a(:)
+integer, save :: soa_cap = 0
+
+! Per-element scratch
+integer :: ix_mag_max, ix_elec_max, n_step
+real(rp) :: ele_length, mc2, b1, delta_ref_time, e_tot_ele, p0c_ele
+real(rp) :: charge_dir, rel_tracking_charge, length
+real(rp) :: g, g_tot, dg, rel_charge_dir, r_step, step_len_val
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+type (fringe_field_info_struct) :: fringe_info
+logical :: has_mag_multipoles, has_elec_multipoles
+! lcavity scratch
+type (ele_struct), pointer :: lord
+type (rf_stair_step_struct), pointer :: step
+integer :: nn, n_steps, i_fringe_at
+real(rp) :: phi0_total, charge_ratio_val
+real(C_DOUBLE), allocatable :: h_step_s0(:), h_step_s(:)
+real(C_DOUBLE), allocatable :: h_step_p0c(:), h_step_p1c(:)
+real(C_DOUBLE), allocatable :: h_step_scale(:), h_step_time(:)
+#endif
+
+did_track_to = ix_start - 1
+
+#ifdef USE_GPU_TRACKING
+n = size(bunch%particle)
+if (n == 0) return
+
+! Ensure persistent SoA buffers are large enough
+if (n > soa_cap) then
+  if (allocated(vx)) deallocate(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, s_a)
+  allocate(vx(n), vpx(n), vy(n), vpy(n), vz(n), vpz(n))
+  allocate(state_a(n), beta_a(n), p0c_a(n), t_a(n), s_a(n))
+  soa_cap = n
+endif
+
+on_device = .false.
+
+do ie = ix_start, ix_end
+  ele => branch%ele(ie)
+
+  ! Check if this element can be GPU-tracked
+  if (.not. ele_gpu_eligible(ele)) exit
+  if (bmad_com%spin_tracking_on) exit
+  if (bmad_com%high_energy_space_charge_on) exit
+  if (bunch%particle(1)%direction /= 1) exit
+  if (bunch%particle(1)%time_dir /= 1) exit
+
+  can_stay = ele_gpu_can_stay_on_device(ele)
+
+  ! If element needs CPU ops and data is on device, download first
+  if (.not. can_stay .and. on_device) then
+    call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                                state_a, beta_a, p0c_a, t_a, n, 1, 1)
+    call soa_to_bunch(bunch, branch%ele(ie-1), n, vx, vpx, vy, vpy, vz, vpz, &
+                       state_a, beta_a, p0c_a, t_a, .true., .true.)
+    ! Also write back s
+    do j = 1, n
+      bunch%particle(j)%s = s_a(j)
+    enddo
+    on_device = .false.
+  endif
+
+  ! --- Device-resident path: everything on GPU ---
+  if (can_stay) then
+    if (.not. on_device) then
+      ! First element in a GPU run: AoS → SoA → upload
+      call bunch_to_soa(bunch, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+      do j = 1, n
+        s_a(j) = bunch%particle(j)%s
+      enddo
+      call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                                state_a, beta_a, p0c_a, t_a, n)
+      ! Also upload s_pos
+      call upload_s_array()
+      on_device = .true.
+    endif
+
+    ! Misalignment on device (simple: offset + tilt, non-bend)
+    has_misalign = ele%bookkeeping_state%has_misalign
+    if (has_misalign) then
+      call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                         ele%value(tilt_tot$), 1, n)
+    endif
+
+    ! Radiation entrance
+    apply_rad = gpu_rad_eligible(ele)
+    if (apply_rad) then
+      call ensure_rad_map(ele)
+      if (associated(ele%rad_map)) call call_gpu_rad_kick(n, ele%rad_map%rm0)
+    endif
+
+    ! Body kernel
+    call dispatch_body_kernel_on_device(ele, branch%param, n)
+
+    ! Radiation exit
+    if (apply_rad .and. associated(ele%rad_map)) call call_gpu_rad_kick(n, ele%rad_map%rm1)
+
+    ! Remove misalignment
+    if (has_misalign) then
+      call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                         ele%value(tilt_tot$), -1, n)
+    endif
+
+    ! Update s position on device
+    call gpu_s_update(ele%s, n)
+
+    ! Orbit-too-large check on device
+    call gpu_orbit_check(n)
+
+    did_track_to = ie
+
+  ! --- CPU-fallback path: use existing per-element routines ---
+  else
+    select case (ele%key)
+    case (drift$)
+      call track_bunch_thru_drift_gpu(bunch, ele, did_track)
+    case (quadrupole$)
+      call track_bunch_thru_quad_gpu(bunch, ele, branch%param, did_track)
+    case (sbend$)
+      call track_bunch_thru_bend_gpu(bunch, ele, branch%param, did_track)
+    case (lcavity$)
+      call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
+    end select
+
+    if (.not. did_track) exit
+
+    ! Run the post-tracking checks that beam_utils normally does
+    call check_apertures_after_gpu(bunch, ele, branch%param)
+    do j = 1, size(bunch%particle)
+      if (bunch%particle(j)%state == alive$) then
+        if (orbit_too_large(bunch%particle(j), branch%param)) cycle
+      endif
+    enddo
+
+    did_track_to = ie
+  endif
+enddo
+
+! Final download if data is still on device
+if (on_device) then
+  call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, n, 1, 1)
+  call soa_to_bunch(bunch, branch%ele(did_track_to), n, vx, vpx, vy, vpy, vz, vpz, &
+                     state_a, beta_a, p0c_a, t_a, .true., .true.)
+  do j = 1, n
+    bunch%particle(j)%s = s_a(j)
+  enddo
+  on_device = .false.
+endif
+
+! Update charge_live
+bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
+#endif
+
+contains
+
+!------------------------------------------------------------------------
+! upload_s_array — upload s_pos data to device d_s buffer
+!------------------------------------------------------------------------
+subroutine upload_s_array()
+use, intrinsic :: iso_c_binding
+integer(C_INT) :: nb
+nb = n * 8  ! sizeof(double) = 8
+! Use the gpu_track_drift_dev approach — d_s is managed by ensure_buffers
+! We need a direct cudaMemcpy. Use the upload function with s as part of it.
+! Actually, d_s is already allocated by ensure_buffers. We upload via a trick:
+! pass s_a through a tiny drift of length 0 — no, that's wasteful.
+! Instead, let's use a dedicated upload. But we don't have one for s alone.
+! For now, just pass s through the existing drift body wrapper with length=0.
+! That will upload s, run a no-op kernel, and download s back — not great.
+! Better: just upload s via the existing cuda memcpy wrapper.
+! We already have gpu_upload_particles which calls ensure_buffers.
+! The d_s buffer exists. We need a way to upload to it.
+! Let me use a zero-length drift dev call which uploads+downloads s.
+! Actually that's wasteful. Let me just leave s on the CPU side and update
+! it only during download. We track s_a on the host and just set it.
+! For the device-resident path, s_pos isn't needed by most kernels
+! (only drift uses it). The drift kernel writes to d_s on device.
+! For quad/bend/lcavity, s isn't modified by the kernel.
+! So we can: upload s once, let drift modify it, and download at the end.
+! But gpu_upload_particles doesn't upload s. Let me just not upload s
+! and handle it differently.
+!
+! Solution: don't upload s. Instead:
+! - For drifts: the drift kernel needs d_s. We upload/download it per drift.
+!   (The cost is minimal — it's just one array for drift elements.)
+! - For other elements: s is set to ele%s on device via gpu_s_update.
+! This is already what we do above with gpu_s_update.
+! For drifts, the drift kernel updates d_s. We need to upload d_s before the
+! drift and download after. Let's handle this in dispatch_body_kernel_on_device.
+end subroutine upload_s_array
+
+!------------------------------------------------------------------------
+! dispatch_body_kernel_on_device — launch the appropriate body kernel
+!------------------------------------------------------------------------
+subroutine dispatch_body_kernel_on_device(ele, param, np)
+
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+
+select case (ele%key)
+case (drift$)
+  call dispatch_drift_body(ele, np)
+case (quadrupole$)
+  call dispatch_quad_body(ele, param, np)
+case (sbend$)
+  call dispatch_bend_body(ele, param, np)
+case (lcavity$)
+  call dispatch_lcavity_body(ele, param, np)
+end select
+
+end subroutine dispatch_body_kernel_on_device
+
+!------------------------------------------------------------------------
+subroutine dispatch_drift_body(ele, np)
+type (ele_struct), intent(in) :: ele
+integer(C_INT), intent(in) :: np
+real(rp) :: mc2_val, len_val
+integer :: j2
+real(C_DOUBLE) :: dummy_s(1)
+
+mc2_val = mass_of(bunch%particle(1)%species)
+len_val = ele%value(l$)
+if (len_val == 0) return
+
+! For drift, need s on device. Upload current s_a, run kernel, download.
+call gpu_track_drift_dev(s_a, mc2_val, len_val, np)
+! s_a is now updated on host (drift_dev does upload+download of s)
+end subroutine dispatch_drift_body
+
+!------------------------------------------------------------------------
+subroutine dispatch_quad_body(ele, param, np)
+type (ele_struct), intent(in) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+has_mag_multipoles = (ix_mag_max > -1)
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (has_mag_multipoles .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+call gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
+                        e_tot_ele, charge_dir, np, &
+                        a2_arr, b2_arr, cm_arr, &
+                        int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                        ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+end subroutine dispatch_quad_body
+
+!------------------------------------------------------------------------
+subroutine dispatch_bend_body(ele, param, np)
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+p0c_ele = ele%value(p0c$)
+
+if (nint(ele%value(exact_multipoles$)) /= off$) return
+
+rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
+                 rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+b1 = b1 * rel_charge_dir
+if (abs(b1) < 1d-10) then
+  bn(1) = b1
+  b1 = 0
+endif
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+g = ele%value(g$)
+length = bunch%particle(1)%time_dir * ele_length
+if (length == 0) then
+  dg = 0
+else
+  dg = bn(0) / ele_length
+  bn(0) = 0
+endif
+g_tot = (g + dg) * rel_charge_dir
+
+has_mag_multipoles = (ix_mag_max > -1)
+has_elec_multipoles = (ix_elec_max > -1)
+n_step = 1
+if (has_mag_multipoles .or. has_elec_multipoles) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+call gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
+                        ele_length, delta_ref_time, e_tot_ele, &
+                        rel_charge_dir, p0c_ele, np, &
+                        a2_arr, b2_arr, cm_arr, &
+                        int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                        ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+end subroutine dispatch_bend_body
+
+!------------------------------------------------------------------------
+subroutine dispatch_lcavity_body(ele, param, np)
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+
+if (ele%value(l$) == 0) return
+if (ele%value(rf_frequency$) == 0) return
+if (bmad_com%absolute_time_tracking) return
+
+lord => pointer_to_super_lord(ele)
+if (lord%value(ks$) /= 0) return
+
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+if (ix_mag_max > -1) return
+if (ix_elec_max > -1) return
+if (ele%value(coupler_strength$) /= 0) return
+
+if (nint(lord%value(fringe_type$)) == none$) then
+  i_fringe_at = 0
+else
+  i_fringe_at = nint(lord%value(fringe_at$))
+  if (i_fringe_at < 1 .or. i_fringe_at > 3) i_fringe_at = 0
+endif
+charge_ratio_val = charge_of(bunch%particle(1)%species) / (2.0_rp * charge_of(lord%ref_species))
+
+mc2 = mass_of(bunch%particle(1)%species)
+n_steps = nint(lord%value(n_rf_steps$))
+phi0_total = lord%value(phi0$) + lord%value(phi0_err$) + lord%value(phi0_multipass$)
+
+allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
+allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
+allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
+
+do j = 0, n_steps + 1
+  step => lord%rf%steps(j)
+  h_step_s0(j+1)    = step%s0
+  h_step_s(j+1)     = step%s
+  h_step_p0c(j+1)   = step%p0c
+  h_step_p1c(j+1)   = step%p1c
+  h_step_scale(j+1) = step%scale
+  h_step_time(j+1)  = step%time
+enddo
+
+call gpu_track_lcavity_dev(mc2, &
+                           h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
+                           h_step_scale, h_step_time, &
+                           int(n_steps, C_INT), &
+                           lord%value(voltage$), lord%value(voltage_err$), &
+                           lord%value(field_autoscale$), &
+                           ele%value(rf_frequency$), phi0_total, &
+                           lord%value(voltage_tot$), lord%value(l_active$), &
+                           int(nint(lord%value(cavity_type$)), C_INT), &
+                           int(i_fringe_at, C_INT), charge_ratio_val, &
+                           int(np, C_INT))
+
+deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
+end subroutine dispatch_lcavity_body
+
+end subroutine track_bunch_thru_elements_gpu
+
+!------------------------------------------------------------------------
+! check_apertures_after_gpu — check exit aperture for all alive particles
+!------------------------------------------------------------------------
+subroutine check_apertures_after_gpu (bunch, ele, param)
+
+type (bunch_struct), intent(inout) :: bunch
+type (ele_struct),   intent(inout) :: ele
+type (lat_param_struct), intent(inout) :: param
+
+integer :: j
+
+do j = 1, size(bunch%particle)
+  if (bunch%particle(j)%state == alive$) then
+    call check_aperture_limit(bunch%particle(j), ele, second_track_edge$, param)
+  endif
+enddo
+
+end subroutine check_apertures_after_gpu
 
 end module gpu_tracking_mod

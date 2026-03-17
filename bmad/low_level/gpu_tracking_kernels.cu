@@ -1512,6 +1512,169 @@ extern "C" void gpu_track_lcavity_dev_(
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 }
 
+/* ==========================================================================
+ * MISALIGNMENT KERNEL — applies offset_particle on GPU
+ *
+ * Handles x_offset, y_offset, and tilt for non-bend elements.
+ * set_flag: 1 = set (lab→body), -1 = unset (body→lab)
+ * For set: subtract offsets, rotate by -tilt
+ * For unset: rotate by +tilt, add offsets
+ * ========================================================================== */
+
+__global__ void misalign_kernel(
+    double *vx, double *vpx, double *vy, double *vpy,
+    int *state,
+    double x_off, double y_off, double tilt,
+    int set_flag, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double x = vx[i], px = vpx[i], y = vy[i], py = vpy[i];
+
+    if (set_flag == 1) {
+        /* set: lab → body: subtract offset, then rotate by -tilt */
+        x -= x_off;
+        y -= y_off;
+        if (tilt != 0.0) {
+            double ct = cos(-tilt), st = sin(-tilt);
+            double xn  = ct * x  - st * y;
+            double yn  = st * x  + ct * y;
+            double pxn = ct * px - st * py;
+            double pyn = st * px + ct * py;
+            x = xn; y = yn; px = pxn; py = pyn;
+        }
+    } else {
+        /* unset: body → lab: rotate by +tilt, then add offset */
+        if (tilt != 0.0) {
+            double ct = cos(tilt), st = sin(tilt);
+            double xn  = ct * x  - st * y;
+            double yn  = st * x  + ct * y;
+            double pxn = ct * px - st * py;
+            double pyn = st * px + ct * py;
+            x = xn; y = yn; px = pxn; py = pyn;
+        }
+        x += x_off;
+        y += y_off;
+    }
+
+    vx[i] = x; vpx[i] = px; vy[i] = y; vpy[i] = py;
+}
+
+extern "C" void gpu_misalign_(
+    double x_off, double y_off, double tilt,
+    int set_flag, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    misalign_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3],
+        d_state,
+        x_off, y_off, tilt, set_flag, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
+ * RECTANGULAR APERTURE CHECK KERNEL
+ *
+ * Checks x1_limit, x2_limit, y1_limit, y2_limit.
+ * Limits of 0 mean no limit in that direction.
+ * Lost particles have their state set to lost constants.
+ * ========================================================================== */
+
+#define LOST_NEG_X 3   /* lost_neg_x$ */
+#define LOST_POS_X 4   /* lost_pos_x$ */
+#define LOST_NEG_Y 5   /* lost_neg_y$ */
+#define LOST_POS_Y 6   /* lost_pos_y$ */
+
+__global__ void aperture_rect_kernel(
+    const double *vx, const double *vy, int *state,
+    double x1_lim, double x2_lim, double y1_lim, double y2_lim,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double x = vx[i], y = vy[i];
+
+    if (x1_lim > 0.0 && x < -x1_lim) { state[i] = LOST_NEG_X; return; }
+    if (x2_lim > 0.0 && x >  x2_lim) { state[i] = LOST_POS_X; return; }
+    if (y1_lim > 0.0 && y < -y1_lim) { state[i] = LOST_NEG_Y; return; }
+    if (y2_lim > 0.0 && y >  y2_lim) { state[i] = LOST_POS_Y; return; }
+}
+
+extern "C" void gpu_check_aperture_rect_(
+    double x1_lim, double x2_lim, double y1_lim, double y2_lim, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    aperture_rect_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[2], d_state,
+        x1_lim, x2_lim, y1_lim, y2_lim, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
+ * S-POSITION UPDATE KERNEL — update s for all alive particles
+ * ========================================================================== */
+
+__global__ void s_update_kernel(double *s_pos, const int *state, double s_val, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+    s_pos[i] = s_val;
+}
+
+extern "C" void gpu_s_update_(double s_val, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    s_update_kernel<<<blocks, threads>>>(d_s, d_state, s_val, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
+ * ORBIT-TOO-LARGE CHECK — flag particles with |coord| > 1 as lost
+ * ========================================================================== */
+
+__global__ void orbit_check_kernel(
+    const double *vx, const double *vpx, const double *vy, const double *vpy,
+    const double *vz, const double *vpz,
+    int *state, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    /* Matches orbit_too_large threshold */
+    if (fabs(vx[i])  > 1.0 || fabs(vpx[i]) > 1.0 ||
+        fabs(vy[i])  > 1.0 || fabs(vpy[i]) > 1.0 ||
+        fabs(vz[i])  > 1.0 || fabs(vpz[i]) > 1.0) {
+        state[i] = LOST_PZ;
+    }
+}
+
+extern "C" void gpu_orbit_check_(int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    orbit_check_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
 /* --------------------------------------------------------------------------
  * gpu_tracking_cleanup — release cached device buffers
  * -------------------------------------------------------------------------- */

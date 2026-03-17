@@ -102,6 +102,8 @@ end subroutine track_beam
 
 subroutine track_bunch (lat, bunch, ele1, ele2, err, centroid, direction, bunch_track)
 
+use gpu_tracking_mod, only: track_bunch_thru_elements_gpu, ele_gpu_eligible
+
 implicit none
 
 type (lat_struct), target :: lat
@@ -150,9 +152,23 @@ if (integer_option(1, direction) == -1) then
 
 else
   if (e1%ix_ele < e2%ix_ele) then
-    do i = e1%ix_ele+1, e2%ix_ele
+    i = e1%ix_ele + 1
+    do while (i <= e2%ix_ele)
+      ! Try multi-element GPU batch tracking
+      if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(branch%ele(i)) .and. &
+          .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
+          bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
+          .not. present(bunch_track)) then
+        call track_bunch_thru_elements_gpu(bunch, branch, i, e2%ix_ele, j)
+        if (j >= i) then
+          i = j + 1
+          cycle
+        endif
+      endif
+      ! Fall back to per-element tracking
       call track1_bunch (bunch, branch%ele(i), err, centroid, direction, bunch_track)
       if (err) return
+      i = i + 1
     enddo
 
   else
