@@ -323,6 +323,12 @@ call bmad_parser('lat_quad_elliptical.bmad', lat)
 call run_aperture_test('Test 34: Quad elliptical aperture', lat, tol, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 35: Lcavity with absolute_time_tracking
+! ======================================================================
+call bmad_parser('lat_lcavity_abstime.bmad', lat)
+call run_comparison_test('Test 35: Lcavity abstime', lat, tol, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *

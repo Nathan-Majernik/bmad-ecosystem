@@ -95,7 +95,8 @@ interface
                                voltage_tot, l_active, &
                                cavity_type, &
                                fringe_at, charge_ratio, &
-                               n_particles) bind(C, name='gpu_track_lcavity_')
+                               n_particles, &
+                               abs_time, phi0_no_multi) bind(C, name='gpu_track_lcavity_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
     integer(C_INT), intent(inout) :: state(*)
@@ -111,6 +112,8 @@ interface
     integer(C_INT), value, intent(in) :: fringe_at
     real(C_DOUBLE), value, intent(in) :: charge_ratio
     integer(C_INT), value, intent(in) :: n_particles
+    integer(C_INT), value, intent(in) :: abs_time
+    real(C_DOUBLE), value, intent(in) :: phi0_no_multi
   end subroutine
 
   function gpu_tracking_available() result(avail) bind(C, name='gpu_tracking_available_')
@@ -201,7 +204,8 @@ interface
                                     voltage_tot, l_active, &
                                     cavity_type, &
                                     fringe_at, charge_ratio, &
-                                    n_particles) bind(C, name='gpu_track_lcavity_dev_')
+                                    n_particles, &
+                                    abs_time, phi0_no_multi) bind(C, name='gpu_track_lcavity_dev_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: mc2
     real(C_DOUBLE), intent(in) :: step_s0(*), step_s(*), step_p0c(*), step_p1c(*)
@@ -214,6 +218,8 @@ interface
     integer(C_INT), value, intent(in) :: fringe_at
     real(C_DOUBLE), value, intent(in) :: charge_ratio
     integer(C_INT), value, intent(in) :: n_particles
+    integer(C_INT), value, intent(in) :: abs_time
+    real(C_DOUBLE), value, intent(in) :: phi0_no_multi
   end subroutine
 
   ! ----- Cross-element persistence kernels -----
@@ -1147,7 +1153,8 @@ logical,                 intent(out)   :: did_track
 #ifdef USE_GPU_TRACKING
 integer(C_INT) :: n
 integer :: j, nn, ix_mag_max, ix_elec_max, n_steps
-real(rp) :: mc2, phi0_total
+real(rp) :: mc2, phi0_total, phi0_no_multi
+integer :: abs_time_flag
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 type (fringe_field_info_struct) :: fringe_info
@@ -1179,9 +1186,6 @@ if (ele%value(l$) == 0) return
 ! Zero rf_frequency with non-zero voltage → CPU
 if (ele%value(rf_frequency$) == 0) return
 
-! Absolute time tracking → CPU (phase computation differs)
-if (bmad_com%absolute_time_tracking) return
-
 ! Get the super lord for RF step data
 lord => pointer_to_super_lord(ele)
 
@@ -1210,8 +1214,11 @@ mc2 = mass_of(bunch%particle(1)%species)
 n_steps = nint(lord%value(n_rf_steps$))
 has_misalign = ele%bookkeeping_state%has_misalign
 
-! Compute total phase offset (relative time tracking, non-multipass)
-phi0_total = lord%value(phi0$) + lord%value(phi0_err$) + lord%value(phi0_multipass$)
+! Phase offsets
+phi0_no_multi = lord%value(phi0$) + lord%value(phi0_err$)
+phi0_total = phi0_no_multi + lord%value(phi0_multipass$)
+abs_time_flag = 0
+if (bmad_com%absolute_time_tracking) abs_time_flag = 1
 
 ! Extract step data from the lord's RF step array (indices 0..n_steps+1)
 allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
@@ -1253,7 +1260,8 @@ if (apply_rad .and. associated(ele%rad_map)) then
                              lord%value(voltage_tot$), lord%value(l_active$), &
                              int(nint(lord%value(cavity_type$)), C_INT), &
                              int(i_fringe_at, C_INT), charge_ratio_val, &
-                             int(n, C_INT))
+                             int(n, C_INT), &
+                             int(abs_time_flag, C_INT), phi0_no_multi)
   call call_gpu_rad_kick(n, ele%rad_map%rm1)
   call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
                               state_a, beta_a, p0c_a, t_a, &
@@ -1272,7 +1280,8 @@ else
                          lord%value(voltage_tot$), lord%value(l_active$), &
                          int(nint(lord%value(cavity_type$)), C_INT), &
                          int(i_fringe_at, C_INT), charge_ratio_val, &
-                         int(n, C_INT))
+                         int(n, C_INT), &
+                         int(abs_time_flag, C_INT), phi0_no_multi)
 endif
 
 ! Exit: SoA→AoS, deallocate, misalignment, update s (no CPU fringe)
@@ -1581,7 +1590,8 @@ logical :: has_mag_multipoles, has_elec_multipoles
 type (ele_struct), pointer :: lord
 type (rf_stair_step_struct), pointer :: step
 integer :: nn, n_steps, i_fringe_at
-real(rp) :: phi0_total, charge_ratio_val
+real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val
+integer :: abs_time_flag
 real(C_DOUBLE), allocatable :: h_step_s0(:), h_step_s(:)
 real(C_DOUBLE), allocatable :: h_step_p0c(:), h_step_p1c(:)
 real(C_DOUBLE), allocatable :: h_step_scale(:), h_step_time(:)
@@ -1983,7 +1993,6 @@ integer(C_INT), intent(in) :: np
 
 if (ele%value(l$) == 0) return
 if (ele%value(rf_frequency$) == 0) return
-if (bmad_com%absolute_time_tracking) return
 
 lord => pointer_to_super_lord(ele)
 if (lord%value(ks$) /= 0) return
@@ -2004,7 +2013,10 @@ charge_ratio_val = charge_of(bunch%particle(1)%species) / (2.0_rp * charge_of(lo
 
 mc2 = mass_of(bunch%particle(1)%species)
 n_steps = nint(lord%value(n_rf_steps$))
-phi0_total = lord%value(phi0$) + lord%value(phi0_err$) + lord%value(phi0_multipass$)
+phi0_no_multi = lord%value(phi0$) + lord%value(phi0_err$)
+phi0_total = phi0_no_multi + lord%value(phi0_multipass$)
+abs_time_flag = 0
+if (bmad_com%absolute_time_tracking) abs_time_flag = 1
 
 allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
 allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
@@ -2030,7 +2042,8 @@ call gpu_track_lcavity_dev(mc2, &
                            lord%value(voltage_tot$), lord%value(l_active$), &
                            int(nint(lord%value(cavity_type$)), C_INT), &
                            int(i_fringe_at, C_INT), charge_ratio_val, &
-                           int(np, C_INT))
+                           int(np, C_INT), &
+                           int(abs_time_flag, C_INT), phi0_no_multi)
 
 deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
 end subroutine dispatch_lcavity_body

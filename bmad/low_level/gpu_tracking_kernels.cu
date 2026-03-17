@@ -1022,7 +1022,9 @@ __global__ void lcavity_kernel(
     int cavity_type,        /* 1=standing_wave, 2=traveling_wave */
     int fringe_at,          /* 0=none, 1=entrance, 2=exit, 3=both */
     double charge_ratio,    /* charge_of(species) / (2 * charge_of(ref_species)) */
-    int n_particles)
+    int n_particles,
+    int abs_time,           /* 1 if absolute_time_tracking */
+    double phi0_no_multi)   /* phi0 + phi0_err (without phi0_multipass) */
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_particles) return;
@@ -1066,9 +1068,23 @@ __global__ void lcavity_kernel(
             }
 
             /* ---- Energy kick ---- */
-            /* Compute RF phase (relative time tracking) */
-            double particle_time = -z / (beta_val * C_LIGHT);
-            double phase = TWOPI * (phi0_total + particle_time * rf_frequency);
+            /* Compute RF phase */
+            double particle_time, phase;
+            if (abs_time) {
+                /* Absolute time tracking: use particle t, no phi0_multipass.
+                 * modulo2(t, half_period) maps t into [-half_period, half_period] */
+                double half_period = 0.5 / rf_frequency;
+                double period = 1.0 / rf_frequency;
+                particle_time = fmod(t, period);
+                if (particle_time > half_period) particle_time -= period;
+                if (particle_time < -half_period) particle_time += period;
+                particle_time -= step_time[ix];
+                phase = TWOPI * (phi0_no_multi + particle_time * rf_frequency);
+            } else {
+                /* Relative time tracking */
+                particle_time = -z / (beta_val * C_LIGHT);
+                phase = TWOPI * (phi0_total + particle_time * rf_frequency);
+            }
 
             /* Energy change */
             double dE_amp = (voltage + voltage_err) * step_scale[ix] * field_autoscale;
@@ -1189,7 +1205,8 @@ extern "C" void gpu_track_lcavity_(
     double voltage_tot, double l_active,
     int cavity_type,
     int fringe_at, double charge_ratio,
-    int n_particles)
+    int n_particles,
+    int abs_time, double phi0_no_multi)
 {
     if (ensure_buffers(n_particles) != 0) return;
 
@@ -1222,7 +1239,8 @@ extern "C" void gpu_track_lcavity_(
         rf_frequency, phi0_total, voltage_tot, l_active,
         cavity_type,
         fringe_at, charge_ratio,
-        n_particles);
+        n_particles,
+        abs_time, phi0_no_multi);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 
@@ -1499,7 +1517,8 @@ extern "C" void gpu_track_lcavity_dev_(
     double voltage_tot, double l_active,
     int cavity_type,
     int fringe_at, double charge_ratio,
-    int n_particles)
+    int n_particles,
+    int abs_time, double phi0_no_multi)
 {
     int n_steps_total = n_rf_steps + 2;
     if (ensure_step_buffers(n_steps_total) != 0) return;
@@ -1523,7 +1542,8 @@ extern "C" void gpu_track_lcavity_dev_(
         rf_frequency, phi0_total, voltage_tot, l_active,
         cavity_type,
         fringe_at, charge_ratio,
-        n_particles);
+        n_particles,
+        abs_time, phi0_no_multi);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 }
