@@ -1789,6 +1789,65 @@ extern "C" void gpu_check_aperture_rect_(
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 }
 
+/* --------------------------------------------------------------------------
+ * Elliptical aperture check kernel.
+ * Particle is lost if (x/x_width)^2 + (y/y_width)^2 > 1.
+ * x_width = (x1_lim + x2_lim)/2, y_width = (y1_lim + y2_lim)/2.
+ * Lost direction determined by max deviation.
+ * -------------------------------------------------------------------------- */
+__global__ void aperture_ellipse_kernel(
+    const double *vx, const double *vy, int *state,
+    double x1_lim, double x2_lim, double y1_lim, double y2_lim,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double x = vx[i], y = vy[i];
+
+    /* Match CPU elliptical_params_setup:
+     * x1_lim/x2_lim are positive element values.
+     * CPU negates x1_limit: lim1 = -x1_limit, lim2 = x2_limit
+     * width2 = (lim2 - lim1)/2 = (x1+x2)/2
+     * center = (lim2 + lim1)/2 = (x2-x1)/2
+     * pos = x - center */
+    double x_width2 = (x1_lim + x2_lim) * 0.5;
+    double y_width2 = (y1_lim + y2_lim) * 0.5;
+    double x_center = (x2_lim - x1_lim) * 0.5;
+    double y_center = (y2_lim - y1_lim) * 0.5;
+
+    if (x_width2 <= 0.0 || y_width2 <= 0.0) return;
+
+    double xp = x - x_center;
+    double yp = y - y_center;
+    double rx = xp / x_width2;
+    double ry = yp / y_width2;
+    double r2 = rx*rx + ry*ry;
+
+    if (r2 <= 1.0) return;
+
+    /* Match CPU: direction from abs(x/xw) vs abs(y/yw) */
+    if (fabs(rx) > fabs(ry)) {
+        state[i] = (xp > 0.0) ? LOST_POS_X : LOST_NEG_X;
+    } else {
+        state[i] = (yp > 0.0) ? LOST_POS_Y : LOST_NEG_Y;
+    }
+}
+
+extern "C" void gpu_check_aperture_ellipse_(
+    double x1_lim, double x2_lim, double y1_lim, double y2_lim, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    aperture_ellipse_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[2], d_state,
+        x1_lim, x2_lim, y1_lim, y2_lim, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
 /* ==========================================================================
  * S-POSITION UPDATE KERNEL — update s for all alive particles
  * ========================================================================== */

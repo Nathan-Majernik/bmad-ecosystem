@@ -98,7 +98,17 @@ p_combo: pipe, L = 1.0,
     x1_limit = 4e-3, x2_limit = 4e-3,
     y1_limit = 4e-3, y2_limit = 4e-3
 
-! 21. Final drift
+! 21. Drift with elliptical aperture
+d_ellip: drift, L = 1.0, aperture_type = elliptical,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+
+! 22. Quad with elliptical aperture
+q_ellip: quadrupole, L = 0.5, k1 = 0.7, aperture_type = elliptical,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+
+! 23. Final drift
 d_final: drift, L = 1.0
 
 lat: line = (d_plain, q_plain, d_aper, q_misalign, q_fringe,
@@ -106,6 +116,6 @@ lat: line = (d_plain, q_plain, d_aper, q_misalign, q_fringe,
              b_plain, b_k1, b_fringe_mis, b_multi,
              lc_plain, lc_misalign,
              p_plain, p_misalign, p_aper, p_combo,
-             d_final)
+             d_ellip, q_ellip, d_final)
 
 use, lat

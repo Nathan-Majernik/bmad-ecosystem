@@ -311,6 +311,18 @@ call bmad_parser('lat_pipe_combo.bmad', lat)
 call run_aperture_test('Test 32: Pipe combo+aperture', lat, tol, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 33: Drift with elliptical aperture
+! ======================================================================
+call bmad_parser('lat_drift_elliptical.bmad', lat)
+call run_aperture_test('Test 33: Drift elliptical aperture', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 34: Quad with elliptical aperture
+! ======================================================================
+call bmad_parser('lat_quad_elliptical.bmad', lat)
+call run_aperture_test('Test 34: Quad elliptical aperture', lat, tol, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *

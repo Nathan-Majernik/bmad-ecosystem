@@ -238,6 +238,13 @@ interface
     integer(C_INT), value, intent(in) :: n
   end subroutine
 
+  subroutine gpu_check_aperture_ellipse(x1_lim, x2_lim, y1_lim, y2_lim, n) &
+      bind(C, name='gpu_check_aperture_ellipse_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: x1_lim, x2_lim, y1_lim, y2_lim
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
   subroutine gpu_s_update(s_val, n) bind(C, name='gpu_s_update_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: s_val
@@ -1436,9 +1443,13 @@ case (sbend$)
 end select
 if (has_fringe_needs_cpu) return
 
-! Elements with apertures need full CPU check_aperture_limit
+! Rectangular and elliptical apertures can be checked on GPU.
+! Wall3d and offset_moves_aperture need full CPU check_aperture_limit.
 if (ele%value(x1_limit$) /= 0 .or. ele%value(x2_limit$) /= 0 .or. &
-    ele%value(y1_limit$) /= 0 .or. ele%value(y2_limit$) /= 0) return
+    ele%value(y1_limit$) /= 0 .or. ele%value(y2_limit$) /= 0) then
+  if (ele%aperture_type /= rectangular$ .and. ele%aperture_type /= elliptical$) return
+  if (ele%offset_moves_aperture) return
+endif
 
 can_stay = .true.
 end function ele_gpu_can_stay_on_device
@@ -1560,6 +1571,9 @@ do ie = ix_start, ix_end
       on_device = .true.
     endif
 
+    ! Entrance aperture check on device (before misalignment, in lab frame)
+    call dispatch_aperture_on_device(ele, n, entrance_end$)
+
     ! Misalignment on device (simple: offset + tilt, non-bend)
     has_misalign = ele%bookkeeping_state%has_misalign
     if (has_misalign) then
@@ -1591,6 +1605,9 @@ do ie = ix_start, ix_end
       call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                          ele%value(tilt_tot$), -1, n)
     endif
+
+    ! Exit aperture check on device (after misalignment removed, in lab frame)
+    call dispatch_aperture_on_device(ele, n, exit_end$)
 
     ! Update s position on device
     call gpu_s_update(ele%s, n)
@@ -1682,6 +1699,35 @@ nb = n * 8  ! sizeof(double) = 8
 ! For drifts, the drift kernel updates d_s. We need to upload d_s before the
 ! drift and download after. Let's handle this in dispatch_body_kernel_on_device.
 end subroutine upload_s_array
+
+!------------------------------------------------------------------------
+! dispatch_aperture_on_device — apply rectangular aperture check on device
+!------------------------------------------------------------------------
+subroutine dispatch_aperture_on_device(ele, np, at_edge)
+
+type (ele_struct), intent(in) :: ele
+integer(C_INT), intent(in) :: np
+integer, intent(in) :: at_edge  ! entrance_end$ or exit_end$
+
+! Check if aperture should be applied at this edge
+! aperture_at: entrance_end$=1, exit_end$=2, both_ends$=3, no_end$/no_aperture$=4
+if (ele%aperture_at == no_aperture$) return
+if (ele%aperture_at == entrance_end$ .and. at_edge /= entrance_end$) return
+if (ele%aperture_at == exit_end$ .and. at_edge /= exit_end$) return
+
+if (ele%value(x1_limit$) == 0 .and. ele%value(x2_limit$) == 0 .and. &
+    ele%value(y1_limit$) == 0 .and. ele%value(y2_limit$) == 0) return
+
+select case (ele%aperture_type)
+case (rectangular$)
+  call gpu_check_aperture_rect(ele%value(x1_limit$), ele%value(x2_limit$), &
+                                ele%value(y1_limit$), ele%value(y2_limit$), np)
+case (elliptical$)
+  call gpu_check_aperture_ellipse(ele%value(x1_limit$), ele%value(x2_limit$), &
+                                   ele%value(y1_limit$), ele%value(y2_limit$), np)
+end select
+
+end subroutine dispatch_aperture_on_device
 
 !------------------------------------------------------------------------
 ! dispatch_fringe_on_device — apply fringe kicks on device
