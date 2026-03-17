@@ -360,7 +360,8 @@ end function
 ! Runtime conditions (bmad_com flags, particle direction, wakefields)
 ! are NOT checked here — those are evaluated at dispatch time.
 !
-! Currently supported element types: drift, quadrupole, sbend, lcavity, pipe.
+! Currently supported element types: drift, quadrupole, sbend, lcavity,
+! pipe, monitor, instrument.
 !------------------------------------------------------------------------
 function ele_gpu_eligible(ele) result (eligible)
 type (ele_struct), intent(in) :: ele
@@ -376,7 +377,7 @@ if (.not. ele%is_on) return
 
 ! Check supported element types
 select case (ele%key)
-case (drift$, quadrupole$, sbend$, lcavity$, pipe$)
+case (drift$, quadrupole$, sbend$, lcavity$, pipe$, monitor$, instrument$)
   eligible = .true.
 end select
 
@@ -397,9 +398,9 @@ eligible = .false.
 if (.not. bmad_com%radiation_damping_on .and. .not. bmad_com%radiation_fluctuations_on) return
 if (ele%value(l$) == 0) return
 
-! Drifts and pipes don't produce radiation
+! Drifts, pipes, monitors, and instruments don't produce radiation
 select case (ele%key)
-case (drift$, pipe$)
+case (drift$, pipe$, monitor$, instrument$)
   return
 end select
 
@@ -1409,9 +1410,18 @@ logical :: has_fringe_needs_cpu, has_complex_misalign
 can_stay = .false.
 if (.not. ele_gpu_eligible(ele)) return
 
-! Pipe elements can have multipoles, fringe, etc. that require the full
-! track_bunch_thru_pipe_gpu path. Always fall back to per-element for pipes.
-if (ele%key == pipe$) return
+! Pipe, monitor, and instrument elements can have multipoles that require
+! the pipe GPU path (quad kernel with b1=0). Without multipoles, they're
+! simple drifts and can stay on device.
+if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$) then
+  if (allocated(ele%multipole_cache)) then
+    if (ele%multipole_cache%ix_pole_mag_max > -1 .or. &
+        ele%multipole_cache%ix_kick_mag_max > -1 .or. &
+        ele%multipole_cache%ix_pole_elec_max > -1 .or. &
+        ele%multipole_cache%ix_kick_elec_max > -1) return
+  endif
+  ! No multipoles: can stay on device as drift
+endif
 
 ! Check for complex misalignment (pitches, z_offset, or bend misalignment)
 has_complex_misalign = .false.
@@ -1431,8 +1441,8 @@ if (has_complex_misalign) return
 ! Check for fringe that requires CPU
 has_fringe_needs_cpu = .false.
 select case (ele%key)
-case (drift$, pipe$)
-  ! Drifts and pipes never have fringe
+case (drift$, pipe$, monitor$, instrument$)
+  ! Drifts, pipes, monitors, and instruments never have fringe
 case (lcavity$)
   ! Lcavity fringe is already handled on GPU
 case (quadrupole$)
@@ -1628,7 +1638,7 @@ do ie = ix_start, ix_end
       call track_bunch_thru_bend_gpu(bunch, ele, branch%param, did_track)
     case (lcavity$)
       call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
-    case (pipe$)
+    case (pipe$, monitor$, instrument$)
       call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, did_track)
     end select
 
@@ -1772,7 +1782,7 @@ type (lat_param_struct), intent(in) :: param
 integer(C_INT), intent(in) :: np
 
 select case (ele%key)
-case (drift$, pipe$)
+case (drift$, pipe$, monitor$, instrument$)
   call dispatch_drift_body(ele, np)
 case (quadrupole$)
   call dispatch_quad_body(ele, param, np)
