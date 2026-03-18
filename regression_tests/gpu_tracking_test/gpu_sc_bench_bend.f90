@@ -40,12 +40,12 @@ endif
 print *
 print *, '=================================================================='
 print *, '  Sbend + CSR/SC Benchmark'
-print *, '  10 x 1m sbends (g=0.5), 100K particles'
+print *, '  10 x 1m sbends (g=0.5), 1M particles'
 print *, '=================================================================='
 print *
 
 ! Beam init: 100K particles
-beam_init%n_particle = 100000
+beam_init%n_particle = 1000000
 beam_init%random_engine = 'quasi'
 beam_init%a_emit = 5e-7
 beam_init%b_emit = 5e-7
@@ -91,7 +91,7 @@ block
   call init_beam_distribution(branch%ele(0), branch%param, beam_init, warmup, err)
   bmad_com%gpu_tracking_on = .true.
   call track_beam(lat_nosc, warmup, err=err)
-  beam_init%n_particle = 100000
+  beam_init%n_particle = 1000000
 end block
 
 ! ======================================================================

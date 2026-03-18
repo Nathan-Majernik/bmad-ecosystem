@@ -36,9 +36,9 @@ end type
 type (bunch_struct), target :: bunch
 type (branch_struct), target :: branch
 type (coord_struct), pointer :: p
-type (csr_particle_position_struct) :: position(size(bunch%particle))
-type (this_w_struct) :: w(size(bunch%particle))
-type (em_field_struct) :: sc_field(size(bunch%particle))
+type (csr_particle_position_struct), allocatable :: position(:)
+type (this_w_struct), allocatable :: w(:)
+type (em_field_struct) :: sc_field(:)
 type (mesh3d_struct) :: mesh3d, mesh3d_image
 type (bunch_params_struct), optional :: bunch_params
 type (floor_position_struct) pos, pos0
@@ -47,6 +47,10 @@ integer :: n, n_alive, i, imin(1), k
 real(rp) :: beta, ratio, t_end, s_ave, w_mat_inv(3,3)
 real(rp) :: Evec(3), Bvec(3), Evec_image(3), sigma(3)
 logical :: include_image, err, bend_here
+
+! Allocate large local arrays on heap (not stack) to avoid stack overflow with large bunches
+n = size(bunch%particle)
+allocate(position(n), w(n))
 
 ! Initialize variables
 mesh3d%nhi = space_charge_com%space_charge_mesh_size
@@ -199,7 +203,6 @@ implicit none
 
 type (bunch_struct), target :: bunch
 type (ele_struct) :: ele
-type (em_field_struct) :: extra_field(size(bunch%particle))
 type (coord_struct), pointer :: p
 type (em_field_struct) :: sc_field(:)
 type (bunch_params_struct) :: bunch_params
