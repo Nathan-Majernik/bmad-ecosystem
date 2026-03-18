@@ -462,6 +462,7 @@ type (rad_map_ele_struct) rad_map_save
 real(rp) sig(6,6), significant_length, s_slice_start, s_slice_end, s_travel
 real(rp) :: value1, value2, f, time0, time, old_time, s_start, s_end, s_target, ds_save
 real(rp) :: prof_track, prof_lost, prof_params, prof_t0, prof_t1
+logical :: gpu_deferred_flush_saved
 
 integer i, n, i_uni, ip, ig, ic, ie
 integer what_lat, n_lost_old, ie_start, ie_end, i_uni_to, ix_track
@@ -542,11 +543,10 @@ n_loop = 0    ! Used for debugging
 n_lost_old = 0
 prof_track = 0; prof_lost = 0; prof_params = 0
 
-! Enable deferred GPU flush when GPU deferred mode is on.
-! This prevents track_bunch from downloading particles after every element.
-if (bmad_com%gpu_tracking_on .and. s%global%gpu_deferred_bunch_params) then
-  bmad_com%gpu_deferred_flush = .true.
-endif
+! Enable deferred GPU flush for this tracking pass.
+! Saves the prior value and restores it at the end.
+gpu_deferred_flush_saved = bmad_com%gpu_deferred_flush
+if (bmad_com%gpu_tracking_on) bmad_com%gpu_deferred_flush = .true.
 
 ie = ie_start
 s_target = s_start
@@ -683,7 +683,7 @@ do
   ! This eliminates the O(N_particle) sigma matrix computation that dominates
   ! GPU tracking time when called at every element.
 
-  if (bmad_com%gpu_tracking_on .and. s%global%gpu_deferred_bunch_params .and. &
+  if (bmad_com%gpu_deferred_flush .and. &
       ie /= ie_start .and. ie /= ie_end .and. ix_slice == -1 .and. &
       .not. tao_model_ele(ie)%save_beam_internally) then
     ! Lightweight: just record particle counts (no sigma matrix)
@@ -747,8 +747,8 @@ do
   endif
 enddo
 
-! Restore deferred flush and ensure final flush
-bmad_com%gpu_deferred_flush = .false.
+! Restore deferred flush setting
+bmad_com%gpu_deferred_flush = gpu_deferred_flush_saved
 
 ! GPU performance profile output
 if (bmad_com%gpu_tracking_on) then

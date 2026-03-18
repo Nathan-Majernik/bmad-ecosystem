@@ -2339,7 +2339,7 @@ type bmad_common_struct
                                                        !   Falls back to CPU silently when GPU can't handle an element.
   logical :: gpu_deferred_flush = .false.              ! Defer GPU→CPU particle download to caller.
                                                        !   When true, track_bunch does not flush persistent GPU data.
-                                                       !   Caller must flush explicitly before accessing particle data.
+                                                       !   Caller (e.g. Tao) flushes at save points and end of tracking.
 end type
   
 type (bmad_common_struct), save, target :: bmad_com

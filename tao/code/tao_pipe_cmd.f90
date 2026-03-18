@@ -4613,7 +4613,6 @@ case ('global')
   nl=incr(nl); write (li(nl), lmt) 'stop_on_error;LOGIC;T;',                  s%global%stop_on_error
   nl=incr(nl); write (li(nl), lmt) 'box_plots;LOGIC;T;',                      s%global%box_plots
   nl=incr(nl); write (li(nl), lmt) 'beam_timer_on;LOGIC;T;',                  s%global%beam_timer_on
-  nl=incr(nl); write (li(nl), lmt) 'gpu_deferred_bunch_params;LOGIC;T;',      s%global%gpu_deferred_bunch_params
   nl=incr(nl); write (li(nl), lmt) 'var_limits_on;LOGIC;T;',                  s%global%var_limits_on
   nl=incr(nl); write (li(nl), lmt) 'only_limit_opt_vars;LOGIC;T;',            s%global%only_limit_opt_vars
   nl=incr(nl); write (li(nl), lmt) 'opt_match_auto_recalc;LOGIC;T;',          s%global%opt_match_auto_recalc
