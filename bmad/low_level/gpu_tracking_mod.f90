@@ -1702,8 +1702,9 @@ do ie = ix_start, ix_end
     ! Exit aperture check on device (after misalignment removed, in lab frame)
     call dispatch_aperture_on_device(ele, n, exit_end$)
 
-    ! Update s position on device
+    ! Update s position on device and host
     call gpu_s_update(ele%s, n)
+    s_a(1:n) = ele%s
 
     ! Orbit-too-large check on device
     call gpu_orbit_check(n)
