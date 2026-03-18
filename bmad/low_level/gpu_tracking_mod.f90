@@ -21,11 +21,21 @@ public :: track_bunch_thru_elements_gpu
 public :: ele_gpu_can_stay_on_device
 public :: gpu_upload_particles, gpu_download_particles
 public :: gpu_space_charge_3d, gpu_csr_bin_particles, gpu_csr_apply_kicks
+public :: gpu_persistent_track_element, gpu_persistent_flush, gpu_persistent_seed
 
 ! Whether gpu_tracking_init has been called
 logical, save :: gpu_trk_initialized = .false.
 ! Whether CUDA hardware is present (checked once, does not change)
 logical, save :: gpu_hw_available = .false.
+
+! Persistent GPU session state (for cross-call device residence)
+logical, save :: gpu_persist_on_device = .false.
+integer, save :: gpu_persist_n = 0
+integer(8), save :: gpu_persist_bunch_id = 0  ! bunch fingerprint to detect new beams
+real(rp), allocatable, save :: gp_vx(:), gp_vpx(:), gp_vy(:), gp_vpy(:)
+real(rp), allocatable, save :: gp_vz(:), gp_vpz(:)
+real(rp), allocatable, save :: gp_beta(:), gp_p0c(:), gp_t(:), gp_s(:)
+integer, allocatable, save :: gp_state(:)
 
 #ifdef USE_GPU_TRACKING
 ! ----- C interfaces (gpu_tracking_kernels.cu) ---------------------------------
@@ -2077,5 +2087,395 @@ do j = 1, size(bunch%particle)
 enddo
 
 end subroutine check_apertures_after_gpu
+
+!------------------------------------------------------------------------
+! PERSISTENT GPU SESSION
+!
+! These routines keep particle data on the GPU across multiple calls
+! to track1_bunch_hom. This solves the problem where Tao (or other
+! callers) tracks one element at a time, preventing the multi-element
+! dispatch from batching.
+!
+! gpu_persistent_track_element: Track one element on device. If data
+!   is not yet on device, upload. Leave data on device for next call.
+!   Returns did_track=.true. if handled on GPU.
+!
+! gpu_persistent_flush: Download data from device back to bunch.
+!   Must be called before any CPU-side access to bunch particle data.
+!------------------------------------------------------------------------
+
+subroutine gpu_persistent_track_element(bunch, ele, param, did_track)
+
+use multipole_mod, only: ab_multipole_kicks
+use radiation_mod, only: radiation_map_setup
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer(C_INT) :: n
+integer :: j
+logical :: can_stay, has_misalign, apply_rad
+real(C_DOUBLE) :: misalign_W(3,3), misalign_Lx, misalign_Ly, misalign_Lz
+
+! Per-element scratch for lcavity dispatch
+integer :: ix_mag_max, ix_elec_max, n_steps, n_step, i_fringe_at, abs_time_flag
+real(rp) :: mc2, ele_length, b1, delta_ref_time, e_tot_ele, p0c_ele
+real(rp) :: charge_dir, rel_tracking_charge, length, g, g_tot, dg, rel_charge_dir
+real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+logical :: has_mag_multipoles, has_elec_multipoles
+type (ele_struct), pointer :: lord
+type (rf_stair_step_struct), pointer :: step
+type (fringe_field_info_struct) :: fringe_info
+real(C_DOUBLE), allocatable :: h_step_s0(:), h_step_s(:)
+real(C_DOUBLE), allocatable :: h_step_p0c(:), h_step_p1c(:)
+real(C_DOUBLE), allocatable :: h_step_scale(:), h_step_time(:)
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+can_stay = ele_gpu_can_stay_on_device(ele)
+if (.not. can_stay) then
+  ! Element can't stay on device — flush and let caller handle it
+  if (gpu_persist_on_device) call gpu_persistent_flush(bunch, ele)
+  return
+endif
+
+! Only use persistent path if data is already on device from a previous
+! element. First element in a sequence falls through to per-element path,
+! which then seeds the device for subsequent elements.
+if (.not. gpu_persist_on_device) return
+
+n = size(bunch%particle)
+if (n == 0) return
+
+! Ensure persistent SoA buffers
+if (n > gpu_persist_n) then
+  if (allocated(gp_vx)) deallocate(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                                    gp_state, gp_beta, gp_p0c, gp_t, gp_s)
+  allocate(gp_vx(n), gp_vpx(n), gp_vy(n), gp_vpy(n), gp_vz(n), gp_vpz(n))
+  allocate(gp_state(n), gp_beta(n), gp_p0c(n), gp_t(n), gp_s(n))
+  gpu_persist_n = n
+endif
+
+! Detect new beam: if bunch identity changed (different allocation),
+! invalidate persistent state so we re-upload.
+block
+  integer(8) :: bunch_id
+  bunch_id = transfer(loc(bunch%particle(1)%vec(1)), bunch_id)
+  if (gpu_persist_on_device .and. bunch_id /= gpu_persist_bunch_id) then
+    gpu_persist_on_device = .false.
+  endif
+  gpu_persist_bunch_id = bunch_id
+end block
+
+! Upload if not already on device
+if (.not. gpu_persist_on_device) then
+  call bunch_to_soa(bunch, n, gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                     gp_state, gp_beta, gp_p0c, gp_t)
+  do j = 1, n
+    gp_s(j) = bunch%particle(j)%s
+  enddo
+  call gpu_upload_particles(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                            gp_state, gp_beta, gp_p0c, gp_t, n)
+  gpu_persist_on_device = .true.
+endif
+
+! --- Track one element on device (same logic as track_bunch_thru_elements_gpu) ---
+
+! Entrance aperture
+call dispatch_aperture_on_device_pub(ele, n, entrance_end$)
+
+! Misalignment
+has_misalign = ele%bookkeeping_state%has_misalign
+if (has_misalign) then
+  if (ele%key == sbend$) then
+    call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                       ele%value(ref_tilt_tot$), 1, n)
+  else
+    call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                       ele%value(tilt_tot$), 1, n)
+  endif
+endif
+
+! Entrance fringe
+call dispatch_fringe_on_device_pub(ele, param, n, first_track_edge$)
+
+! Radiation entrance
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) then
+  call ensure_rad_map(ele)
+  if (associated(ele%rad_map)) call call_gpu_rad_kick(n, ele%rad_map%rm0)
+endif
+
+! Body kernel
+call dispatch_body_kernel_pub(bunch, ele, param, n)
+
+! Radiation exit
+if (apply_rad .and. associated(ele%rad_map)) call call_gpu_rad_kick(n, ele%rad_map%rm1)
+
+! Exit fringe
+call dispatch_fringe_on_device_pub(ele, param, n, second_track_edge$)
+
+! Remove misalignment
+if (has_misalign) then
+  if (ele%key == sbend$) then
+    call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                       ele%value(ref_tilt_tot$), -1, n)
+  else
+    call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                       ele%value(tilt_tot$), -1, n)
+  endif
+endif
+
+! Exit aperture
+call dispatch_aperture_on_device_pub(ele, n, exit_end$)
+
+! Update s on device and host
+call gpu_s_update(ele%s, n)
+gp_s(1:n) = ele%s
+
+! Orbit check
+call gpu_orbit_check(n)
+
+did_track = .true.
+#endif
+
+contains
+
+subroutine dispatch_aperture_on_device_pub(ele, np, at_edge)
+type (ele_struct), intent(in) :: ele
+integer(C_INT), intent(in) :: np
+integer, intent(in) :: at_edge
+
+if (ele%aperture_at == no_aperture$) return
+if (ele%aperture_at == entrance_end$ .and. at_edge /= entrance_end$) return
+if (ele%aperture_at == exit_end$ .and. at_edge /= exit_end$) return
+if (ele%value(x1_limit$) == 0 .and. ele%value(x2_limit$) == 0 .and. &
+    ele%value(y1_limit$) == 0 .and. ele%value(y2_limit$) == 0) return
+select case (ele%aperture_type)
+case (rectangular$)
+  call gpu_check_aperture_rect(ele%value(x1_limit$), ele%value(x2_limit$), &
+                                ele%value(y1_limit$), ele%value(y2_limit$), np)
+case (elliptical$)
+  call gpu_check_aperture_ellipse(ele%value(x1_limit$), ele%value(x2_limit$), &
+                                   ele%value(y1_limit$), ele%value(y2_limit$), np)
+end select
+end subroutine
+
+subroutine dispatch_fringe_on_device_pub(ele, param, np, edge)
+use multipole_mod, only: ab_multipole_kicks
+type (ele_struct), intent(in) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+integer, intent(in) :: edge
+integer :: fringe_type_val
+real(rp) :: charge_dir_val
+
+select case (ele%key)
+case (quadrupole$)
+  fringe_type_val = nint(ele%value(fringe_type$))
+  if (fringe_type_val == none$) return
+  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                   ele%orientation * bunch%particle(1)%direction
+  call gpu_quad_fringe(ele%value(k1$), ele%value(fq1$), ele%value(fq2$), &
+                       charge_dir_val, &
+                       int(fringe_type_val, C_INT), int(edge, C_INT), &
+                       int(bunch%particle(1)%time_dir, C_INT), np)
+end select
+end subroutine
+
+subroutine dispatch_body_kernel_pub(bunch, ele, param, np)
+type (bunch_struct), intent(in) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+
+select case (ele%key)
+case (drift$, pipe$, monitor$, instrument$)
+  mc2 = mass_of(bunch%particle(1)%species)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  call gpu_track_drift_dev(gp_s, mc2, ele_length, np)
+
+case (quadrupole$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  has_mag_multipoles = (ix_mag_max > -1)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (has_mag_multipoles .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
+                          e_tot_ele, charge_dir, np, &
+                          a2_arr, b2_arr, cm_arr, &
+                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+
+case (sbend$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  p0c_ele = ele%value(p0c$)
+  if (nint(ele%value(exact_multipoles$)) /= off$) return
+  rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
+                   rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  b1 = b1 * rel_charge_dir
+  if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  g = ele%value(g$)
+  length = bunch%particle(1)%time_dir * ele_length
+  if (length == 0) then; dg = 0; else; dg = bn(0)/ele_length; bn(0) = 0; endif
+  g_tot = (g + dg) * rel_charge_dir
+  has_mag_multipoles = (ix_mag_max > -1)
+  has_elec_multipoles = (ix_elec_max > -1)
+  n_step = 1
+  if (has_mag_multipoles .or. has_elec_multipoles) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
+                          ele_length, delta_ref_time, e_tot_ele, &
+                          rel_charge_dir, p0c_ele, np, &
+                          a2_arr, b2_arr, cm_arr, &
+                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+
+case (lcavity$)
+  if (ele%value(l$) == 0) return
+  if (ele%value(rf_frequency$) == 0) return
+  lord => pointer_to_super_lord(ele)
+  if (lord%value(ks$) /= 0) return
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) return
+  if (ele%value(coupler_strength$) /= 0) return
+  if (nint(lord%value(fringe_type$)) == none$) then
+    i_fringe_at = 0
+  else
+    i_fringe_at = nint(lord%value(fringe_at$))
+    if (i_fringe_at < 1 .or. i_fringe_at > 3) i_fringe_at = 0
+  endif
+  charge_ratio_val = charge_of(bunch%particle(1)%species) / (2.0_rp * charge_of(lord%ref_species))
+  mc2 = mass_of(bunch%particle(1)%species)
+  n_steps = nint(lord%value(n_rf_steps$))
+  phi0_no_multi = lord%value(phi0$) + lord%value(phi0_err$)
+  phi0_total = phi0_no_multi + lord%value(phi0_multipass$)
+  abs_time_flag = 0
+  if (bmad_com%absolute_time_tracking) abs_time_flag = 1
+  allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
+  allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
+  allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
+  do j = 0, n_steps + 1
+    step => lord%rf%steps(j)
+    h_step_s0(j+1) = step%s0; h_step_s(j+1) = step%s
+    h_step_p0c(j+1) = step%p0c; h_step_p1c(j+1) = step%p1c
+    h_step_scale(j+1) = step%scale; h_step_time(j+1) = step%time
+  enddo
+  call gpu_track_lcavity_dev(mc2, h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
+                             h_step_scale, h_step_time, int(n_steps, C_INT), &
+                             lord%value(voltage$), lord%value(voltage_err$), &
+                             lord%value(field_autoscale$), &
+                             ele%value(rf_frequency$), phi0_total, &
+                             lord%value(voltage_tot$), lord%value(l_active$), &
+                             int(nint(lord%value(cavity_type$)), C_INT), &
+                             int(i_fringe_at, C_INT), charge_ratio_val, &
+                             int(np, C_INT), int(abs_time_flag, C_INT), phi0_no_multi)
+  deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
+end select
+end subroutine
+
+end subroutine gpu_persistent_track_element
+
+!------------------------------------------------------------------------
+! gpu_persistent_flush — download particle data from device to bunch
+!
+! Must be called before any CPU-side access to bunch particles,
+! and when transitioning to a non-GPU element.
+!------------------------------------------------------------------------
+subroutine gpu_persistent_flush(bunch, ele)
+
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct), intent(inout) :: bunch
+type (ele_struct),   intent(in)    :: ele
+integer :: j, n
+
+if (.not. gpu_persist_on_device) return
+
+n = size(bunch%particle)
+call gpu_download_particles(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                            gp_state, gp_beta, gp_p0c, gp_t, n, 1, 1)
+call soa_to_bunch(bunch, ele, n, gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                   gp_state, gp_beta, gp_p0c, gp_t, .true., .true.)
+do j = 1, n
+  bunch%particle(j)%s = gp_s(j)
+enddo
+bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
+gpu_persist_on_device = .false.
+
+end subroutine gpu_persistent_flush
+
+!------------------------------------------------------------------------
+! gpu_persistent_seed — upload bunch data to device after per-element
+! GPU tracking, so the next element can use the persistent path.
+!------------------------------------------------------------------------
+subroutine gpu_persistent_seed(bunch, ele)
+
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct), intent(in) :: bunch
+type (ele_struct),   intent(in) :: ele
+integer :: j, n
+
+#ifdef USE_GPU_TRACKING
+if (.not. ele_gpu_can_stay_on_device(ele)) return
+
+n = size(bunch%particle)
+
+! Ensure persistent SoA buffers
+if (n > gpu_persist_n) then
+  if (allocated(gp_vx)) deallocate(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                                    gp_state, gp_beta, gp_p0c, gp_t, gp_s)
+  allocate(gp_vx(n), gp_vpx(n), gp_vy(n), gp_vpy(n), gp_vz(n), gp_vpz(n))
+  allocate(gp_state(n), gp_beta(n), gp_p0c(n), gp_t(n), gp_s(n))
+  gpu_persist_n = n
+endif
+
+call bunch_to_soa(bunch, n, gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                   gp_state, gp_beta, gp_p0c, gp_t)
+do j = 1, n
+  gp_s(j) = bunch%particle(j)%s
+enddo
+call gpu_upload_particles(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                          gp_state, gp_beta, gp_p0c, gp_t, n)
+gpu_persist_on_device = .true.
+gpu_persist_bunch_id = transfer(loc(bunch%particle(1)%vec(1)), gpu_persist_bunch_id)
+#endif
+
+end subroutine gpu_persistent_seed
 
 end module gpu_tracking_mod

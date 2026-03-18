@@ -67,41 +67,52 @@ call save_a_bunch_step (ele, bunch, bunch_track, 0.0_rp)
 wake_ele => pointer_to_wake_ele(ele, ds_wake)
 if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bmad_com%lr_wakes_on)) then
 
-  ! GPU batch tracking (opt-in via bmad_com%gpu_tracking_on).
-  ! ele_gpu_eligible checks element type, tracking method, and is_on.
-  ! Runtime conditions (spin, direction) are checked here.
-  ! Radiation damping and fluctuations are now handled on GPU.
+  ! GPU tracking (opt-in via bmad_com%gpu_tracking_on).
+  ! Persistent GPU session: data stays on device across consecutive calls.
+  ! Flushes automatically when a non-GPU element is encountered.
   gpu_did_track = .false.
-  if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
+  if (bmad_com%gpu_tracking_on .and. &
       .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
       bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
 
-    ! Check entrance aperture (track1 normally does this but GPU path bypasses track1)
-    call check_entrance_aperture_for_gpu(bunch, ele, branch%param)
-
-    select case (ele%key)
-    case (drift$)
-      call track_bunch_thru_drift_gpu(bunch, ele, gpu_did_track)
-    case (quadrupole$)
-      call track_bunch_thru_quad_gpu(bunch, ele, branch%param, gpu_did_track)
-    case (sbend$)
-      call track_bunch_thru_bend_gpu(bunch, ele, branch%param, gpu_did_track)
-    case (lcavity$)
-      call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, gpu_did_track)
-    case (pipe$, monitor$, instrument$)
-      call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, gpu_did_track)
-    end select
+    ! Try persistent device-resident tracking (keeps data on GPU across calls)
+    call gpu_persistent_track_element(bunch, ele, branch%param, gpu_did_track)
 
     if (gpu_did_track) then
-      call check_apertures_after_gpu(bunch, ele, branch%param)
-      ! Check for NaN/Inf coordinates (track1 does this via orbit_too_large)
-      do j = 1, size(bunch%particle)
-        if (bunch%particle(j)%state == alive$) then
-          if (orbit_too_large(bunch%particle(j), branch%param)) cycle
-        endif
-      enddo
       bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
       return
+    endif
+
+    ! Persistent path declined — either non-device-resident element or first element.
+    ! Data already flushed if it was on device. Try per-element GPU tracking.
+    if (ele_gpu_eligible(ele)) then
+      call check_entrance_aperture_for_gpu(bunch, ele, branch%param)
+
+      select case (ele%key)
+      case (drift$)
+        call track_bunch_thru_drift_gpu(bunch, ele, gpu_did_track)
+      case (quadrupole$)
+        call track_bunch_thru_quad_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (sbend$)
+        call track_bunch_thru_bend_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (lcavity$)
+        call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (pipe$, monitor$, instrument$)
+        call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, gpu_did_track)
+      end select
+
+      if (gpu_did_track) then
+        call check_apertures_after_gpu(bunch, ele, branch%param)
+        do j = 1, size(bunch%particle)
+          if (bunch%particle(j)%state == alive$) then
+            if (orbit_too_large(bunch%particle(j), branch%param)) cycle
+          endif
+        enddo
+        bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
+        ! Seed persistent state: upload result to device for next element
+        call gpu_persistent_seed(bunch, ele)
+        return
+      endif
     endif
   endif
 

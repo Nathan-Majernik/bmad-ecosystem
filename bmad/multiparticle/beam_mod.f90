@@ -102,7 +102,7 @@ end subroutine track_beam
 
 subroutine track_bunch (lat, bunch, ele1, ele2, err, centroid, direction, bunch_track)
 
-use gpu_tracking_mod, only: track_bunch_thru_elements_gpu, ele_gpu_eligible
+use gpu_tracking_mod, only: track_bunch_thru_elements_gpu, ele_gpu_eligible, gpu_persistent_flush
 
 implicit none
 
@@ -184,6 +184,9 @@ else
     enddo
   endif
 endif
+
+! Flush any persistent GPU data back to bunch at end of tracking
+if (bmad_com%gpu_tracking_on) call gpu_persistent_flush(bunch, branch%ele(e2%ix_ele))
 
 end subroutine track_bunch
 
