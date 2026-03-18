@@ -230,13 +230,21 @@ an ``unphysical'' magnetic or electric field.
 \item[\vn{gpu_tracking_on}] \Newline
 Toggle for GPU-accelerated batch particle tracking (\sref{s:gpu.tracking}). Default is \vn{False}.
 When set to \vn{True}, bunch tracking through eligible elements (\vn{drift}, \vn{quadrupole},
-\vn{sbend}, and \vn{lcavity}) is offloaded to an NVIDIA GPU via CUDA kernels. Elements that are not
-eligible for GPU tracking are silently tracked on the CPU. The \vn{gpu_tracking_init} routine can be
-used to initialize this flag based on hardware availability and the \vn{ACC_ENABLE_GPU_TRACKING}
-environment variable. GPU tracking is not compatible with radiation damping, radiation fluctuations,
-spin tracking, or backward tracking --- if any of these are active, a bunch will be tracked on the
-CPU even if \vn{gpu_tracking_on} is \vn{True}. The \vn{ele_gpu_eligible} function can be used to
-query whether a given element supports GPU tracking.
+\vn{sbend}, \vn{lcavity}, \vn{pipe}, \vn{monitor}, and \vn{instrument}) is offloaded to an NVIDIA
+GPU via CUDA kernels. Elements that are not eligible for GPU tracking are silently tracked on the
+CPU. The \vn{gpu_tracking_init} routine can be used to initialize this flag based on hardware
+availability and the \vn{ACC_ENABLE_GPU_TRACKING} environment variable. GPU tracking supports
+radiation damping and fluctuations, 3D FFT space charge, and 1D CSR. It is not compatible with spin
+tracking or backward tracking --- if either is active, a bunch will be tracked on the CPU even if
+\vn{gpu_tracking_on} is \vn{True}. The \vn{ele_gpu_eligible} function can be used to query whether
+a given element supports GPU tracking.
+%
+\index{gpu_deferred_flush}
+\item[\vn{gpu_deferred_flush}] \Newline
+Default is \vn{False}. When \vn{True}, \vn{track_bunch} does not download particle data from the
+GPU after each call. The caller is responsible for flushing the persistent GPU session at appropriate
+points (e.g., at save elements). Tao automatically enables this during beam tracking for performance.
+See \sref{s:gpu.deferred.flush}.
 %
 \item[\vn{high_energy_space_charge_on}] \Newline
 Default is \vn{False}. Toggle to turn on or off the ultra-relativistic space charge effect in

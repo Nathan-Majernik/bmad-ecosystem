@@ -461,7 +461,15 @@ global switch \vn{global_com%mp_threading_is_safe}. The default is True.
 In addition to CPU-based parallelism via MP and MPI, \bmad supports GPU-accelerated particle
 tracking via NVIDIA CUDA (\sref{s:gpu.tracking}). When \vn{bmad_com%gpu_tracking_on} is set to
 \vn{True}, bunch tracking through eligible elements is offloaded to the GPU, where all particles in
-a bunch are tracked in parallel by CUDA threads.
+a bunch are tracked in parallel by CUDA threads. Supported elements include drift, quadrupole
+(with fringe), sbend (with misalignment), lcavity (relative and absolute time), pipe, monitor, and
+instrument. Radiation damping/fluctuations, 3D FFT space charge, and 1D CSR are all supported on
+GPU.
+
+A persistent GPU session keeps particle data on the device across consecutive elements, reducing
+host-device transfers from $O(N_\text{elements})$ to $O(1)$. Combined with deferred flush
+(\vn{bmad_com%gpu_deferred_flush}), this gives typical speedups of 10--30$\times$ depending on
+lattice size and particle count.
 
 GPU tracking operates at the bunch level within \vn{track1_bunch_hom} and is orthogonal to MP/MPI
 parallelism. For example, a program could use MPI to distribute different bunches across nodes while

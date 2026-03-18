@@ -208,7 +208,8 @@ Routine to write a file of beam positions in global floor coordinates.
 \item[ele_gpu_eligible (ele) result (eligible)] \Newline
 Function that returns \vn{True} if an element is eligible for GPU-accelerated tracking
 (\sref{s:gpu.tracking}). An element is eligible if its \vn{tracking_method} is \vn{bmad_standard},
-it is turned on, and it is one of: \vn{drift}, \vn{quadrupole}, \vn{sbend}, or \vn{lcavity}.
+it is turned on, and it is one of: \vn{drift}, \vn{quadrupole}, \vn{sbend}, \vn{lcavity},
+\vn{pipe}, \vn{monitor}, or \vn{instrument}.
 
 \index[routine]{gpu_tracking_init}
 \label{r:gpu.tracking.init}

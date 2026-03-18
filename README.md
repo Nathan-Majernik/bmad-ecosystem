@@ -112,14 +112,23 @@ When enabled, eligible elements are tracked on the GPU while unsupported element
 fall back silently to CPU tracking. GPU tracking is not compatible with spin
 tracking or backward tracking.
 
+**Supported elements:** drift, quadrupole (with fringe), sbend (with
+misalignment), lcavity (relative and absolute time tracking), pipe, monitor, and
+instrument. Rectangular and elliptical apertures are checked on device.
+
+**Persistent GPU session:** Particle data stays on the GPU across consecutive
+elements. The first element uploads, subsequent elements run as lightweight
+kernel launches with no host-device transfers, and data is downloaded only when
+a non-GPU element is encountered or tracking completes. This reduces PCIe
+traffic from O(N_elements) round trips to a single round trip.
+
 **Radiation support:** GPU tracking supports both radiation damping
 (`bmad_com%radiation_damping_on`) and radiation fluctuations
 (`bmad_com%radiation_fluctuations_on`). The stochastic and damping matrices from
 Bmad's `radiation_map_setup` are applied on the GPU using cuRAND for Gaussian
 random number generation. Supported elements: quadrupole, sbend, lcavity (drift
 does not produce radiation). The entrance/exit radiation kicks run as separate
-CUDA kernels within the same device upload/download cycle to avoid extra
-host-device transfers.
+CUDA kernels within the same device session.
 
 **Collective effects:** GPU tracking supports 3D FFT space charge
 (`space_charge_method = fft_3d`) and 1D CSR (`csr_method = 1_dim`).
@@ -128,6 +137,11 @@ charge deposition (trilinear with atomicAdd), Green function computation,
 field interpolation, and kick application. CSR particle binning and
 kick application run on GPU while the bin-level kick calculation
 (involving iterative root-finding) remains on CPU.
+
+**Deferred flush:** `bmad_com%gpu_deferred_flush` (default false) skips
+per-element GPU-to-CPU downloads. Tao enables this automatically during beam
+tracking, flushing only at save points. This eliminates the dominant Tao
+overhead and achieves ~22x speedup for large lattices.
 
 ```bash
 # Enable GPU tracking at runtime
