@@ -7,6 +7,9 @@
 !   2. CPU, 3D FFT space charge
 !   3. GPU, no space charge
 !   4. GPU, 3D FFT space charge
+!
+! init_beam_distribution is called ONCE before the timing loop.
+! Each pass restores particles from a saved copy (fast memcpy).
 !-
 
 program gpu_sc_bench_drift
@@ -19,11 +22,12 @@ implicit none
 
 type (lat_struct), target :: lat_nosc, lat_sc
 type (beam_init_struct) :: beam_init
-type (beam_struct) :: beam
+type (beam_struct) :: beam, beam_save
 type (branch_struct), pointer :: branch
 type (coord_struct), allocatable :: centroid(:)
+type (coord_struct), allocatable :: saved_particles(:)
 
-integer :: n_pass, ie
+integer :: n_pass, ie, np
 real(rp) :: t_start, t_end
 real(rp) :: t_cpu_nosc, t_cpu_sc, t_gpu_nosc, t_gpu_sc
 logical :: err
@@ -53,7 +57,7 @@ space_charge_com%n_bin = 40
 space_charge_com%particle_bin_span = 2
 space_charge_com%space_charge_mesh_size = [16, 16, 32]
 
-n_pass = 3  ! Average over 3 passes
+n_pass = 5  ! Average over 5 passes
 
 ! Parse both lattices
 call bmad_parser('lat_sc_bench_drift_nosc.bmad', lat_nosc)
@@ -62,18 +66,27 @@ call bmad_parser('lat_sc_bench_drift.bmad', lat_sc)
 ! Compute centroids for SC lattice
 call compute_centroid(lat_sc, centroid)
 
-! Warmup GPU
+! Create beam ONCE and save a copy for restoring between passes
 branch => lat_nosc%branch(0)
-beam_init%n_particle = 100
 call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
-bmad_com%gpu_tracking_on = .true.
-call track_beam(lat_nosc, beam, err=err)
-beam_init%n_particle = 1000000
+np = size(beam%bunch(1)%particle)
+allocate(saved_particles(np))
+saved_particles = beam%bunch(1)%particle
+
+! Warmup GPU (small beam)
+block
+  type (beam_struct) :: warmup
+  beam_init%n_particle = 100
+  call init_beam_distribution(branch%ele(0), branch%param, beam_init, warmup, err)
+  bmad_com%gpu_tracking_on = .true.
+  call track_beam(lat_nosc, warmup, err=err)
+  beam_init%n_particle = 1000000
+end block
 
 print *
 print *, '=================================================================='
 print *, '  Drift + Space Charge Benchmark'
-print *, '  10 x 1m drifts, 1M particles'
+print *, '  10 x 1m drifts, 1M particles, 5 passes'
 print *, '=================================================================='
 print *
 
@@ -82,11 +95,9 @@ print *
 ! ======================================================================
 bmad_com%gpu_tracking_on = .false.
 bmad_com%csr_and_space_charge_on = .false.
-branch => lat_nosc%branch(0)
-call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
 call cpu_time(t_start)
 do ie = 1, n_pass
-  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  beam%bunch(1)%particle = saved_particles
   call track_beam(lat_nosc, beam, err=err)
 enddo
 call cpu_time(t_end)
@@ -98,11 +109,9 @@ print '(A,T45,F10.3,A)', '  CPU, no SC:', t_cpu_nosc, ' s'
 ! ======================================================================
 bmad_com%gpu_tracking_on = .false.
 bmad_com%csr_and_space_charge_on = .true.
-branch => lat_sc%branch(0)
-call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
 call cpu_time(t_start)
 do ie = 1, n_pass
-  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  beam%bunch(1)%particle = saved_particles
   call track_beam(lat_sc, beam, err=err, centroid=centroid)
 enddo
 call cpu_time(t_end)
@@ -114,11 +123,9 @@ print '(A,T45,F10.3,A)', '  CPU, 3D FFT SC:', t_cpu_sc, ' s'
 ! ======================================================================
 bmad_com%gpu_tracking_on = .true.
 bmad_com%csr_and_space_charge_on = .false.
-branch => lat_nosc%branch(0)
-call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
 call cpu_time(t_start)
 do ie = 1, n_pass
-  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  beam%bunch(1)%particle = saved_particles
   call track_beam(lat_nosc, beam, err=err)
 enddo
 call cpu_time(t_end)
@@ -130,11 +137,9 @@ print '(A,T45,F10.3,A)', '  GPU, no SC:', t_gpu_nosc, ' s'
 ! ======================================================================
 bmad_com%gpu_tracking_on = .true.
 bmad_com%csr_and_space_charge_on = .true.
-branch => lat_sc%branch(0)
-call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
 call cpu_time(t_start)
 do ie = 1, n_pass
-  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  beam%bunch(1)%particle = saved_particles
   call track_beam(lat_sc, beam, err=err, centroid=centroid)
 enddo
 call cpu_time(t_end)
