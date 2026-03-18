@@ -1488,6 +1488,11 @@ logical :: has_fringe_needs_cpu
 can_stay = .false.
 if (.not. ele_gpu_eligible(ele)) return
 
+! Elements with CSR or space charge need track1_bunch_csr sub-stepping
+if (bmad_com%csr_and_space_charge_on) then
+  if (ele%csr_method /= off$ .or. ele%space_charge_method /= off$) return
+endif
+
 ! Pipe, monitor, and instrument elements can have multipoles that require
 ! the pipe GPU path (quad kernel with b1=0). Without multipoles, they're
 ! simple drifts and can stay on device.
@@ -1620,6 +1625,9 @@ do ie = ix_start, ix_end
   if (.not. ele_gpu_eligible(ele)) exit
   if (bmad_com%spin_tracking_on) exit
   if (bmad_com%high_energy_space_charge_on) exit
+  ! CSR/SC elements need track1_bunch_csr sub-stepping — exit to caller
+  if (bmad_com%csr_and_space_charge_on .and. &
+      (ele%csr_method /= off$ .or. ele%space_charge_method /= off$)) exit
   if (bunch%particle(1)%direction /= 1) exit
   if (bunch%particle(1)%time_dir /= 1) exit
 

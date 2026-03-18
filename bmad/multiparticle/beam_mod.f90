@@ -157,7 +157,6 @@ else
       ! Try multi-element GPU batch tracking
       if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(branch%ele(i)) .and. &
           .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
-          .not. bmad_com%csr_and_space_charge_on .and. &
           bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
           .not. present(bunch_track) .and. &
           i < e2%ix_ele .and. i+1 <= branch%n_ele_track .and. &
