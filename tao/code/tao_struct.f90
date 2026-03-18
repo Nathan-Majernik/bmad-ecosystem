@@ -679,6 +679,7 @@ type tao_global_struct
   character(80) :: var_out_file  = 'var#.out'
   character(100) :: history_file = '~/.history_tao'
   logical :: beam_timer_on = .false.                  ! For timing the beam tracking calculation.
+  logical :: gpu_deferred_bunch_params = .true.        ! Skip per-element calc_bunch_params during GPU tracking?
   logical :: box_plots = .false.                      ! For debugging plot layout issues.
   logical :: blank_line_between_commands = .true.     ! Add a blank line between command output?
   logical :: cmd_file_abort_on_error = .true.         ! Abort open command files if there is an error?

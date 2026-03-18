@@ -643,20 +643,39 @@ do
   endif
 
   ! Calc bunch params
+  ! When GPU deferred mode is on, skip the expensive sigma matrix / emittance
+  ! calculation at intermediate elements. Only compute at save points (start,
+  ! end, save_beam_internally). At other elements, just record particle counts.
+  ! This eliminates the O(N_particle) sigma matrix computation that dominates
+  ! GPU tracking time when called at every element.
 
-  call calc_bunch_params (beam%bunch(s%global%bunch_to_plot), bunch_params, err, print_err)
-  ! Only generate error message once per tracking
-  if (err .and. print_err) then
-    sig = bunch_params%sigma
-    if (any(sig /= 0)) then
-      call out_io (s_warn$, r_name, &
-            'Beam parameters not computed at: ' // trim(ele%name) // '  ' // ele_loc_name(ele, parens = '()') , &
-            '[This will happen, for example, with round beams. Ignore if the beam parameters at problem locations are not needed.]', &
-            'The singular sigma matrix is:', &
-            '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', &
-            'Will not print any more singular sigma matrices for this track...', &
-            r_array = [sig(1,:), sig(2,:), sig(3,:), sig(4,:), sig(5,:), sig(6,:)])
-      print_err = .false.  
+  if (bmad_com%gpu_tracking_on .and. s%global%gpu_deferred_bunch_params .and. &
+      ie /= ie_start .and. ie /= ie_end .and. ix_slice == -1 .and. &
+      .not. tao_model_ele(ie)%save_beam_internally) then
+    ! Lightweight: just record particle counts (no sigma matrix)
+    bunch_params = bunch_params_struct()
+    bunch_params%n_particle_tot = size(beam%bunch(s%global%bunch_to_plot)%particle)
+    bunch_params%n_particle_live = count(beam%bunch(s%global%bunch_to_plot)%particle%state == alive$)
+    bunch_params%charge_live = sum(beam%bunch(s%global%bunch_to_plot)%particle%charge, &
+                                   mask = (beam%bunch(s%global%bunch_to_plot)%particle%state == alive$))
+    bunch_params%charge_tot = sum(beam%bunch(s%global%bunch_to_plot)%particle%charge)
+    bunch_params%s = beam%bunch(s%global%bunch_to_plot)%particle(1)%s
+    err = .false.
+  else
+    call calc_bunch_params (beam%bunch(s%global%bunch_to_plot), bunch_params, err, print_err)
+    ! Only generate error message once per tracking
+    if (err .and. print_err) then
+      sig = bunch_params%sigma
+      if (any(sig /= 0)) then
+        call out_io (s_warn$, r_name, &
+              'Beam parameters not computed at: ' // trim(ele%name) // '  ' // ele_loc_name(ele, parens = '()') , &
+              '[This will happen, for example, with round beams. Ignore if the beam parameters at problem locations are not needed.]', &
+              'The singular sigma matrix is:', &
+              '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', '  \6es15.7\', &
+              'Will not print any more singular sigma matrices for this track...', &
+              r_array = [sig(1,:), sig(2,:), sig(3,:), sig(4,:), sig(5,:), sig(6,:)])
+        print_err = .false.
+      endif
     endif
   endif
 

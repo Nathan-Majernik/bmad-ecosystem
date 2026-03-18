@@ -436,6 +436,7 @@ case ('beam')
     nl=nl+1; lines(nl) = ''
     nl=nl+1; write(lines(nl), amt) 'global%track_type           = ', quote(s%global%track_type)
     nl=nl+1; write(lines(nl), lmt) 'global%beam_timer_on        = ', s%global%beam_timer_on
+    nl=nl+1; write(lines(nl), lmt) 'global%gpu_deferred_bunch_params = ', s%global%gpu_deferred_bunch_params
     nl=nl+1; write(lines(nl), rmt) 'global%beam_dead_cutoff     = ', s%global%beam_dead_cutoff
 
     fmt = '(3a, i0, a)'
@@ -2129,6 +2130,7 @@ case ('global')
   case ('global')
     nl=nl+1; lines(nl) = 'Tao Global parameters [Note: To print optimizer globals use: "show optimizer"]'
     nl=nl+1; write(lines(nl), lmt) '  %beam_timer_on                 = ', s%global%beam_timer_on
+    nl=nl+1; write(lines(nl), lmt) '  %gpu_deferred_bunch_params     = ', s%global%gpu_deferred_bunch_params
     nl=nl+1; write(lines(nl), imt) '  %bunch_to_plot                 = ', s%global%bunch_to_plot
     nl=nl+1; write(lines(nl), imt) '  %datum_err_messages_max        = ', s%global%datum_err_messages_max
     nl=nl+1; write(lines(nl), lmt) '  %cmd_file_abort_on_error       = ', s%global%cmd_file_abort_on_error
