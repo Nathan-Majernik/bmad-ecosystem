@@ -106,7 +106,8 @@ interface
                                cavity_type, &
                                fringe_at, charge_ratio, &
                                n_particles, &
-                               abs_time, phi0_no_multi) bind(C, name='gpu_track_lcavity_')
+                               abs_time, phi0_no_multi, &
+                               ref_time_start) bind(C, name='gpu_track_lcavity_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
     integer(C_INT), intent(inout) :: state(*)
@@ -124,6 +125,7 @@ interface
     integer(C_INT), value, intent(in) :: n_particles
     integer(C_INT), value, intent(in) :: abs_time
     real(C_DOUBLE), value, intent(in) :: phi0_no_multi
+    real(C_DOUBLE), value, intent(in) :: ref_time_start
   end subroutine
 
   function gpu_tracking_available() result(avail) bind(C, name='gpu_tracking_available_')
@@ -215,7 +217,8 @@ interface
                                     cavity_type, &
                                     fringe_at, charge_ratio, &
                                     n_particles, &
-                                    abs_time, phi0_no_multi) bind(C, name='gpu_track_lcavity_dev_')
+                                    abs_time, phi0_no_multi, &
+                                    ref_time_start) bind(C, name='gpu_track_lcavity_dev_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: mc2
     real(C_DOUBLE), intent(in) :: step_s0(*), step_s(*), step_p0c(*), step_p1c(*)
@@ -230,6 +233,7 @@ interface
     integer(C_INT), value, intent(in) :: n_particles
     integer(C_INT), value, intent(in) :: abs_time
     real(C_DOUBLE), value, intent(in) :: phi0_no_multi
+    real(C_DOUBLE), value, intent(in) :: ref_time_start
   end subroutine
 
   ! ----- Cross-element persistence kernels -----
@@ -1163,7 +1167,7 @@ logical,                 intent(out)   :: did_track
 #ifdef USE_GPU_TRACKING
 integer(C_INT) :: n
 integer :: j, nn, ix_mag_max, ix_elec_max, n_steps
-real(rp) :: mc2, phi0_total, phi0_no_multi
+real(rp) :: mc2, phi0_total, phi0_no_multi, ref_time_start_val
 integer :: abs_time_flag
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
@@ -1228,7 +1232,11 @@ has_misalign = ele%bookkeeping_state%has_misalign
 phi0_no_multi = lord%value(phi0$) + lord%value(phi0_err$)
 phi0_total = phi0_no_multi + lord%value(phi0_multipass$)
 abs_time_flag = 0
-if (bmad_com%absolute_time_tracking) abs_time_flag = 1
+ref_time_start_val = 0.0_rp
+if (bmad_com%absolute_time_tracking) then
+  abs_time_flag = 1
+  if (bmad_com%absolute_time_ref_shift) ref_time_start_val = lord%value(ref_time_start$)
+endif
 
 ! Extract step data from the lord's RF step array (indices 0..n_steps+1)
 allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
@@ -1271,7 +1279,8 @@ if (apply_rad .and. associated(ele%rad_map)) then
                              int(nint(lord%value(cavity_type$)), C_INT), &
                              int(i_fringe_at, C_INT), charge_ratio_val, &
                              int(n, C_INT), &
-                             int(abs_time_flag, C_INT), phi0_no_multi)
+                             int(abs_time_flag, C_INT), phi0_no_multi, &
+                             ref_time_start_val)
   call call_gpu_rad_kick(n, ele%rad_map%rm1)
   call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
                               state_a, beta_a, p0c_a, t_a, &
@@ -1291,7 +1300,8 @@ else
                          int(nint(lord%value(cavity_type$)), C_INT), &
                          int(i_fringe_at, C_INT), charge_ratio_val, &
                          int(n, C_INT), &
-                         int(abs_time_flag, C_INT), phi0_no_multi)
+                         int(abs_time_flag, C_INT), phi0_no_multi, &
+                         ref_time_start_val)
 endif
 
 ! Exit: SoA→AoS, deallocate, misalignment, update s (no CPU fringe)
@@ -1605,7 +1615,7 @@ logical :: has_mag_multipoles, has_elec_multipoles
 type (ele_struct), pointer :: lord
 type (rf_stair_step_struct), pointer :: step
 integer :: nn, n_steps, i_fringe_at
-real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val
+real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val, ref_time_start_val
 integer :: abs_time_flag
 real(C_DOUBLE), allocatable :: h_step_s0(:), h_step_s(:)
 real(C_DOUBLE), allocatable :: h_step_p0c(:), h_step_p1c(:)
@@ -2035,7 +2045,11 @@ n_steps = nint(lord%value(n_rf_steps$))
 phi0_no_multi = lord%value(phi0$) + lord%value(phi0_err$)
 phi0_total = phi0_no_multi + lord%value(phi0_multipass$)
 abs_time_flag = 0
-if (bmad_com%absolute_time_tracking) abs_time_flag = 1
+ref_time_start_val = 0.0_rp
+if (bmad_com%absolute_time_tracking) then
+  abs_time_flag = 1
+  if (bmad_com%absolute_time_ref_shift) ref_time_start_val = lord%value(ref_time_start$)
+endif
 
 allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
 allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
@@ -2062,7 +2076,8 @@ call gpu_track_lcavity_dev(mc2, &
                            int(nint(lord%value(cavity_type$)), C_INT), &
                            int(i_fringe_at, C_INT), charge_ratio_val, &
                            int(np, C_INT), &
-                           int(abs_time_flag, C_INT), phi0_no_multi)
+                           int(abs_time_flag, C_INT), phi0_no_multi, &
+                           ref_time_start_val)
 
 deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
 end subroutine dispatch_lcavity_body
@@ -2125,7 +2140,7 @@ real(C_DOUBLE) :: misalign_W(3,3), misalign_Lx, misalign_Ly, misalign_Lz
 integer :: ix_mag_max, ix_elec_max, n_steps, n_step, i_fringe_at, abs_time_flag
 real(rp) :: mc2, ele_length, b1, delta_ref_time, e_tot_ele, p0c_ele
 real(rp) :: charge_dir, rel_tracking_charge, length, g, g_tot, dg, rel_charge_dir
-real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val
+real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val, ref_time_start_val
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
@@ -2385,7 +2400,11 @@ case (lcavity$)
   phi0_no_multi = lord%value(phi0$) + lord%value(phi0_err$)
   phi0_total = phi0_no_multi + lord%value(phi0_multipass$)
   abs_time_flag = 0
-  if (bmad_com%absolute_time_tracking) abs_time_flag = 1
+  ref_time_start_val = 0.0_rp
+  if (bmad_com%absolute_time_tracking) then
+    abs_time_flag = 1
+    if (bmad_com%absolute_time_ref_shift) ref_time_start_val = lord%value(ref_time_start$)
+  endif
   allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
   allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
   allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
@@ -2403,7 +2422,8 @@ case (lcavity$)
                              lord%value(voltage_tot$), lord%value(l_active$), &
                              int(nint(lord%value(cavity_type$)), C_INT), &
                              int(i_fringe_at, C_INT), charge_ratio_val, &
-                             int(np, C_INT), int(abs_time_flag, C_INT), phi0_no_multi)
+                             int(np, C_INT), int(abs_time_flag, C_INT), phi0_no_multi, &
+                             ref_time_start_val)
   deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
 end select
 end subroutine

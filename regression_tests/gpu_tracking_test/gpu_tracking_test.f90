@@ -336,6 +336,12 @@ call bmad_parser('lat_lcavity_abstime.bmad', lat)
 call run_comparison_test('Test 36: Lcavity abstime', lat, tol, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 37: Lcavity abstime multi-cavity (downstream ref_time_start)
+! ======================================================================
+call bmad_parser('lat_lcavity_abstime_multi.bmad', lat)
+call run_comparison_test('Test 37: Lcavity abstime multi-cav', lat, tol, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *

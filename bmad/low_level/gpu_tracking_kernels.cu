@@ -950,12 +950,27 @@ __device__ __forceinline__ double dpc_given_dE_dev(double pc_old, double mc2, do
  */
 __device__ void lcavity_fringe_kick_dev(
     double &x, double &px, double &y, double &py, double &z, double &pz,
-    double &beta_val, double p0c, double mc2,
+    double &beta_val, double p0c, double mc2, double t,
     int edge, double gradient_tot, double charge_ratio,
-    double rf_frequency, double phi0_total)
+    double rf_frequency, double phi0_total,
+    int abs_time, double phi0_no_multi, double ref_time_start,
+    double step_time_val)
 {
-    double particle_time = -z / (beta_val * C_LIGHT);
-    double phase = TWOPI * (phi0_total + particle_time * rf_frequency);
+    double particle_time, phase;
+    if (abs_time) {
+        double half_period = 0.5 / rf_frequency;
+        double period = 1.0 / rf_frequency;
+        double t_shifted = t - ref_time_start;
+        double mod_val = fmod(t_shifted, period);
+        if (mod_val < 0.0) mod_val += period;
+        particle_time = mod_val;
+        if (particle_time >= half_period) particle_time -= period;
+        particle_time -= step_time_val;
+        phase = TWOPI * (phi0_no_multi + particle_time * rf_frequency);
+    } else {
+        particle_time = -z / (beta_val * C_LIGHT);
+        phase = TWOPI * (phi0_total + particle_time * rf_frequency);
+    }
 
     double ez_field = gradient_tot * cos(phase);
     double rf_omega = TWOPI * rf_frequency / C_LIGHT;
@@ -1024,7 +1039,8 @@ __global__ void lcavity_kernel(
     double charge_ratio,    /* charge_of(species) / (2 * charge_of(ref_species)) */
     int n_particles,
     int abs_time,           /* 1 if absolute_time_tracking */
-    double phi0_no_multi)   /* phi0 + phi0_err (without phi0_multipass) */
+    double phi0_no_multi,   /* phi0 + phi0_err (without phi0_multipass) */
+    double ref_time_start)  /* lord%value(ref_time_start$) for abs time ref shift */
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_particles) return;
@@ -1054,8 +1070,9 @@ __global__ void lcavity_kernel(
         /* ---- Entrance fringe: step 0, after drift, before energy kick ---- */
         if (ix == 0 && (fringe_at & 1) && l_active > 0.0) {
             double grad_tot = voltage_tot * field_autoscale / l_active;
-            lcavity_fringe_kick_dev(x, px, y, py, z, pz, beta_val, p0c, mc2,
-                +1, grad_tot, charge_ratio, rf_frequency, phi0_total);
+            lcavity_fringe_kick_dev(x, px, y, py, z, pz, beta_val, p0c, mc2, t,
+                +1, grad_tot, charge_ratio, rf_frequency, phi0_total,
+                abs_time, phi0_no_multi, ref_time_start, step_time[0]);
         }
 
         /* ---- Stair-step kick (not at phantom step) ---- */
@@ -1072,12 +1089,18 @@ __global__ void lcavity_kernel(
             double particle_time, phase;
             if (abs_time) {
                 /* Absolute time tracking: use particle t, no phi0_multipass.
+                 * Must subtract ref_time_start (absolute_time_ref_shift).
                  * modulo2(t, half_period) maps t into [-half_period, half_period] */
                 double half_period = 0.5 / rf_frequency;
                 double period = 1.0 / rf_frequency;
-                particle_time = fmod(t, period);
-                if (particle_time > half_period) particle_time -= period;
-                if (particle_time < -half_period) particle_time += period;
+                /* Fortran modulo2(x, amp) = modulo(x, 2*amp) - 2*amp if >= amp
+                 * Fortran modulo(x, p) always returns [0, p) for p>0 */
+                double t_shifted = t - ref_time_start;
+                double mod_val = fmod(t_shifted, period);
+                if (mod_val < 0.0) mod_val += period;  /* Fortran modulo: always [0, period) */
+                particle_time = mod_val;
+                if (particle_time >= half_period) particle_time -= period;
+                /* Now particle_time is in [-half_period, half_period) */
                 particle_time -= step_time[ix];
                 phase = TWOPI * (phi0_no_multi + particle_time * rf_frequency);
             } else {
@@ -1132,8 +1155,9 @@ __global__ void lcavity_kernel(
         /* ---- Exit fringe: step n_rf_steps, after energy kick ---- */
         if (ix == n_rf_steps && (fringe_at & 2) && l_active > 0.0) {
             double grad_tot = voltage_tot * field_autoscale / l_active;
-            lcavity_fringe_kick_dev(x, px, y, py, z, pz, beta_val, p0c, mc2,
-                -1, grad_tot, charge_ratio, rf_frequency, phi0_total);
+            lcavity_fringe_kick_dev(x, px, y, py, z, pz, beta_val, p0c, mc2, t,
+                -1, grad_tot, charge_ratio, rf_frequency, phi0_total,
+                abs_time, phi0_no_multi, ref_time_start, step_time[n_rf_steps]);
         }
     }
 
@@ -1206,7 +1230,8 @@ extern "C" void gpu_track_lcavity_(
     int cavity_type,
     int fringe_at, double charge_ratio,
     int n_particles,
-    int abs_time, double phi0_no_multi)
+    int abs_time, double phi0_no_multi,
+    double ref_time_start)
 {
     if (ensure_buffers(n_particles) != 0) return;
 
@@ -1240,7 +1265,7 @@ extern "C" void gpu_track_lcavity_(
         cavity_type,
         fringe_at, charge_ratio,
         n_particles,
-        abs_time, phi0_no_multi);
+        abs_time, phi0_no_multi, ref_time_start);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 
@@ -1518,7 +1543,8 @@ extern "C" void gpu_track_lcavity_dev_(
     int cavity_type,
     int fringe_at, double charge_ratio,
     int n_particles,
-    int abs_time, double phi0_no_multi)
+    int abs_time, double phi0_no_multi,
+    double ref_time_start)
 {
     int n_steps_total = n_rf_steps + 2;
     if (ensure_step_buffers(n_steps_total) != 0) return;
@@ -1543,7 +1569,7 @@ extern "C" void gpu_track_lcavity_dev_(
         cavity_type,
         fringe_at, charge_ratio,
         n_particles,
-        abs_time, phi0_no_multi);
+        abs_time, phi0_no_multi, ref_time_start);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 }
