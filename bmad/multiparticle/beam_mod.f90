@@ -264,6 +264,7 @@ subroutine track1_bunch (bunch, ele, err, centroid, direction, bunch_track)
 
 use csr_and_space_charge_mod, only: track1_bunch_csr, track1_bunch_csr3d
 use beam_utils, only: track1_bunch_hom
+use gpu_tracking_mod, only: gpu_persistent_flush
 use space_charge_mod, only: track_bunch_to_t, track_bunch_to_s
 
 implicit none
@@ -323,7 +324,13 @@ if (ele%csr_method /= off$ .and. time_rk_tracking) then
   goto 9000  ! Mark all particles as lost and return
 endif
 
-! 
+!
+
+! Flush persistent GPU state before CSR/SC path (which bypasses track1_bunch_hom
+! and does its own upload/download cycle that would clobber persistent device buffers)
+if (csr_sc_on .and. ele%key /= match$ .and. bmad_com%gpu_tracking_on) then
+  call gpu_persistent_flush(bunch, ele)
+endif
 
 if (csr_sc_on .and. ele%key /= match$) then
   if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then 

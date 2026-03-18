@@ -1,0 +1,168 @@
+!+
+! gpu_sc_bench_bend
+!
+! Benchmark: 10 x 1m sbends, 1M particles
+! Four cases:
+!   1. CPU, no collective effects
+!   2. CPU, CSR + 3D FFT space charge
+!   3. GPU, no collective effects
+!   4. GPU, CSR + 3D FFT space charge
+!-
+
+program gpu_sc_bench_bend
+
+use bmad
+use beam_mod
+use gpu_tracking_mod
+
+implicit none
+
+type (lat_struct), target :: lat_nosc, lat_sc
+type (beam_init_struct) :: beam_init
+type (beam_struct) :: beam
+type (branch_struct), pointer :: branch
+type (coord_struct), allocatable :: centroid(:)
+
+integer :: n_pass, ie
+real(rp) :: t_start, t_end
+real(rp) :: t_cpu_nosc, t_cpu_sc, t_gpu_nosc, t_gpu_sc
+logical :: err
+
+! Initialize GPU
+call gpu_tracking_init()
+if (.not. bmad_com%gpu_tracking_on) then
+  print *, 'FATAL: GPU tracking not available'
+  stop
+endif
+
+! Beam init: 100K particles (1M causes OOM with CSR bin arrays)
+beam_init%n_particle = 100000
+beam_init%random_engine = 'quasi'
+beam_init%a_emit = 5e-7
+beam_init%b_emit = 5e-7
+beam_init%dPz_dz = 0
+beam_init%n_bunch = 1
+beam_init%bunch_charge = 1e-9
+beam_init%sig_pz = 1e-3
+beam_init%sig_z = 3e-3
+beam_init%random_sigma_cutoff = 3
+
+! Space charge settings
+space_charge_com%ds_track_step = 0.1_rp
+space_charge_com%n_bin = 40
+space_charge_com%particle_bin_span = 2
+space_charge_com%space_charge_mesh_size = [16, 16, 32]
+
+n_pass = 3  ! Average over 3 passes
+
+! Parse both lattices
+call bmad_parser('lat_sc_bench_bend_nosc.bmad', lat_nosc)
+call bmad_parser('lat_sc_bench_bend.bmad', lat_sc)
+
+! Compute centroids for SC lattice
+call compute_centroid(lat_sc, centroid)
+
+! Warmup GPU
+branch => lat_nosc%branch(0)
+beam_init%n_particle = 100
+call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+bmad_com%gpu_tracking_on = .true.
+call track_beam(lat_nosc, beam, err=err)
+beam_init%n_particle = 100000
+
+print *
+print *, '=================================================================='
+print *, '  Sbend + CSR/SC Benchmark'
+print *, '  10 x 1m sbends (g=0.5), 100K particles'
+print *, '=================================================================='
+print *
+
+! ======================================================================
+! Case 1: CPU, no collective effects
+! ======================================================================
+bmad_com%gpu_tracking_on = .false.
+bmad_com%csr_and_space_charge_on = .false.
+branch => lat_nosc%branch(0)
+call cpu_time(t_start)
+do ie = 1, n_pass
+  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  call track_beam(lat_nosc, beam, err=err)
+enddo
+call cpu_time(t_end)
+t_cpu_nosc = (t_end - t_start) / n_pass
+print '(A,T45,F10.3,A)', '  CPU, no collective:', t_cpu_nosc, ' s'
+
+! ======================================================================
+! Case 2: CPU, CSR + 3D FFT space charge
+! ======================================================================
+bmad_com%gpu_tracking_on = .false.
+bmad_com%csr_and_space_charge_on = .true.
+branch => lat_sc%branch(0)
+call cpu_time(t_start)
+do ie = 1, n_pass
+  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  call track_beam(lat_sc, beam, err=err, centroid=centroid)
+enddo
+call cpu_time(t_end)
+t_cpu_sc = (t_end - t_start) / n_pass
+print '(A,T45,F10.3,A)', '  CPU, CSR + 3D SC:', t_cpu_sc, ' s'
+
+! ======================================================================
+! Case 3: GPU, no collective effects
+! ======================================================================
+bmad_com%gpu_tracking_on = .true.
+bmad_com%csr_and_space_charge_on = .false.
+branch => lat_nosc%branch(0)
+call cpu_time(t_start)
+do ie = 1, n_pass
+  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  call track_beam(lat_nosc, beam, err=err)
+enddo
+call cpu_time(t_end)
+t_gpu_nosc = (t_end - t_start) / n_pass
+print '(A,T45,F10.3,A)', '  GPU, no collective:', t_gpu_nosc, ' s'
+
+! ======================================================================
+! Case 4: GPU, CSR + 3D FFT space charge
+! ======================================================================
+bmad_com%gpu_tracking_on = .true.
+bmad_com%csr_and_space_charge_on = .true.
+branch => lat_sc%branch(0)
+call cpu_time(t_start)
+do ie = 1, n_pass
+  call init_beam_distribution(branch%ele(0), branch%param, beam_init, beam, err)
+  call track_beam(lat_sc, beam, err=err, centroid=centroid)
+enddo
+call cpu_time(t_end)
+t_gpu_sc = (t_end - t_start) / n_pass
+print '(A,T45,F10.3,A)', '  GPU, CSR + 3D SC:', t_gpu_sc, ' s'
+
+! Summary
+print *
+print *, '------------------------------------------------------------------'
+print *, '  Speedups:'
+print '(A,T45,F10.2,A)', '  GPU vs CPU (no collective):', t_cpu_nosc / t_gpu_nosc, 'x'
+print '(A,T45,F10.2,A)', '  GPU vs CPU (CSR + SC):', t_cpu_sc / t_gpu_sc, 'x'
+print '(A,T45,F10.2,A)', '  Collective overhead (CPU):', t_cpu_sc / t_cpu_nosc, 'x'
+print '(A,T45,F10.2,A)', '  Collective overhead (GPU):', t_gpu_sc / t_gpu_nosc, 'x'
+print *, '=================================================================='
+
+contains
+
+subroutine compute_centroid(lat, centroid)
+type (lat_struct), target, intent(inout) :: lat
+type (coord_struct), allocatable, intent(out) :: centroid(:)
+type (branch_struct), pointer :: br
+type (coord_struct) :: orb
+integer :: ie2
+br => lat%branch(0)
+allocate(centroid(0:br%n_ele_track))
+call init_coord(orb, br%ele(0), downstream_end$)
+centroid(0) = orb
+do ie2 = 1, br%n_ele_track
+  call track1(orb, br%ele(ie2), br%param, orb)
+  centroid(ie2) = orb
+enddo
+end subroutine compute_centroid
+
+end program gpu_sc_bench_bend

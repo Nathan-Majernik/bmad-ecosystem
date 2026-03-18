@@ -303,9 +303,12 @@ __global__ void sc_interpolate_kick_kernel(
     vpx[i] = px + Evec[0] * factor / gamma2;
     vpy[i] = py + Evec[1] * factor / gamma2;
 
-    /* Longitudinal kick (energy conserving) */
+    /* Longitudinal kick: dpz = sqrt_alpha(rel_p, ef^2 + 2*ef*pz0)
+     * = sqrt(rel_p^2 + ef^2 + 2*ef*pz0) - rel_p
+     * Numerically stable form: x / (sqrt(alpha^2 + x) + alpha) */
     double ef = Evec[2] * factor;
-    double dpz = sqrt(ef*ef + 2.0*ef*pz0 + rel_p*rel_p - px*px - py*py) - rel_p;
+    double x_sa = ef*ef + 2.0*ef*pz0;
+    double dpz = x_sa / (sqrt(rel_p*rel_p + x_sa) + rel_p);
     vpz[i] = pz_val + dpz;
 
     /* Update beta */

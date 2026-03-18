@@ -58,9 +58,12 @@ branch => pointer_to_branch(ele)
 
 ! Fast path: if GPU persistent session can handle this element, skip all the
 ! O(N_particle) setup work (direction assignment, wake check, etc.)
+! Skip when CSR/SC is active on this element — those need the sub-stepping path.
 gpu_did_track = .false.
 if (bmad_com%gpu_tracking_on .and. &
     .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
+    .not. (bmad_com%csr_and_space_charge_on .and. &
+           (ele%csr_method /= off$ .or. ele%space_charge_method /= off$)) .and. &
     bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
   call gpu_persistent_track_element(bunch, ele, branch%param, gpu_did_track)
   if (gpu_did_track) return
@@ -80,9 +83,12 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
 
   ! GPU tracking (opt-in via bmad_com%gpu_tracking_on).
   ! Per-element GPU path for first element or non-persistent elements.
+  ! Skip when CSR/SC is active on this element — track1_bunch handles the sub-stepping.
   gpu_did_track = .false.
   if (bmad_com%gpu_tracking_on .and. &
       .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
+      .not. (bmad_com%csr_and_space_charge_on .and. &
+             (ele%csr_method /= off$ .or. ele%space_charge_method /= off$)) .and. &
       bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
 
     ! Persistent path already tried above and declined (non-device-resident
