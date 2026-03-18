@@ -185,8 +185,12 @@ else
   endif
 endif
 
-! Flush any persistent GPU data back to bunch at end of tracking
-if (bmad_com%gpu_tracking_on) call gpu_persistent_flush(bunch, branch%ele(e2%ix_ele))
+! Flush persistent GPU data back to bunch.
+! When gpu_deferred_flush is on, skip the flush here — the caller is
+! responsible for flushing when it needs CPU-side particle data.
+! This avoids downloading all particles after every single element.
+if (bmad_com%gpu_tracking_on .and. .not. bmad_com%gpu_deferred_flush) &
+  call gpu_persistent_flush(bunch, branch%ele(e2%ix_ele))
 
 end subroutine track_bunch
 

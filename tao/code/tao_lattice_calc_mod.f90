@@ -437,6 +437,7 @@ subroutine tao_beam_track (u, tao_lat, ix_branch, beam, calc_ok)
 use wake_mod, only: zero_lr_wakes_in_lat
 use beam_utils, only: calc_bunch_params
 use radiation_mod, only: radiation_map_setup
+use gpu_tracking_mod, only: gpu_persistent_flush
 
 implicit none
 
@@ -460,6 +461,7 @@ type (rad_map_ele_struct) rad_map_save
 
 real(rp) sig(6,6), significant_length, s_slice_start, s_slice_end, s_travel
 real(rp) :: value1, value2, f, time0, time, old_time, s_start, s_end, s_target, ds_save
+real(rp) :: prof_track, prof_lost, prof_params, prof_t0, prof_t1
 
 integer i, n, i_uni, ip, ig, ic, ie
 integer what_lat, n_lost_old, ie_start, ie_end, i_uni_to, ix_track
@@ -538,6 +540,14 @@ endif
 
 n_loop = 0    ! Used for debugging
 n_lost_old = 0
+prof_track = 0; prof_lost = 0; prof_params = 0
+
+! Enable deferred GPU flush when GPU deferred mode is on.
+! This prevents track_bunch from downloading particles after every element.
+if (bmad_com%gpu_tracking_on .and. s%global%gpu_deferred_bunch_params) then
+  bmad_com%gpu_deferred_flush = .true.
+endif
+
 ie = ie_start
 s_target = s_start
 ele => point_to_this_ele (branch%ele(ie), rad_map_save)
@@ -551,6 +561,7 @@ do
 
   ! track to the element and save for phase space plot
 
+  call cpu_time(prof_t0)
   if (s%com%use_saved_beam_in_tracking) then
     beam = tao_model_ele(ie)%beam
 
@@ -600,9 +611,22 @@ do
     endif
 
     can_save = (ie == ie_start .or. ie == ie_end .or. ele%key == fork$ .or. ele%key == photon_fork$)
-    if (ix_slice == -1 .and. (tao_model_ele(ie)%save_beam_internally .or. can_save)) tao_model_ele(ie)%beam = beam
+    if (ix_slice == -1 .and. (tao_model_ele(ie)%save_beam_internally .or. can_save)) then
+      ! Flush GPU data before saving beam (need current CPU-side particles)
+      if (bmad_com%gpu_deferred_flush) then
+        do i = 1, size(beam%bunch)
+          call gpu_persistent_flush(beam%bunch(i), ele)
+        enddo
+      endif
+      tao_model_ele(ie)%beam = beam
+    endif
 
     if (ix_slice == -1 .and. (u%beam%dump_file /= '' .and. tao_model_ele(ie)%save_beam_to_file)) then
+      if (bmad_com%gpu_deferred_flush) then
+        do i = 1, size(beam%bunch)
+          call gpu_persistent_flush(beam%bunch(i), ele)
+        enddo
+      endif
       if (index(u%beam%dump_file, '.h5') == 0 .and. index(u%beam%dump_file, '.hdf5') == 0) then
         call write_beam_file (u%beam%dump_file, beam, new_beam_file, ascii$, lat)
       else
@@ -611,38 +635,48 @@ do
       new_beam_file = .false.
     endif
   endif
- 
+
+  call cpu_time(prof_t1); prof_track = prof_track + (prof_t1 - prof_t0)
+
   ! Lost particles
-
-  n_bunch = s%global%bunch_to_plot
-  n_lost = count(beam%bunch(n_bunch)%particle(:)%state /= alive$ .and. beam%bunch(n_bunch)%particle(:)%state /= pre_born$)
-  if (n_lost /= n_lost_old) then
-    n = size(beam%bunch(n_bunch)%particle(:))
-    if (size(s%u) == 1) then
-      call out_io (s_blank$, r_name, &
-            '\i0\ particle(s) lost at element ' // trim(ele_loc_name(ele)) // ': ' // trim(ele%name) // &
-            '  Total lost: \i0\  of \i0\ ', &
-            i_array = [n_lost-n_lost_old, n_lost, n])
-    else
-      call out_io (s_blank$, r_name, &
-            '\i0\ particle(s) lost in universe \i0\ at element ' // trim(ele_loc_name(ele)) // ': ' // trim(ele%name) // &
-            '  Total lost: \i0\  of \i0\ ', &
-            i_array = [n_lost-n_lost_old, u%ix_uni, n_lost, n])
+  ! When GPU deferred flush is on, skip per-element lost counting at intermediate
+  ! elements — the CPU-side particle state is stale (data is on GPU).
+  ! Lost particles will be counted at save points (where we flush) and at the end.
+  call cpu_time(prof_t0)
+  if (.not. bmad_com%gpu_deferred_flush .or. ie == ie_end .or. can_save) then
+    n_bunch = s%global%bunch_to_plot
+    n_lost = count(beam%bunch(n_bunch)%particle(:)%state /= alive$ .and. beam%bunch(n_bunch)%particle(:)%state /= pre_born$)
+    if (n_lost /= n_lost_old) then
+      n = size(beam%bunch(n_bunch)%particle(:))
+      if (size(s%u) == 1) then
+        call out_io (s_blank$, r_name, &
+              '\i0\ particle(s) lost at element ' // trim(ele_loc_name(ele)) // ': ' // trim(ele%name) // &
+              '  Total lost: \i0\  of \i0\ ', &
+              i_array = [n_lost-n_lost_old, n_lost, n])
+      else
+        call out_io (s_blank$, r_name, &
+              '\i0\ particle(s) lost in universe \i0\ at element ' // trim(ele_loc_name(ele)) // ': ' // trim(ele%name) // &
+              '  Total lost: \i0\  of \i0\ ', &
+              i_array = [n_lost-n_lost_old, u%ix_uni, n_lost, n])
+      endif
+      n_lost_old = n_lost
     endif
-    n_lost_old = n_lost
+
+    if (tao_too_many_particles_lost(beam)) then
+      ix_track = ie
+      call out_io (s_warn$, r_name, &
+              'TOO MANY PARTICLES HAVE BEEN LOST AT ELEMENT ' // trim(ele_loc_name(ele)) // ': ' // trim(ele%name), &
+              'PERCENTAGE OF DEAD PARTICLES OVER GLOBAL%BEAM_DEAD_CUTOFF OF: ' // real_str(s%global%beam_dead_cutoff, 6, 4), &
+              'WILL STOP TRACKING AT ELEMENT: ' // ele_full_name(ele))
+      tao_model_ele(ie)%beam = beam
+      exit
+    endif
   endif
 
-  if (tao_too_many_particles_lost(beam)) then
-    ix_track = ie
-    call out_io (s_warn$, r_name, &
-            'TOO MANY PARTICLES HAVE BEEN LOST AT ELEMENT ' // trim(ele_loc_name(ele)) // ': ' // trim(ele%name), &
-            'PERCENTAGE OF DEAD PARTICLES OVER GLOBAL%BEAM_DEAD_CUTOFF OF: ' // real_str(s%global%beam_dead_cutoff, 6, 4), &
-            'WILL STOP TRACKING AT ELEMENT: ' // ele_full_name(ele))
-    tao_model_ele(ie)%beam = beam   ! Make sure we save lost info.
-    exit
-  endif
+  call cpu_time(prof_t1); prof_lost = prof_lost + (prof_t1 - prof_t0)
 
   ! Calc bunch params
+  call cpu_time(prof_t0)
   ! When GPU deferred mode is on, skip the expensive sigma matrix / emittance
   ! calculation at intermediate elements. Only compute at save points (start,
   ! end, save_beam_internally). At other elements, just record particle counts.
@@ -686,6 +720,7 @@ do
   endif
 
   if (ix_slice == -1) tao_branch%bunch_params(ie) = bunch_params
+  call cpu_time(prof_t1); prof_params = prof_params + (prof_t1 - prof_t0)
 
   ! Timer
 
@@ -711,6 +746,16 @@ do
     n_slice = max(1, int(1.01_rp*ele%value(l$) / ds_save))
   endif
 enddo
+
+! Restore deferred flush and ensure final flush
+bmad_com%gpu_deferred_flush = .false.
+
+! GPU performance profile output
+if (bmad_com%gpu_tracking_on) then
+  call out_io (s_blank$, r_name, &
+    'GPU PROFILE: track=\f8.3\ save+lost=\f8.3\ params=\f8.3\ total=\f8.3\ s', &
+    r_array = [prof_track, prof_lost, prof_params, prof_track + prof_lost + prof_params])
+endif
 
 if (associated(ele%rad_map)) ele%rad_map = rad_map_save
 

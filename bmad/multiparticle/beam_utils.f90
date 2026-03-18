@@ -55,6 +55,17 @@ character(*), parameter :: r_name = 'track1_bunch_hom'
 ! Note: PTC tracking is not not thread safe.
 
 branch => pointer_to_branch(ele)
+
+! Fast path: if GPU persistent session can handle this element, skip all the
+! O(N_particle) setup work (direction assignment, wake check, etc.)
+gpu_did_track = .false.
+if (bmad_com%gpu_tracking_on .and. &
+    .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
+    bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+  call gpu_persistent_track_element(bunch, ele, branch%param, gpu_did_track)
+  if (gpu_did_track) return
+endif
+
 bunch%particle%direction = integer_option(1, direction)
 if (ele%tracking_method == taylor$ .and. .not. associated(ele%taylor(1)%term)) call ele_to_taylor(ele)
 thread_safe = (ele%tracking_method /= symp_lie_ptc$ .and. global_com%mp_threading_is_safe)
@@ -68,23 +79,14 @@ wake_ele => pointer_to_wake_ele(ele, ds_wake)
 if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bmad_com%lr_wakes_on)) then
 
   ! GPU tracking (opt-in via bmad_com%gpu_tracking_on).
-  ! Persistent GPU session: data stays on device across consecutive calls.
-  ! Flushes automatically when a non-GPU element is encountered.
+  ! Per-element GPU path for first element or non-persistent elements.
   gpu_did_track = .false.
   if (bmad_com%gpu_tracking_on .and. &
       .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
       bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
 
-    ! Try persistent device-resident tracking (keeps data on GPU across calls)
-    call gpu_persistent_track_element(bunch, ele, branch%param, gpu_did_track)
-
-    if (gpu_did_track) then
-      bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
-      return
-    endif
-
-    ! Persistent path declined — either non-device-resident element or first element.
-    ! Data already flushed if it was on device. Try per-element GPU tracking.
+    ! Persistent path already tried above and declined (non-device-resident
+    ! or first element). Data already flushed if it was on device.
     if (ele_gpu_eligible(ele)) then
       call check_entrance_aperture_for_gpu(bunch, ele, branch%param)
 

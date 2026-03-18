@@ -2337,6 +2337,9 @@ type bmad_common_struct
   logical :: gpu_tracking_on = .false.                 ! GPU-accelerated batch tracking for supported elements.
                                                        !   Initialized from ACC_ENABLE_GPU_TRACKING env var.
                                                        !   Falls back to CPU silently when GPU can't handle an element.
+  logical :: gpu_deferred_flush = .false.              ! Defer GPU→CPU particle download to caller.
+                                                       !   When true, track_bunch does not flush persistent GPU data.
+                                                       !   Caller must flush explicitly before accessing particle data.
 end type
   
 type (bmad_common_struct), save, target :: bmad_com
