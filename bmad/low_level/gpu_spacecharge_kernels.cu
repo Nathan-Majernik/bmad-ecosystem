@@ -698,6 +698,90 @@ extern "C" void gpu_space_charge_3d_(
 
 
 /* --------------------------------------------------------------------------
+ * gpu_csr_z_minmax — compute min/max of z (vec[4]) for alive particles
+ *
+ * GPU reduction kernel — no host-device transfer of particle data.
+ * Uses a two-pass block reduction: first pass reduces within blocks,
+ * second pass reduces block results on CPU (tiny array).
+ * -------------------------------------------------------------------------- */
+
+__global__ void z_minmax_kernel(
+    const double *z, const int *state,
+    double *block_min, double *block_max,
+    int n)
+{
+    extern __shared__ double sdata[];
+    double *smin = sdata;
+    double *smax = sdata + blockDim.x;
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double local_min = 1e30, local_max = -1e30;
+    if (i < n && state[i] == 1) {
+        local_min = z[i];
+        local_max = z[i];
+    }
+    smin[tid] = local_min;
+    smax[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (smin[tid + s] < smin[tid]) smin[tid] = smin[tid + s];
+            if (smax[tid + s] > smax[tid]) smax[tid] = smax[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_min[blockIdx.x] = smin[0];
+        block_max[blockIdx.x] = smax[0];
+    }
+}
+
+extern "C" void gpu_csr_z_minmax_(
+    double *h_z_min, double *h_z_max,
+    int n_particles)
+{
+    if (n_particles <= 0) return;
+
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+
+    double *d_bmin, *d_bmax;
+    cudaMalloc((void**)&d_bmin, blocks * sizeof(double));
+    cudaMalloc((void**)&d_bmax, blocks * sizeof(double));
+
+    z_minmax_kernel<<<blocks, threads, 2 * threads * sizeof(double)>>>(
+        dvec[4], dstate, d_bmin, d_bmax, n_particles);
+    cudaDeviceSynchronize();
+
+    /* Download block results (tiny: ~4K blocks for 1M particles) */
+    double *h_bmin = (double*)malloc(blocks * sizeof(double));
+    double *h_bmax = (double*)malloc(blocks * sizeof(double));
+    cudaMemcpy(h_bmin, d_bmin, blocks * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_bmax, d_bmax, blocks * sizeof(double), cudaMemcpyDeviceToHost);
+
+    double zmin = 1e30, zmax = -1e30;
+    for (int i = 0; i < blocks; i++) {
+        if (h_bmin[i] < zmin) zmin = h_bmin[i];
+        if (h_bmax[i] > zmax) zmax = h_bmax[i];
+    }
+    *h_z_min = zmin;
+    *h_z_max = zmax;
+
+    free(h_bmin);
+    free(h_bmax);
+    cudaFree(d_bmin);
+    cudaFree(d_bmax);
+}
+
+
+/* --------------------------------------------------------------------------
  * gpu_csr_bin_particles — bin particles on GPU
  *
  * Particle vx, vy, vz, state must be on device.
@@ -719,9 +803,15 @@ extern "C" void gpu_csr_bin_particles_(
     double *dvec[6]; int *dstate; double *dbeta, *dp0c;
     get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
 
-    /* Upload per-particle charge */
-    if (d_sc_charge) cudaFree(d_sc_charge);
-    cudaMalloc((void**)&d_sc_charge, (size_t)n_particles * sizeof(double));
+    /* Upload per-particle charge (reuse buffer if large enough) */
+    {
+        static int d_sc_charge_size = 0;
+        if (n_particles > d_sc_charge_size) {
+            if (d_sc_charge) cudaFree(d_sc_charge);
+            cudaMalloc((void**)&d_sc_charge, (size_t)n_particles * sizeof(double));
+            d_sc_charge_size = n_particles;
+        }
+    }
     CUDA_SC_CHECK(cudaMemcpy(d_sc_charge, h_charge,
         n_particles * sizeof(double), cudaMemcpyHostToDevice));
 

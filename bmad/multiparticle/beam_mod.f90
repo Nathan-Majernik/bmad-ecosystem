@@ -326,21 +326,26 @@ endif
 
 !
 
-! Flush persistent GPU state before CSR/SC path (which bypasses track1_bunch_hom
-! and does its own upload/download cycle that would clobber persistent device buffers)
+! Flush persistent GPU state before SC paths that aren't GPU-aware.
+! track1_bunch_csr IS GPU-aware and uses persistent device data directly.
 if (csr_sc_on .and. ele%key /= match$ .and. bmad_com%gpu_tracking_on) then
-  call gpu_persistent_flush(bunch, ele)
+  if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then
+    call gpu_persistent_flush(bunch, ele)  ! track1_bunch_space_charge not GPU-aware
+  elseif (ele%csr_method == steady_state_3d$) then
+    call gpu_persistent_flush(bunch, ele)  ! track1_bunch_csr3d not GPU-aware
+  endif
+  ! track1_bunch_csr: don't flush — it uses persistent device data for GPU CSR
 endif
 
 if (csr_sc_on .and. ele%key /= match$) then
-  if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then 
+  if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then
     call track1_bunch_space_charge (bunch, ele, err, bunch_track = bunch_track)
     track1_bunch_space_charge_called = .true.
 
   elseif (ele%csr_method == steady_state_3d$) then
     if (bunch%drift_between_t_and_s) call correct_s_t_tracking_conversion(bunch, ele)
     call track1_bunch_csr3d(bunch, ele, centroid, err, bunch_track = bunch_track)
-     
+
   else
     if (.not. present(centroid)) then
       call out_io (s_fatal$, r_name, 'BUNCH CENTROID MUST BE SUPPLIED FOR CSR CALCULATION!')

@@ -20,8 +20,10 @@ public :: gpu_rad_eligible
 public :: track_bunch_thru_elements_gpu
 public :: ele_gpu_can_stay_on_device
 public :: gpu_upload_particles, gpu_download_particles
-public :: gpu_space_charge_3d, gpu_csr_bin_particles, gpu_csr_apply_kicks
+public :: gpu_space_charge_3d, gpu_csr_bin_particles, gpu_csr_apply_kicks, gpu_csr_z_minmax
 public :: gpu_persistent_track_element, gpu_persistent_flush, gpu_persistent_seed
+public :: gpu_persist_on_device
+public :: gpu_track_body_on_device
 
 ! Whether gpu_tracking_init has been called
 logical, save :: gpu_trk_initialized = .false.
@@ -291,6 +293,12 @@ interface
     real(C_DOUBLE), intent(in) :: h_charge(*)
     integer(C_INT), value, intent(in) :: n_particles, nx, ny, nz
     real(C_DOUBLE), value, intent(in) :: gamma, ds_step, mc2, dct_ave
+  end subroutine
+
+  subroutine gpu_csr_z_minmax(h_z_min, h_z_max, n_particles) bind(C, name='gpu_csr_z_minmax_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(out) :: h_z_min, h_z_max
+    integer(C_INT), value, intent(in) :: n_particles
   end subroutine
 
   subroutine gpu_csr_bin_particles(h_charge, n_particles, &
@@ -2497,5 +2505,116 @@ gpu_persist_bunch_id = transfer(loc(bunch%particle(1)%vec(1)), gpu_persist_bunch
 #endif
 
 end subroutine gpu_persistent_seed
+
+!------------------------------------------------------------------------
+! gpu_track_body_on_device — run ONLY the body kernel for an element
+!
+! Assumes data is already on device. Does NOT apply misalignment, fringe,
+! aperture, or radiation. Used by track1_bunch_csr for sub-element tracking
+! where the CSR loop handles its own fringe/misalignment.
+!------------------------------------------------------------------------
+subroutine gpu_track_body_on_device(bunch, ele, param, did_track)
+
+use multipole_mod, only: ab_multipole_kicks, multipole_ele_to_ab
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer(C_INT) :: n
+integer :: ix_mag_max, ix_elec_max, n_step
+real(rp) :: mc2, ele_length, b1, delta_ref_time, e_tot_ele, p0c_ele
+real(rp) :: charge_dir, rel_tracking_charge, length, g, g_tot, dg, rel_charge_dir
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+logical :: has_mag_multipoles, has_elec_multipoles
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+if (.not. gpu_persist_on_device) return
+
+n = size(bunch%particle)
+if (n == 0) return
+
+select case (ele%key)
+case (drift$, pipe$, monitor$, instrument$)
+  mc2 = mass_of(bunch%particle(1)%species)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  call gpu_track_drift_dev(gp_s, mc2, ele_length, n)
+  did_track = .true.
+
+case (quadrupole$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
+                          e_tot_ele, charge_dir, n, &
+                          a2_arr, b2_arr, cm_arr, &
+                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  did_track = .true.
+
+case (sbend$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  p0c_ele = ele%value(p0c$)
+  if (nint(ele%value(exact_multipoles$)) /= off$) return
+  rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
+                   rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  b1 = b1 * rel_charge_dir
+  if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  g = ele%value(g$)
+  length = bunch%particle(1)%time_dir * ele_length
+  if (length == 0) then; dg = 0; else; dg = bn(0)/ele_length; bn(0) = 0; endif
+  g_tot = (g + dg) * rel_charge_dir
+  has_mag_multipoles = (ix_mag_max > -1)
+  has_elec_multipoles = (ix_elec_max > -1)
+  n_step = 1
+  if (has_mag_multipoles .or. has_elec_multipoles) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
+                          ele_length, delta_ref_time, e_tot_ele, &
+                          rel_charge_dir, p0c_ele, n, &
+                          a2_arr, b2_arr, cm_arr, &
+                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  did_track = .true.
+end select
+
+! Update s on device
+if (did_track) call gpu_s_update(ele%s, n)
+#endif
+
+end subroutine gpu_track_body_on_device
 
 end module gpu_tracking_mod

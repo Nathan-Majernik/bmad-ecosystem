@@ -128,6 +128,10 @@ contains
 
 subroutine track1_bunch_csr (bunch, ele, centroid, err, s_start, s_end, bunch_track)
 
+use gpu_tracking_mod, only: gpu_persistent_flush, &
+                             gpu_persistent_seed, gpu_persist_on_device, &
+                             gpu_track_body_on_device, ele_gpu_eligible
+
 implicit none
 
 type (bunch_struct), target :: bunch
@@ -136,6 +140,7 @@ type (ele_struct), target :: ele
 type (bunch_track_struct), optional :: bunch_track
 type (branch_struct), pointer :: branch
 type (ele_struct) :: runt
+logical :: gpu_csr_active, gpu_did_track
 type (ele_struct), pointer :: ele0, s_ele
 type (csr_struct), target :: csr
 type (csr_ele_info_struct), pointer :: eleinfo
@@ -279,11 +284,29 @@ csr%species = bunch%particle(1)%species
 csr%ix_ele_kick = ele%ix_ele
 csr%actual_track_step = csr%ds_track_step * (csr%eleinfo(ele%ix_ele)%L_chord / ele%value(l$))
 
+! Determine if GPU CSR path is viable.
+! We check ele_gpu_eligible (body kernel exists) rather than ele_gpu_can_stay_on_device
+! (which excludes CSR elements and elements with fringe — both handled by this routine).
+! If data isn't already on device, upload it now.
+gpu_csr_active = .false.
+if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
+    .not. bmad_com%spin_tracking_on .and. &
+    bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+  gpu_csr_active = .true.
+  ! Ensure data is on device (upload if not already there from previous element)
+  if (.not. gpu_persist_on_device) then
+    call gpu_persistent_seed(bunch, ele)
+  endif
+endif
+
 call save_a_bunch_step (ele, bunch, bunch_track, s_start)
 
 !----------------------------------------------------------------------------------------
 ! Loop over the tracking steps
 ! runt is the element that is tracked through at each step.
+!
+! GPU path: when data is on device, use GPU kernels for body tracking,
+! binning, and kick application. The bin-level kick computation stays on CPU.
 
 do i_step = 0, n_step
 
@@ -291,21 +314,37 @@ do i_step = 0, n_step
 
   if (i_step /= 0) then
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
-    call track1_bunch_hom (bunch, runt)
+    if (gpu_csr_active) then
+      ! Track the runt body on GPU (data already on device).
+      ! No misalign/fringe/aperture — the CSR loop doesn't apply those per sub-step.
+      call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
+      if (.not. gpu_did_track) then
+        ! GPU body failed for this runt — flush and fall back to CPU
+        call gpu_persistent_flush(bunch, runt)
+        gpu_csr_active = .false.
+        call track1_bunch_hom (bunch, runt)
+      endif
+    else
+      call track1_bunch_hom (bunch, runt)
+    endif
   endif
 
   s0_step = i_step * csr%ds_track_step
   if (present(s_start)) s0_step = s0_step + s_start
 
   ! Cannot do a realistic calculation if there are less particles than bins
+  ! When GPU CSR is active, CPU bunch%particle%state is stale — skip check
+  ! (the GPU binning kernel handles dead particles correctly).
 
-  n_live = count(bunch%particle%state == alive$)
-  if (n_live < space_charge_com%n_bin) then
-    call out_io (s_error$, r_name, 'NUMBER OF LIVE PARTICLES: \i0\ ', &
-                          'LESS THAN NUMBER OF BINS FOR CSR CALC.', &
-                          'AT ELEMENT: ' // trim(ele%name) // '  [# \i0\] ', &
-                          i_array = [n_live, ele%ix_ele ])
-    return
+  if (.not. gpu_csr_active) then
+    n_live = count(bunch%particle%state == alive$)
+    if (n_live < space_charge_com%n_bin) then
+      call out_io (s_error$, r_name, 'NUMBER OF LIVE PARTICLES: \i0\ ', &
+                            'LESS THAN NUMBER OF BINS FOR CSR CALC.', &
+                            'AT ELEMENT: ' // trim(ele%name) // '  [# \i0\] ', &
+                            i_array = [n_live, ele%ix_ele ])
+      return
+    endif
   endif
 
   ! Assume a linear energy gain in a cavity
@@ -314,9 +353,15 @@ do i_step = 0, n_step
   e_tot = f1 * branch%ele(ele%ix_ele-1)%value(e_tot$) + (1 - f1) * ele%value(e_tot$)
   call convert_total_energy_to (e_tot, branch%param%particle, csr%gamma, beta = csr%beta)
   csr%gamma2 = csr%gamma**2
-  csr%rel_mass = mass_of(branch%param%particle) / m_electron 
+  csr%rel_mass = mass_of(branch%param%particle) / m_electron
 
-  call csr_bin_particles (ele, bunch%particle, csr, err_flag); if (err_flag) return
+  ! Bin particles — GPU path uses device data directly
+  if (gpu_csr_active) then
+    call csr_bin_particles_gpu(ele, bunch, csr, err_flag)
+  else
+    call csr_bin_particles (ele, bunch%particle, csr, err_flag)
+  endif
+  if (err_flag) return
 
   csr%s_kick = s0_step
   csr%s_chord_kick = s_ref_to_s_chord (s0_step, csr%eleinfo(ele%ix_ele))
@@ -328,6 +373,7 @@ do i_step = 0, n_step
   csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
 
   ! ns = 0 is the unshielded kick.
+  ! csr_bin_kicks operates on bin-level data only (not per-particle), stays on CPU.
 
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
     do ns = 0, space_charge_com%n_shield_images
@@ -346,9 +392,12 @@ do i_step = 0, n_step
     enddo
   endif
 
-  ! Give particles a kick
-
-  call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
+  ! Apply kicks to particles — GPU path modifies device data directly
+  if (gpu_csr_active) then
+    call csr_apply_kicks_gpu(ele, csr, bunch)
+  else
+    call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
+  endif
 
   call save_a_bunch_step (ele, bunch, bunch_track, s0_step)
 
@@ -383,6 +432,133 @@ do i_step = 0, n_step
 enddo
 
 err = .false.
+
+contains
+
+!------------------------------------------------------------------------
+! GPU-accelerated CSR particle binning.
+! Uses GPU z-reduction for min/max, GPU kernel for per-particle binning,
+! then copies results into csr%slice struct for CPU bin-kick computation.
+!------------------------------------------------------------------------
+subroutine csr_bin_particles_gpu(ele_in, bunch_in, csr_in, err_flag_out)
+use gpu_tracking_mod, only: gpu_csr_z_minmax, gpu_csr_bin_particles
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (bunch_struct), target, intent(in) :: bunch_in
+type (csr_struct), target, intent(inout) :: csr_in
+logical, intent(out) :: err_flag_out
+
+real(rp) :: z_minval, z_maxval, dz_l, z_center_l, z_min_l, dz_particle_l
+real(C_DOUBLE), allocatable :: h_charge_l(:), h_bin_charge_l(:), h_bin_x0_wt_l(:), h_bin_y0_wt_l(:), h_bin_n_particle_l(:)
+integer :: ii, np_l, nb_l, n_bin_eff_l
+
+err_flag_out = .false.
+
+if (ele_in%space_charge_method /= slice$ .and. ele_in%csr_method /= one_dim$) return
+
+nb_l = space_charge_com%n_bin
+np_l = size(bunch_in%particle)
+n_bin_eff_l = nb_l - 2 - (space_charge_com%particle_bin_span + 1)
+if (n_bin_eff_l < 1) then
+  err_flag_out = .true.
+  return
+endif
+
+! Get z min/max from device data
+call gpu_csr_z_minmax(z_minval, z_maxval, int(np_l, C_INT))
+dz_l = z_maxval - z_minval
+if (dz_l == 0) then
+  err_flag_out = .true.
+  return
+endif
+
+csr_in%dz_slice = 1.0000001_rp * dz_l / n_bin_eff_l
+z_center_l = (z_maxval + z_minval) / 2
+z_min_l = z_center_l - nb_l * csr_in%dz_slice / 2
+dz_particle_l = space_charge_com%particle_bin_span * csr_in%dz_slice
+
+! Allocate bin arrays
+if (allocated(csr_in%slice)) then
+  if (size(csr_in%slice, 1) < nb_l) deallocate (csr_in%slice)
+endif
+if (.not. allocated(csr_in%slice)) &
+    allocate (csr_in%slice(nb_l), csr_in%kick1(-nb_l:nb_l))
+csr_in%slice(:) = csr_bunch_slice_struct()
+
+! Fill in z geometry
+do ii = 1, nb_l
+  csr_in%slice(ii)%z0_edge  = z_min_l + (ii - 1) * csr_in%dz_slice
+  csr_in%slice(ii)%z_center = csr_in%slice(ii)%z0_edge + csr_in%dz_slice / 2
+  csr_in%slice(ii)%z1_edge  = csr_in%slice(ii)%z0_edge + csr_in%dz_slice
+enddo
+
+! Prepare per-particle charge array (host)
+allocate(h_charge_l(np_l))
+do ii = 1, np_l
+  if (bunch_in%particle(ii)%state == alive$) then
+    h_charge_l(ii) = bunch_in%particle(ii)%charge * charge_of(bunch_in%particle(ii)%species)
+  else
+    h_charge_l(ii) = 0
+  endif
+enddo
+
+! GPU binning kernel (reads vz, vx, vy, state from device; outputs bin arrays to host)
+allocate(h_bin_charge_l(nb_l), h_bin_x0_wt_l(nb_l), h_bin_y0_wt_l(nb_l), h_bin_n_particle_l(nb_l))
+call gpu_csr_bin_particles(h_charge_l, int(np_l, C_INT), &
+    h_bin_charge_l, h_bin_x0_wt_l, h_bin_y0_wt_l, h_bin_n_particle_l, &
+    z_min_l, csr_in%dz_slice, dz_particle_l, &
+    int(nb_l, C_INT), int(space_charge_com%particle_bin_span, C_INT))
+
+! Copy results into csr%slice
+do ii = 1, nb_l
+  csr_in%slice(ii)%charge = h_bin_charge_l(ii)
+  if (h_bin_n_particle_l(ii) > 0 .and. h_bin_charge_l(ii) /= 0) then
+    csr_in%slice(ii)%x0 = h_bin_x0_wt_l(ii) / h_bin_charge_l(ii)
+    csr_in%slice(ii)%y0 = h_bin_y0_wt_l(ii) / h_bin_charge_l(ii)
+  endif
+  csr_in%slice(ii)%n_particle = h_bin_n_particle_l(ii)
+enddo
+
+deallocate(h_charge_l, h_bin_charge_l, h_bin_x0_wt_l, h_bin_y0_wt_l, h_bin_n_particle_l)
+
+end subroutine csr_bin_particles_gpu
+
+!------------------------------------------------------------------------
+! GPU-accelerated CSR kick application.
+! Uploads bin-level kick arrays to device, applies kicks on GPU.
+!------------------------------------------------------------------------
+subroutine csr_apply_kicks_gpu(ele_in, csr_in, bunch_in)
+use gpu_tracking_mod, only: gpu_csr_apply_kicks
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (csr_struct), target, intent(in) :: csr_in
+type (bunch_struct), target, intent(inout) :: bunch_in
+
+real(C_DOUBLE), allocatable :: h_kick_csr_l(:), h_kick_lsc_l(:)
+integer :: ii, np_l, nb_l
+integer(C_INT) :: apply_csr_l, apply_lsc_l
+
+nb_l = space_charge_com%n_bin
+np_l = size(bunch_in%particle)
+
+allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
+do ii = 1, nb_l
+  h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
+  h_kick_lsc_l(ii) = 0
+enddo
+
+apply_csr_l = 0; apply_lsc_l = 0
+if (ele_in%csr_method == one_dim$) apply_csr_l = 1
+if (ele_in%space_charge_method == slice$) apply_lsc_l = 1
+
+call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
+    csr_in%slice(1)%z_center, csr_in%dz_slice, &
+    apply_csr_l, apply_lsc_l, &
+    int(nb_l, C_INT), int(np_l, C_INT))
+
+deallocate(h_kick_csr_l, h_kick_lsc_l)
+
+end subroutine csr_apply_kicks_gpu
 
 end subroutine track1_bunch_csr
 
