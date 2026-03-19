@@ -427,6 +427,9 @@ __global__ void csr_apply_kick_kernel(
  * HOST WRAPPERS
  * ========================================================================= */
 
+/* Forward declaration of geometry struct (defined below near CSR kernels) */
+struct CsrEleGeom;
+
 /* Cached device arrays for space charge */
 static double *d_sc_rho = NULL;
 static double *d_sc_efield = NULL;  /* nx*ny*nz*3 */
@@ -445,6 +448,42 @@ static double *d_csr_bin_n_particle = NULL;
 static double *d_csr_kick_csr = NULL;
 static double *d_csr_kick_lsc = NULL;
 static int d_csr_bin_cap = 0;
+
+/* Cached device arrays for CSR bin kicks */
+static CsrEleGeom *d_cbk_geom = NULL;
+static double *d_cbk_I_csr = NULL;
+static double *d_cbk_I_int_csr = NULL;
+static int *d_cbk_ix_ele_source = NULL;
+static int d_cbk_geom_cap = 0;   /* capacity in elements */
+static int d_cbk_kick1_cap = 0;  /* capacity in n_kick1 */
+
+/* Static host buffers for CSR bin kicks */
+static CsrEleGeom *h_cbk_geom = NULL;
+static double *h_cbk_I_csr = NULL;
+static double *h_cbk_I_int_csr = NULL;
+static int h_cbk_geom_cap = 0;
+static int h_cbk_kick1_cap = 0;
+
+/* Static host buffers for space charge block reductions */
+static double *h_sc_bsum = NULL;
+static int *h_sc_bcnt = NULL;
+static int h_sc_bsum_cap = 0;
+
+static double *h_sc_bmin_x = NULL, *h_sc_bmax_x = NULL;
+static double *h_sc_bmin_y = NULL, *h_sc_bmax_y = NULL;
+static double *h_sc_bmin_z = NULL, *h_sc_bmax_z = NULL;
+static int h_sc_bounds_cap = 0;
+
+/* Static host buffers for gpu_csr_z_minmax_ */
+static double *h_zminmax_bmin = NULL, *h_zminmax_bmax = NULL;
+static int h_zminmax_cap = 0;
+
+/* Cached device arrays for gpu_csr_z_minmax_ */
+static double *d_zminmax_bmin = NULL, *d_zminmax_bmax = NULL;
+static int d_zminmax_cap = 0;
+
+/* Charge upload caching -- avoid re-uploading when charge hasn't changed */
+static int sc_charge_uploaded = 0;
 
 /* Access device buffer pointers from gpu_tracking_kernels.cu via accessor */
 extern "C" void gpu_get_device_ptrs_(
@@ -505,6 +544,7 @@ static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
             if (d_sc_charge) cudaFree(d_sc_charge);
             cudaMalloc((void**)&d_sc_charge, (size_t)n_particles * sizeof(double));
             cached_np = n_particles;
+            sc_charge_uploaded = 0;  /* force re-upload after realloc */
         }
     }
 
@@ -559,9 +599,18 @@ extern "C" void gpu_space_charge_3d_(
     int threads = 256;
     int n_blocks = (n_particles + threads - 1) / threads;
 
-    /* Upload per-particle charge */
-    CUDA_SC_CHECK(cudaMemcpy(d_sc_charge, h_charge,
-        (size_t)n_particles * sizeof(double), cudaMemcpyHostToDevice));
+    /* Upload per-particle charge (cached -- skip if same pointer and not invalidated) */
+    {
+        static const double *last_h_charge = NULL;
+        static int last_np = 0;
+        if (!sc_charge_uploaded || h_charge != last_h_charge || n_particles != last_np) {
+            CUDA_SC_CHECK(cudaMemcpy(d_sc_charge, h_charge,
+                (size_t)n_particles * sizeof(double), cudaMemcpyHostToDevice));
+            sc_charge_uploaded = 1;
+            last_h_charge = h_charge;
+            last_np = n_particles;
+        }
+    }
 
     /* --- Step 1: Compute mesh bounds and dct_ave on GPU --- */
     /* Use GPU reduction to avoid downloading 40 MB of particle data per sub-step. */
@@ -581,16 +630,19 @@ extern "C" void gpu_space_charge_3d_(
         dct_ave_reduce_kernel<<<n_blocks, threads, threads*(sizeof(double)+sizeof(int))>>>(
             dvec[4], dbeta, dstate, d_block_sum, d_block_count, n_particles);
         cudaDeviceSynchronize();
-        /* Download tiny block results */
-        double *h_bsum = (double*)malloc(n_blocks * sizeof(double));
-        int *h_bcnt = (int*)malloc(n_blocks * sizeof(int));
-        cudaMemcpy(h_bsum, d_block_sum, n_blocks * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_bcnt, d_block_count, n_blocks * sizeof(int), cudaMemcpyDeviceToHost);
+        /* Download tiny block results (static host buffers) */
+        if (n_blocks > h_sc_bsum_cap) {
+            free(h_sc_bsum); free(h_sc_bcnt);
+            h_sc_bsum = (double*)malloc(n_blocks * sizeof(double));
+            h_sc_bcnt = (int*)malloc(n_blocks * sizeof(int));
+            h_sc_bsum_cap = n_blocks;
+        }
+        cudaMemcpy(h_sc_bsum, d_block_sum, n_blocks * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_sc_bcnt, d_block_count, n_blocks * sizeof(int), cudaMemcpyDeviceToHost);
         double sum_zb = 0.0; int n_alive = 0;
-        for (int i = 0; i < n_blocks; i++) { sum_zb += h_bsum[i]; n_alive += h_bcnt[i]; }
+        for (int i = 0; i < n_blocks; i++) { sum_zb += h_sc_bsum[i]; n_alive += h_sc_bcnt[i]; }
         dct_ave = (n_alive > 0) ? sum_zb / n_alive : 0.0;
-        free(h_bsum); free(h_bcnt);
-        /* d_block_sum/count are static -- not freed here */
+        /* d_block_sum/count and h_sc_bsum/bcnt are static -- not freed here */
     }
 
     /* Compute bounds using GPU block reduction (cached buffers) */
@@ -628,29 +680,32 @@ extern "C" void gpu_space_charge_3d_(
         cudaDeviceSynchronize();
     }
 
-    /* Download block results (tiny: ~4K doubles × 6) */
-    double *h_bmin_x = (double*)malloc(n_blocks*sizeof(double));
-    double *h_bmax_x = (double*)malloc(n_blocks*sizeof(double));
-    double *h_bmin_y = (double*)malloc(n_blocks*sizeof(double));
-    double *h_bmax_y = (double*)malloc(n_blocks*sizeof(double));
-    double *h_bmin_z = (double*)malloc(n_blocks*sizeof(double));
-    double *h_bmax_z = (double*)malloc(n_blocks*sizeof(double));
-    cudaMemcpy(h_bmin_x, d_bmin_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bmax_x, d_bmax_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bmin_y, d_bmin_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bmax_y, d_bmax_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bmin_z, d_bmin_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bmax_z, d_bmax_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    /* Download block results (tiny: ~4K doubles x 6, static host buffers) */
+    if (n_blocks > h_sc_bounds_cap) {
+        free(h_sc_bmin_x); free(h_sc_bmax_x); free(h_sc_bmin_y);
+        free(h_sc_bmax_y); free(h_sc_bmin_z); free(h_sc_bmax_z);
+        h_sc_bmin_x = (double*)malloc(n_blocks*sizeof(double));
+        h_sc_bmax_x = (double*)malloc(n_blocks*sizeof(double));
+        h_sc_bmin_y = (double*)malloc(n_blocks*sizeof(double));
+        h_sc_bmax_y = (double*)malloc(n_blocks*sizeof(double));
+        h_sc_bmin_z = (double*)malloc(n_blocks*sizeof(double));
+        h_sc_bmax_z = (double*)malloc(n_blocks*sizeof(double));
+        h_sc_bounds_cap = n_blocks;
+    }
+    cudaMemcpy(h_sc_bmin_x, d_bmin_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sc_bmax_x, d_bmax_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sc_bmin_y, d_bmin_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sc_bmax_y, d_bmax_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sc_bmin_z, d_bmin_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sc_bmax_z, d_bmax_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
 
     double xmin=1e30, xmax=-1e30, ymin=1e30, ymax=-1e30, zmin=1e30, zmax=-1e30;
     for (int i = 0; i < n_blocks; i++) {
-        if (h_bmin_x[i] < xmin) xmin = h_bmin_x[i]; if (h_bmax_x[i] > xmax) xmax = h_bmax_x[i];
-        if (h_bmin_y[i] < ymin) ymin = h_bmin_y[i]; if (h_bmax_y[i] > ymax) ymax = h_bmax_y[i];
-        if (h_bmin_z[i] < zmin) zmin = h_bmin_z[i]; if (h_bmax_z[i] > zmax) zmax = h_bmax_z[i];
+        if (h_sc_bmin_x[i] < xmin) xmin = h_sc_bmin_x[i]; if (h_sc_bmax_x[i] > xmax) xmax = h_sc_bmax_x[i];
+        if (h_sc_bmin_y[i] < ymin) ymin = h_sc_bmin_y[i]; if (h_sc_bmax_y[i] > ymax) ymax = h_sc_bmax_y[i];
+        if (h_sc_bmin_z[i] < zmin) zmin = h_sc_bmin_z[i]; if (h_sc_bmax_z[i] > zmax) zmax = h_sc_bmax_z[i];
     }
-
-    free(h_bmin_x); free(h_bmax_x); free(h_bmin_y); free(h_bmax_y); free(h_bmin_z); free(h_bmax_z);
-    /* d_bmin/d_bmax are static, not freed here, reused across calls */
+    /* d_bmin/d_bmax and h_sc_bmin/bmax are static, not freed here */
 
     double dx = (xmax-xmin)/(nx-1), dy = (ymax-ymin)/(ny-1), dz = (zmax-zmin)/(nz-1);
     if (dx == 0) dx = 1e-10; if (dy == 0) dy = 1e-10; if (dz == 0) dz = 1e-10;
@@ -676,7 +731,7 @@ extern "C" void gpu_space_charge_3d_(
         xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
         nx, ny, nz, n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
-    CUDA_SC_CHECK(cudaDeviceSynchronize());
+    /* No sync needed -- next operations are on same default stream */
 
     /* --- Step 3: FFT of charge density --- */
     CUDA_SC_CHECK(cudaMemset(d_sc_crho, 0, dbl_size * sizeof(cufftDoubleComplex)));
@@ -684,10 +739,10 @@ extern "C" void gpu_space_charge_3d_(
     int blocks_m = (mesh_size + threads - 1) / threads;
     rho_to_complex_kernel<<<blocks_m, threads>>>(
         d_sc_rho, d_sc_crho, nx, ny, nz, nx2, ny2, nz2);
-    CUDA_SC_CHECK(cudaDeviceSynchronize());
+    /* No sync needed -- cuFFT on default stream is serialized */
 
     CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_crho, d_sc_crho, CUFFT_FORWARD));
-    CUDA_SC_CHECK(cudaDeviceSynchronize());
+    /* No sync needed -- next kernels on same stream */
 
     /* --- Step 4: For each E-field component: Green function + FFT + multiply + IFFT --- */
     int blocks_d = (dbl_size + threads - 1) / threads;
@@ -700,7 +755,7 @@ extern "C" void gpu_space_charge_3d_(
         green_function_kernel<<<blocks_d, threads>>>(
             d_sc_cgrn, dx, dy, dz, gamma, icomp,
             nx2, ny2, nz2, 0.0, 0.0, 0.0);
-        CUDA_SC_CHECK(cudaDeviceSynchronize());
+        /* No sync -- D2D copy on same stream waits for kernel */
 
         /* Apply IGF stencil */
         int stencil_size = (nx2-1)*(ny2-1)*(nz2-1);
@@ -709,27 +764,27 @@ extern "C" void gpu_space_charge_3d_(
             dbl_size * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToDevice));
         igf_stencil_kernel<<<blocks_s, threads>>>(
             d_sc_cgrn2, d_sc_cgrn, nx2, ny2, nz2);
-        CUDA_SC_CHECK(cudaDeviceSynchronize());
+        /* No sync -- cuFFT on same stream waits for kernel */
 
         /* FFT of Green function */
         CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn, d_sc_cgrn, CUFFT_FORWARD));
-        CUDA_SC_CHECK(cudaDeviceSynchronize());
+        /* No sync -- next kernel on same stream */
 
         /* Multiply in frequency domain */
         complex_multiply_kernel<<<blocks_d, threads>>>(
             d_sc_crho, d_sc_cgrn, dbl_size);
-        CUDA_SC_CHECK(cudaDeviceSynchronize());
+        /* No sync -- cuFFT on same stream waits for kernel */
 
         /* Inverse FFT */
         CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn, d_sc_cgrn, CUFFT_INVERSE));
-        CUDA_SC_CHECK(cudaDeviceSynchronize());
+        /* No sync -- next kernel on same stream */
 
         /* Extract field component */
         double scale = SC_FPEI / (double)(nx2*ny2*nz2);
         extract_field_kernel<<<blocks_m, threads>>>(
             d_sc_cgrn, d_sc_efield + (icomp-1)*mesh_size,
             nx, ny, nz, nx2, ny2, nz2, scale);
-        CUDA_SC_CHECK(cudaDeviceSynchronize());
+        /* No sync needed within loop -- next iteration memset is on same stream */
     }
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
@@ -854,32 +909,36 @@ extern "C" void gpu_csr_z_minmax_(
     int threads = 256;
     int blocks = (n_particles + threads - 1) / threads;
 
-    double *d_bmin, *d_bmax;
-    cudaMalloc((void**)&d_bmin, blocks * sizeof(double));
-    cudaMalloc((void**)&d_bmax, blocks * sizeof(double));
+    /* Use cached device buffers (only realloc when size grows) */
+    if (blocks > d_zminmax_cap) {
+        if (d_zminmax_bmin) cudaFree(d_zminmax_bmin);
+        if (d_zminmax_bmax) cudaFree(d_zminmax_bmax);
+        cudaMalloc((void**)&d_zminmax_bmin, blocks * sizeof(double));
+        cudaMalloc((void**)&d_zminmax_bmax, blocks * sizeof(double));
+        d_zminmax_cap = blocks;
+    }
 
     z_minmax_kernel<<<blocks, threads, 2 * threads * sizeof(double)>>>(
-        dvec[4], dstate, d_bmin, d_bmax, n_particles);
+        dvec[4], dstate, d_zminmax_bmin, d_zminmax_bmax, n_particles);
     cudaDeviceSynchronize();
 
-    /* Download block results (tiny: ~4K blocks for 1M particles) */
-    double *h_bmin = (double*)malloc(blocks * sizeof(double));
-    double *h_bmax = (double*)malloc(blocks * sizeof(double));
-    cudaMemcpy(h_bmin, d_bmin, blocks * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_bmax, d_bmax, blocks * sizeof(double), cudaMemcpyDeviceToHost);
+    /* Download block results (static host buffers) */
+    if (blocks > h_zminmax_cap) {
+        free(h_zminmax_bmin); free(h_zminmax_bmax);
+        h_zminmax_bmin = (double*)malloc(blocks * sizeof(double));
+        h_zminmax_bmax = (double*)malloc(blocks * sizeof(double));
+        h_zminmax_cap = blocks;
+    }
+    cudaMemcpy(h_zminmax_bmin, d_zminmax_bmin, blocks * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_zminmax_bmax, d_zminmax_bmax, blocks * sizeof(double), cudaMemcpyDeviceToHost);
 
     double zmin = 1e30, zmax = -1e30;
     for (int i = 0; i < blocks; i++) {
-        if (h_bmin[i] < zmin) zmin = h_bmin[i];
-        if (h_bmax[i] > zmax) zmax = h_bmax[i];
+        if (h_zminmax_bmin[i] < zmin) zmin = h_zminmax_bmin[i];
+        if (h_zminmax_bmax[i] > zmax) zmax = h_zminmax_bmax[i];
     }
     *h_z_min = zmin;
     *h_z_max = zmax;
-
-    free(h_bmin);
-    free(h_bmax);
-    cudaFree(d_bmin);
-    cudaFree(d_bmax);
 }
 
 
@@ -905,13 +964,15 @@ extern "C" void gpu_csr_bin_particles_(
     double *dvec[6]; int *dstate; double *dbeta, *dp0c;
     get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
 
-    /* Upload per-particle charge (reuse buffer if large enough) */
+    /* Ensure d_sc_charge is large enough (uses the cached buffer from ensure_sc_buffers
+       via the static cached_np in that function; also handle standalone CSR case) */
     {
-        static int d_sc_charge_size = 0;
-        if (n_particles > d_sc_charge_size) {
+        static int csr_charge_cap = 0;
+        if (n_particles > csr_charge_cap) {
             if (d_sc_charge) cudaFree(d_sc_charge);
             cudaMalloc((void**)&d_sc_charge, (size_t)n_particles * sizeof(double));
-            d_sc_charge_size = n_particles;
+            csr_charge_cap = n_particles;
+            sc_charge_uploaded = 0;  /* force re-upload after realloc */
         }
     }
     CUDA_SC_CHECK(cudaMemcpy(d_sc_charge, h_charge,
@@ -1376,8 +1437,13 @@ extern "C" void gpu_csr_bin_kicks_(
 {
     int n_kick1 = 2 * n_bin + 1;
 
-    /* Build geometry array */
-    CsrEleGeom *h_geom = (CsrEleGeom*)malloc((n_ele + 1) * sizeof(CsrEleGeom));
+    /* Build geometry array (static host buffer) */
+    if (n_ele + 1 > h_cbk_geom_cap) {
+        free(h_cbk_geom);
+        h_cbk_geom = (CsrEleGeom*)malloc((n_ele + 1) * sizeof(CsrEleGeom));
+        h_cbk_geom_cap = n_ele + 1;
+    }
+    CsrEleGeom *h_geom = h_cbk_geom;
     for (int i = 0; i <= n_ele; i++) {
         h_geom[i].floor0_x = h_floor0_x[i];
         h_geom[i].floor0_z = h_floor0_z[i];
@@ -1395,37 +1461,50 @@ extern "C" void gpu_csr_bin_kicks_(
         h_geom[i].ele_key = h_ele_key[i];
     }
 
-    /* Upload geometry to device */
-    CsrEleGeom *d_geom;
-    cudaMalloc((void**)&d_geom, (n_ele + 1) * sizeof(CsrEleGeom));
-    cudaMemcpy(d_geom, h_geom, (n_ele + 1) * sizeof(CsrEleGeom), cudaMemcpyHostToDevice);
+    /* Upload geometry to device (cached buffer) */
+    if (n_ele + 1 > d_cbk_geom_cap) {
+        if (d_cbk_geom) cudaFree(d_cbk_geom);
+        cudaMalloc((void**)&d_cbk_geom, (n_ele + 1) * sizeof(CsrEleGeom));
+        d_cbk_geom_cap = n_ele + 1;
+    }
+    cudaMemcpy(d_cbk_geom, h_geom, (n_ele + 1) * sizeof(CsrEleGeom), cudaMemcpyHostToDevice);
 
-    /* Allocate device output arrays */
-    double *d_I_csr, *d_I_int_csr;
-    int *d_ix_ele_source;
-    cudaMalloc((void**)&d_I_csr, n_kick1 * sizeof(double));
-    cudaMalloc((void**)&d_I_int_csr, n_kick1 * sizeof(double));
-    cudaMalloc((void**)&d_ix_ele_source, n_kick1 * sizeof(int));
-    cudaMemset(d_I_csr, 0, n_kick1 * sizeof(double));
-    cudaMemset(d_I_int_csr, 0, n_kick1 * sizeof(double));
+    /* Ensure device output arrays are large enough (cached) */
+    if (n_kick1 > d_cbk_kick1_cap) {
+        if (d_cbk_I_csr) cudaFree(d_cbk_I_csr);
+        if (d_cbk_I_int_csr) cudaFree(d_cbk_I_int_csr);
+        if (d_cbk_ix_ele_source) cudaFree(d_cbk_ix_ele_source);
+        cudaMalloc((void**)&d_cbk_I_csr, n_kick1 * sizeof(double));
+        cudaMalloc((void**)&d_cbk_I_int_csr, n_kick1 * sizeof(double));
+        cudaMalloc((void**)&d_cbk_ix_ele_source, n_kick1 * sizeof(int));
+        d_cbk_kick1_cap = n_kick1;
+    }
+    cudaMemset(d_cbk_I_csr, 0, n_kick1 * sizeof(double));
+    cudaMemset(d_cbk_I_int_csr, 0, n_kick1 * sizeof(double));
 
     /* Launch kernel: one thread per kick1 bin */
     int threads = 256;
     int blocks = (n_kick1 + threads - 1) / threads;
     csr_bin_kicks_kernel<<<blocks, threads>>>(
-        d_geom, n_ele, ix_ele_kick, s_chord_kick,
+        d_cbk_geom, n_ele, ix_ele_kick, s_chord_kick,
         floor_k_x, floor_k_z,
         gamma, gamma2, beta2, y_source,
         dz_slice, n_bin, kick_factor,
-        d_I_csr, d_I_int_csr, d_ix_ele_source);
+        d_cbk_I_csr, d_cbk_I_int_csr, d_cbk_ix_ele_source);
     CUDA_SC_CHECK(cudaGetLastError());
     CUDA_SC_CHECK(cudaDeviceSynchronize());
 
-    /* Download results */
-    double *h_I_csr = (double*)malloc(n_kick1 * sizeof(double));
-    double *h_I_int_csr = (double*)malloc(n_kick1 * sizeof(double));
-    cudaMemcpy(h_I_csr, d_I_csr, n_kick1 * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_I_int_csr, d_I_int_csr, n_kick1 * sizeof(double), cudaMemcpyDeviceToHost);
+    /* Download results (static host buffers) */
+    if (n_kick1 > h_cbk_kick1_cap) {
+        free(h_cbk_I_csr); free(h_cbk_I_int_csr);
+        h_cbk_I_csr = (double*)malloc(n_kick1 * sizeof(double));
+        h_cbk_I_int_csr = (double*)malloc(n_kick1 * sizeof(double));
+        h_cbk_kick1_cap = n_kick1;
+    }
+    double *h_I_csr = h_cbk_I_csr;
+    double *h_I_int_csr = h_cbk_I_int_csr;
+    cudaMemcpy(h_I_csr, d_cbk_I_csr, n_kick1 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_I_int_csr, d_cbk_I_int_csr, n_kick1 * sizeof(double), cudaMemcpyDeviceToHost);
 
     /* --- CPU: Compute I_int_csr (prefix scan) --- */
     /* h_I_csr is indexed 0..2*n_bin, corresponding to i_bin = -n_bin..+n_bin */
@@ -1485,14 +1564,7 @@ extern "C" void gpu_csr_bin_kicks_(
         memcpy(h_I_csr_out, h_I_csr, n_kick1 * sizeof(double));
     }
 
-    /* Cleanup */
-    free(h_geom);
-    free(h_I_csr);
-    free(h_I_int_csr);
-    cudaFree(d_geom);
-    cudaFree(d_I_csr);
-    cudaFree(d_I_int_csr);
-    cudaFree(d_ix_ele_source);
+    /* All buffers are static -- not freed here, reused across calls */
 }
 
 
@@ -1509,6 +1581,7 @@ extern "C" void gpu_spacecharge_cleanup_(void)
     if (d_sc_cgrn)   { cudaFree(d_sc_cgrn);   d_sc_cgrn = NULL; }
     if (d_sc_cgrn2)  { cudaFree(d_sc_cgrn2);  d_sc_cgrn2 = NULL; }
     sc_nx2 = 0; sc_ny2 = 0; sc_nz2 = 0;
+    sc_charge_uploaded = 0;
 
     if (d_csr_bin_charge)     { cudaFree(d_csr_bin_charge);     d_csr_bin_charge = NULL; }
     if (d_csr_bin_x0_wt)     { cudaFree(d_csr_bin_x0_wt);     d_csr_bin_x0_wt = NULL; }
@@ -1517,6 +1590,37 @@ extern "C" void gpu_spacecharge_cleanup_(void)
     if (d_csr_kick_csr)      { cudaFree(d_csr_kick_csr);      d_csr_kick_csr = NULL; }
     if (d_csr_kick_lsc)      { cudaFree(d_csr_kick_lsc);      d_csr_kick_lsc = NULL; }
     d_csr_bin_cap = 0;
+
+    /* CSR bin kicks cached buffers */
+    if (d_cbk_geom) { cudaFree(d_cbk_geom); d_cbk_geom = NULL; }
+    if (d_cbk_I_csr) { cudaFree(d_cbk_I_csr); d_cbk_I_csr = NULL; }
+    if (d_cbk_I_int_csr) { cudaFree(d_cbk_I_int_csr); d_cbk_I_int_csr = NULL; }
+    if (d_cbk_ix_ele_source) { cudaFree(d_cbk_ix_ele_source); d_cbk_ix_ele_source = NULL; }
+    d_cbk_geom_cap = 0; d_cbk_kick1_cap = 0;
+    free(h_cbk_geom); h_cbk_geom = NULL; h_cbk_geom_cap = 0;
+    free(h_cbk_I_csr); h_cbk_I_csr = NULL;
+    free(h_cbk_I_int_csr); h_cbk_I_int_csr = NULL;
+    h_cbk_kick1_cap = 0;
+
+    /* Space charge host buffers */
+    free(h_sc_bsum); h_sc_bsum = NULL;
+    free(h_sc_bcnt); h_sc_bcnt = NULL;
+    h_sc_bsum_cap = 0;
+    free(h_sc_bmin_x); h_sc_bmin_x = NULL;
+    free(h_sc_bmax_x); h_sc_bmax_x = NULL;
+    free(h_sc_bmin_y); h_sc_bmin_y = NULL;
+    free(h_sc_bmax_y); h_sc_bmax_y = NULL;
+    free(h_sc_bmin_z); h_sc_bmin_z = NULL;
+    free(h_sc_bmax_z); h_sc_bmax_z = NULL;
+    h_sc_bounds_cap = 0;
+
+    /* z_minmax cached buffers */
+    if (d_zminmax_bmin) { cudaFree(d_zminmax_bmin); d_zminmax_bmin = NULL; }
+    if (d_zminmax_bmax) { cudaFree(d_zminmax_bmax); d_zminmax_bmax = NULL; }
+    d_zminmax_cap = 0;
+    free(h_zminmax_bmin); h_zminmax_bmin = NULL;
+    free(h_zminmax_bmax); h_zminmax_bmax = NULL;
+    h_zminmax_cap = 0;
 }
 
 #endif /* USE_GPU_TRACKING */
