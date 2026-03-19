@@ -532,19 +532,21 @@ end subroutine csr_bin_particles_gpu
 ! Uploads bin-level kick arrays to device, applies kicks on GPU.
 !------------------------------------------------------------------------
 subroutine csr_apply_kicks_gpu(ele_in, csr_in, bunch_in)
-use gpu_tracking_mod, only: gpu_csr_apply_kicks
+use gpu_tracking_mod, only: gpu_csr_apply_kicks, gpu_space_charge_3d, gpu_persist_on_device
 use, intrinsic :: iso_c_binding
 type (ele_struct), intent(in) :: ele_in
 type (csr_struct), target, intent(in) :: csr_in
 type (bunch_struct), target, intent(inout) :: bunch_in
 
-real(C_DOUBLE), allocatable :: h_kick_csr_l(:), h_kick_lsc_l(:)
+real(C_DOUBLE), allocatable :: h_kick_csr_l(:), h_kick_lsc_l(:), h_charge_l(:)
 integer :: ii, np_l, nb_l
 integer(C_INT) :: apply_csr_l, apply_lsc_l
+real(rp) :: mc2_l
 
 nb_l = space_charge_com%n_bin
 np_l = size(bunch_in%particle)
 
+! CSR/LSC kicks
 allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
 do ii = 1, nb_l
   h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
@@ -561,6 +563,21 @@ call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
     int(nb_l, C_INT), int(np_l, C_INT))
 
 deallocate(h_kick_csr_l, h_kick_lsc_l)
+
+! 3D FFT space charge (on device — no upload/download needed)
+if (ele_in%space_charge_method == fft_3d$ .and. gpu_persist_on_device) then
+  allocate(h_charge_l(np_l))
+  do ii = 1, np_l
+    h_charge_l(ii) = bunch_in%particle(ii)%charge
+  enddo
+  mc2_l = mass_of(bunch_in%particle(1)%species)
+  ! Pass sentinel dct_ave (1e31) so CUDA kernel computes it from device data
+  call gpu_space_charge_3d(h_charge_l, int(np_l, C_INT), &
+      int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
+      int(csr_in%mesh3d%nhi(3), C_INT), &
+      csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+  deallocate(h_charge_l)
+endif
 
 end subroutine csr_apply_kicks_gpu
 
