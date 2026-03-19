@@ -70,7 +70,7 @@ static double *d_eb2 = NULL;
 static double *d_cm  = NULL;
 
 /* --------------------------------------------------------------------------
- * ensure_buffers — (re-)allocate device arrays when size changes
+ * ensure_buffers -- (re-)allocate device arrays when size changes
  * -------------------------------------------------------------------------- */
 static int ensure_buffers(int n)
 {
@@ -114,7 +114,7 @@ fail:
 }
 
 /* --------------------------------------------------------------------------
- * Accessor functions for device buffer pointers — used by
+ * Accessor functions for device buffer pointers -- used by
  * gpu_spacecharge_kernels.cu to access the cached particle buffers
  * without breaking static linkage.
  * -------------------------------------------------------------------------- */
@@ -129,7 +129,7 @@ extern "C" void gpu_get_device_ptrs_(
 }
 
 /* --------------------------------------------------------------------------
- * gpu_tracking_available — query whether a CUDA GPU is present
+ * gpu_tracking_available -- query whether a CUDA GPU is present
  * -------------------------------------------------------------------------- */
 extern "C" int gpu_tracking_available_(void)
 {
@@ -156,7 +156,7 @@ __device__ __forceinline__ double low_energy_z_correction_dev(
     double mc2, double e_tot_ele)
 {
     if (mc2 * (beta_ref * pz_val) * (beta_ref * pz_val) < 3e-7 * e_tot_ele) {
-        /* Taylor expansion for small pz — avoids precision loss */
+        /* Taylor expansion for small pz -- avoids precision loss */
         double mr = mc2 / e_tot_ele;
         double b02 = beta_ref * beta_ref;
         double f_tay = b02 * (2.0 * b02 - mr * mr * 0.5);
@@ -167,11 +167,11 @@ __device__ __forceinline__ double low_energy_z_correction_dev(
 }
 
 /* --------------------------------------------------------------------------
- * drift_body_dev — core drift physics for a single particle
+ * drift_body_dev -- core drift physics for a single particle
  *
  * Updates position (x, y), longitudinal (z), and time (t) for a drift of
  * length ds.  Returns 0 on success, 1 if particle is lost (pxy2 >= 1).
- * Does NOT update s_pos — callers handle that themselves.
+ * Does NOT update s_pos -- callers handle that themselves.
  * -------------------------------------------------------------------------- */
 __device__ int drift_body_dev(
     double *x, double *px, double *y, double *py, double *z, double *pz,
@@ -252,7 +252,7 @@ __device__ void multipole_kick_dev(
     double kx = 0.0, ky = 0.0;
     for (int nn = 0; nn <= ix_max; nn++) {
         if (a2[nn] == 0.0 && b2[nn] == 0.0) continue;
-        /* even m — cm is Fortran column-major: cm(nn, m) at offset m*N_MULTI+nn */
+        /* even m -- cm is Fortran column-major: cm(nn, m) at offset m*N_MULTI+nn */
         for (int m = 0; m <= nn; m += 2) {
             double f = cm[m * N_MULTI + nn] * ipow(x, nn - m) * ipow(y, m);
             kx += b2[nn] * f;
@@ -270,7 +270,7 @@ __device__ void multipole_kick_dev(
 }
 
 /* --------------------------------------------------------------------------
- * apply_electric_kick_dev — apply a scaled electric multipole kick and
+ * apply_electric_kick_dev -- apply a scaled electric multipole kick and
  * update pz, beta, and z.  Caller pre-computes the scaled kick (kx_s, ky_s)
  * including any element-specific factors (1/beta, (1+g*x)/ps, etc.).
  * Returns 1 if particle is lost (alpha < -1), 0 on success.
@@ -297,7 +297,7 @@ __device__ int apply_electric_kick_dev(
 }
 
 /* --------------------------------------------------------------------------
- * quad_mat2_calc_dev — compute 2x2 transfer matrix and z-correction terms
+ * quad_mat2_calc_dev -- compute 2x2 transfer matrix and z-correction terms
  *
  * Given focusing strength k_val and step length, computes:
  *   c, s: cosine-like and sine-like matrix elements
@@ -441,7 +441,7 @@ __global__ void quad_kernel(
 }
 
 /* --------------------------------------------------------------------------
- * upload_particle_data — H→D transfer of core particle arrays
+ * upload_particle_data -- H→D transfer of core particle arrays
  * -------------------------------------------------------------------------- */
 static int upload_particle_data(int n,
     double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
@@ -464,7 +464,7 @@ static int upload_particle_data(int n,
 }
 
 /* --------------------------------------------------------------------------
- * download_particle_data — D→H transfer of core particle arrays
+ * download_particle_data -- D→H transfer of core particle arrays
  *
  * copy_beta/copy_p0c: set to 1 to also download beta/p0c arrays.
  * Drift: both 0.  Quad/bend: copy_beta only when electric multipoles.
@@ -492,7 +492,7 @@ static int download_particle_data(int n,
 }
 
 /* --------------------------------------------------------------------------
- * upload_multipole_data — H→D transfer of multipole coefficient arrays
+ * upload_multipole_data -- H→D transfer of multipole coefficient arrays
  * -------------------------------------------------------------------------- */
 static int upload_multipole_data(
     double *h_a2, double *h_b2, double *h_cm,
@@ -933,7 +933,7 @@ extern "C" void gpu_track_bend_(
 #define STANDING_WAVE 1
 #define TRAVELING_WAVE 2
 
-/* Device helper: dpc_given_dE — momentum change from energy change.
+/* Device helper: dpc_given_dE -- momentum change from energy change.
  * Uses rationalization to avoid catastrophic cancellation for small dE. */
 __device__ __forceinline__ double dpc_given_dE_dev(double pc_old, double mc2, double dE)
 {
@@ -1002,7 +1002,7 @@ __device__ void lcavity_fringe_kick_dev(
 }
 
 /* --------------------------------------------------------------------------
- * ponderomotive_kick_dev — standing-wave ponderomotive transverse kick
+ * ponderomotive_kick_dev -- standing-wave ponderomotive transverse kick
  *
  * Applied symmetrically before and after each RF energy kick step.
  * -------------------------------------------------------------------------- */
@@ -1380,7 +1380,7 @@ __global__ void rad_kick_kernel(
  * SPLIT UPLOAD/DOWNLOAD WRAPPERS
  *
  * These allow the Fortran code to upload particle data once, run multiple
- * kernels (radiation + body), then download once — avoiding redundant
+ * kernels (radiation + body), then download once -- avoiding redundant
  * host-device transfers.
  * ========================================================================== */
 
@@ -1424,7 +1424,7 @@ static int ensure_rad_buffers(void)
 }
 
 /* --------------------------------------------------------------------------
- * gpu_rad_kick — apply radiation kick on device data (already uploaded)
+ * gpu_rad_kick -- apply radiation kick on device data (already uploaded)
  * -------------------------------------------------------------------------- */
 extern "C" void gpu_rad_kick_(
     int n,
@@ -1728,7 +1728,7 @@ extern "C" void gpu_quad_fringe_(
 }
 
 /* ==========================================================================
- * MISALIGNMENT KERNEL — applies offset_particle on GPU
+ * MISALIGNMENT KERNEL -- applies offset_particle on GPU
  *
  * Handles x_offset, y_offset, and tilt for non-bend elements.
  * set_flag: 1 = set (lab→body), -1 = unset (body→lab)
@@ -1793,11 +1793,11 @@ extern "C" void gpu_misalign_(
 }
 
 /* ==========================================================================
- * 3D MISALIGNMENT KERNEL — general affine coordinate transform
+ * 3D MISALIGNMENT KERNEL -- general affine coordinate transform
  *
  * Applies a precomputed 3x3 rotation W and offset L to transform
  * particle (x, px, y, py) between lab and body frames.
- * Handles bends (curvature), pitches, z_offset — any misalignment.
+ * Handles bends (curvature), pitches, z_offset -- any misalignment.
  *
  * set_flag=1: lab→body:  r_body = W · (r_lab - L), p_body = W · p_lab
  * set_flag=-1: body→lab: r_lab = W^T · r_body + L, p_lab = W^T · p_body
@@ -1991,7 +1991,7 @@ extern "C" void gpu_check_aperture_ellipse_(
 }
 
 /* ==========================================================================
- * S-POSITION UPDATE KERNEL — update s for all alive particles
+ * S-POSITION UPDATE KERNEL -- update s for all alive particles
  * ========================================================================== */
 
 __global__ void s_update_kernel(double *s_pos, const int *state, double s_val, int n)
@@ -2013,7 +2013,7 @@ extern "C" void gpu_s_update_(double s_val, int n)
 }
 
 /* ==========================================================================
- * ORBIT-TOO-LARGE CHECK — flag particles with |coord| > 1 as lost
+ * ORBIT-TOO-LARGE CHECK -- flag particles with |coord| > 1 as lost
  * ========================================================================== */
 
 __global__ void orbit_check_kernel(
@@ -2046,7 +2046,7 @@ extern "C" void gpu_orbit_check_(int n)
 }
 
 /* --------------------------------------------------------------------------
- * gpu_tracking_cleanup — release cached device buffers
+ * gpu_tracking_cleanup -- release cached device buffers
  * -------------------------------------------------------------------------- */
 extern "C" void gpu_tracking_cleanup_(void)
 {

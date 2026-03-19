@@ -46,7 +46,7 @@ type (branch_struct), pointer :: branch
 real(rp) charge, ds_wake
 
 integer, optional :: direction
-integer i, j, n, jj
+integer i, j, n
 logical err_flag, finished, thread_safe
 logical gpu_did_track
 
@@ -56,15 +56,17 @@ character(*), parameter :: r_name = 'track1_bunch_hom'
 
 branch => pointer_to_branch(ele)
 
-! Fast path: if GPU persistent session can handle this element, skip all the
-! O(N_particle) setup work (direction assignment, wake check, etc.)
-! Skip when CSR/SC is active on this element — those need the sub-stepping path.
+! GPU eligibility: common predicate for persistent and per-element paths.
+! Excludes spin tracking, high-energy SC, backward tracking, and CSR/SC sub-stepping.
 gpu_did_track = .false.
 if (bmad_com%gpu_tracking_on .and. &
     .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
     .not. (bmad_com%csr_and_space_charge_on .and. &
            (ele%csr_method /= off$ .or. ele%space_charge_method /= off$)) .and. &
     bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+
+  ! Fast path: try persistent GPU session (data already on device from previous element).
+  ! Skips all O(N_particle) CPU setup (direction assignment, wake check, SoA conversion).
   call gpu_persistent_track_element(bunch, ele, branch%param, gpu_did_track)
   if (gpu_did_track) return
 endif
@@ -81,19 +83,11 @@ call save_a_bunch_step (ele, bunch, bunch_track, 0.0_rp)
 wake_ele => pointer_to_wake_ele(ele, ds_wake)
 if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bmad_com%lr_wakes_on)) then
 
-  ! GPU tracking (opt-in via bmad_com%gpu_tracking_on).
-  ! Per-element GPU path for first element or non-persistent elements.
-  ! Skip when CSR/SC is active on this element — track1_bunch handles the sub-stepping.
-  gpu_did_track = .false.
-  if (bmad_com%gpu_tracking_on .and. &
-      .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
-      .not. (bmad_com%csr_and_space_charge_on .and. &
-             (ele%csr_method /= off$ .or. ele%space_charge_method /= off$)) .and. &
+  ! Per-element GPU path: persistent path declined (element can't stay on device).
+  ! The outer GPU eligibility was already checked above (lines 62-72).
+  if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
+      .not. bmad_com%spin_tracking_on .and. &
       bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
-
-    ! Persistent path already tried above and declined (non-device-resident
-    ! or first element). Data already flushed if it was on device.
-    if (ele_gpu_eligible(ele)) then
       call check_entrance_aperture_for_gpu(bunch, ele, branch%param)
 
       select case (ele%key)
@@ -119,7 +113,6 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
         bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
         return
       endif
-    endif
   endif
 
   if (bmad_com%radiation_damping_on .or. bmad_com%radiation_fluctuations_on) call radiation_map_setup(ele, err_flag)

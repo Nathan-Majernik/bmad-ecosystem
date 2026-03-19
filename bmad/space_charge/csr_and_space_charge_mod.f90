@@ -688,7 +688,7 @@ end subroutine track1_bunch_csr
 !----------------------------------------------------------------------------
 !----------------------------------------------------------------------------
 !+
-! Subroutine csr_bin_parcticles (ele, particle, csr)
+! Subroutine csr_bin_particles (ele, particle, csr)
 !
 ! Routine to bin the particles longitudinally in s. 
 !
