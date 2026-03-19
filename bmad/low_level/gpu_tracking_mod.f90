@@ -2199,8 +2199,7 @@ if (.not. can_stay) then
 endif
 
 ! First element: data not yet on device -- upload will happen below.
-! No early return: handle the first element via persistent path directly,
-! avoiding the redundant upload that gpu_persistent_seed would have done.
+! Handle via persistent path directly to avoid redundant per-element transfer.
 
 n = size(bunch%particle)
 if (n == 0) return
