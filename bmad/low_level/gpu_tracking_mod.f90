@@ -21,6 +21,7 @@ public :: track_bunch_thru_elements_gpu
 public :: ele_gpu_can_stay_on_device
 public :: gpu_upload_particles, gpu_download_particles
 public :: gpu_space_charge_3d, gpu_csr_bin_particles, gpu_csr_apply_kicks, gpu_csr_z_minmax
+public :: gpu_csr_bin_kicks
 public :: gpu_persistent_track_element, gpu_persistent_flush, gpu_persistent_seed
 public :: gpu_persist_on_device
 public :: gpu_track_body_on_device
@@ -320,6 +321,29 @@ interface
     real(C_DOUBLE), intent(in) :: h_kick_csr(*), h_kick_lsc(*)
     real(C_DOUBLE), value, intent(in) :: z_center_0, dz_slice
     integer(C_INT), value, intent(in) :: apply_csr, apply_lsc, n_bin, n_particles
+  end subroutine
+
+  subroutine gpu_csr_bin_kicks(h_floor0_x, h_floor0_z, h_floor0_theta, &
+      h_floor1_x, h_floor1_z, h_floor1_theta, &
+      h_L_chord, h_theta_chord, h_spline_coef, h_dL_s, h_ele_s, h_ele_key, &
+      n_ele, ix_ele_kick, s_chord_kick, floor_k_x, floor_k_z, &
+      gamma, gamma2, beta2, y_source, dz_slice, n_bin, kick_factor, &
+      actual_track_step, species_radius, rel_mass, e_charge_abs, &
+      csr_method_one_dim, h_edge_dcdz, h_slice_charge, &
+      h_kick_csr, h_I_csr_out) bind(C, name='gpu_csr_bin_kicks_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: h_floor0_x(*), h_floor0_z(*), h_floor0_theta(*)
+    real(C_DOUBLE), intent(in) :: h_floor1_x(*), h_floor1_z(*), h_floor1_theta(*)
+    real(C_DOUBLE), intent(in) :: h_L_chord(*), h_theta_chord(*), h_spline_coef(*)
+    real(C_DOUBLE), intent(in) :: h_dL_s(*), h_ele_s(*)
+    integer(C_INT), intent(in) :: h_ele_key(*)
+    integer(C_INT), value, intent(in) :: n_ele, ix_ele_kick, n_bin, csr_method_one_dim
+    real(C_DOUBLE), value, intent(in) :: s_chord_kick, floor_k_x, floor_k_z
+    real(C_DOUBLE), value, intent(in) :: gamma, gamma2, beta2, y_source, dz_slice
+    real(C_DOUBLE), value, intent(in) :: kick_factor, actual_track_step
+    real(C_DOUBLE), value, intent(in) :: species_radius, rel_mass, e_charge_abs
+    real(C_DOUBLE), intent(in) :: h_edge_dcdz(*), h_slice_charge(*)
+    real(C_DOUBLE), intent(out) :: h_kick_csr(*), h_I_csr_out(*)
   end subroutine
 
   subroutine gpu_spacecharge_cleanup() bind(C, name='gpu_spacecharge_cleanup_')

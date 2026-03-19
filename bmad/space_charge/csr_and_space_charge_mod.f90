@@ -387,7 +387,11 @@ do i_step = 0, n_step
 
       csr%y_source = ns * space_charge_com%beam_chamber_height
 
-      call csr_bin_kicks (ele, s0_step, csr, err_flag)
+      if (gpu_csr_active) then
+        call csr_bin_kicks_gpu_wrap(ele, csr, err_flag)
+      else
+        call csr_bin_kicks (ele, s0_step, csr, err_flag)
+      endif
       if (err_flag) return
     enddo
   endif
@@ -559,6 +563,108 @@ call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
 deallocate(h_kick_csr_l, h_kick_lsc_l)
 
 end subroutine csr_apply_kicks_gpu
+
+!------------------------------------------------------------------------
+! GPU-accelerated CSR bin kicks.
+! Uploads element geometry to device, runs parallel root-finding for all
+! kick1 bins, then computes convolution to get per-slice kick_csr.
+!------------------------------------------------------------------------
+subroutine csr_bin_kicks_gpu_wrap(ele_in, csr_in, err_flag_out)
+use gpu_tracking_mod, only: gpu_csr_bin_kicks
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (csr_struct), target, intent(inout) :: csr_in
+logical, intent(out) :: err_flag_out
+
+real(C_DOUBLE), allocatable :: h_f0x(:), h_f0z(:), h_f0t(:)
+real(C_DOUBLE), allocatable :: h_f1x(:), h_f1z(:), h_f1t(:)
+real(C_DOUBLE), allocatable :: h_lc(:), h_tc(:), h_spl(:), h_dls(:), h_es(:)
+integer(C_INT), allocatable :: h_ek(:)
+real(C_DOUBLE), allocatable :: h_edge_dcdz(:), h_slice_charge(:)
+real(C_DOUBLE), allocatable :: h_kick_csr_l(:), h_I_csr_out(:)
+integer :: ie, nb, n_ele_geom, n_kick1
+real(rp) :: species_radius, coef
+
+err_flag_out = .false.
+nb = space_charge_com%n_bin
+n_ele_geom = size(csr_in%eleinfo) - 1  ! 0:n_ele_geom
+n_kick1 = 2 * nb + 1
+
+! Build geometry arrays from csr%eleinfo
+allocate(h_f0x(0:n_ele_geom), h_f0z(0:n_ele_geom), h_f0t(0:n_ele_geom))
+allocate(h_f1x(0:n_ele_geom), h_f1z(0:n_ele_geom), h_f1t(0:n_ele_geom))
+allocate(h_lc(0:n_ele_geom), h_tc(0:n_ele_geom))
+allocate(h_spl(3*(n_ele_geom+1)))
+allocate(h_dls(0:n_ele_geom), h_es(0:n_ele_geom))
+allocate(h_ek(0:n_ele_geom))
+
+do ie = 0, n_ele_geom
+  h_f0x(ie) = csr_in%eleinfo(ie)%floor0%r(1)
+  h_f0z(ie) = csr_in%eleinfo(ie)%floor0%r(3)
+  h_f0t(ie) = csr_in%eleinfo(ie)%floor0%theta
+  h_f1x(ie) = csr_in%eleinfo(ie)%floor1%r(1)
+  h_f1z(ie) = csr_in%eleinfo(ie)%floor1%r(3)
+  h_f1t(ie) = csr_in%eleinfo(ie)%floor1%theta
+  h_lc(ie) = csr_in%eleinfo(ie)%L_chord
+  h_tc(ie) = csr_in%eleinfo(ie)%theta_chord
+  h_spl(3*ie+1) = csr_in%eleinfo(ie)%spline%coef(1)
+  h_spl(3*ie+2) = csr_in%eleinfo(ie)%spline%coef(2)
+  h_spl(3*ie+3) = csr_in%eleinfo(ie)%spline%coef(3)
+  h_dls(ie) = csr_in%eleinfo(ie)%dL_s
+  h_es(ie) = csr_in%eleinfo(ie)%ele%s
+  h_ek(ie) = csr_in%eleinfo(ie)%ele%key
+enddo
+
+! Build bin data arrays
+allocate(h_edge_dcdz(nb), h_slice_charge(nb))
+do ie = 1, nb
+  h_edge_dcdz(ie) = csr_in%slice(ie)%edge_dcharge_density_dz
+  h_slice_charge(ie) = csr_in%slice(ie)%charge
+enddo
+
+species_radius = classical_radius(csr_in%species)
+
+allocate(h_kick_csr_l(nb), h_I_csr_out(n_kick1))
+h_kick_csr_l = 0
+
+call gpu_csr_bin_kicks( &
+    h_f0x, h_f0z, h_f0t, h_f1x, h_f1z, h_f1t, &
+    h_lc, h_tc, h_spl, h_dls, h_es, h_ek, &
+    int(n_ele_geom, C_INT), &
+    int(csr_in%ix_ele_kick, C_INT), &
+    csr_in%s_chord_kick, &
+    csr_in%floor_k%r(1), csr_in%floor_k%r(3), &
+    csr_in%gamma, csr_in%gamma2, csr_in%beta**2, &
+    csr_in%y_source, csr_in%dz_slice, &
+    int(nb, C_INT), csr_in%kick_factor, &
+    csr_in%actual_track_step, species_radius, &
+    csr_in%rel_mass, abs(e_charge * charge_of(csr_in%species)), &
+    merge(1, 0, ele_in%csr_method == one_dim$), &
+    h_edge_dcdz, h_slice_charge, &
+    h_kick_csr_l, h_I_csr_out)
+
+! Copy results back to csr%slice
+if (csr_in%y_source == 0 .and. ele_in%csr_method == one_dim$) then
+  do ie = 1, nb
+    csr_in%slice(ie)%kick_csr = h_kick_csr_l(ie)
+  enddo
+else
+  ! Image charge: GPU accumulates into h_kick_csr_l
+  do ie = 1, nb
+    csr_in%slice(ie)%kick_csr = h_kick_csr_l(ie)
+  enddo
+endif
+
+! Copy I_csr back to kick1 for image charge accumulation
+do ie = -nb, nb
+  csr_in%kick1(ie)%I_csr = h_I_csr_out(ie + nb + 1)
+enddo
+
+deallocate(h_f0x, h_f0z, h_f0t, h_f1x, h_f1z, h_f1t)
+deallocate(h_lc, h_tc, h_spl, h_dls, h_es, h_ek)
+deallocate(h_edge_dcdz, h_slice_charge, h_kick_csr_l, h_I_csr_out)
+
+end subroutine csr_bin_kicks_gpu_wrap
 
 end subroutine track1_bunch_csr
 
@@ -1626,10 +1732,11 @@ if (ele%space_charge_method == fft_3d$) then
   dct_ave = sum(particle%vec(5)/particle%beta, particle%state == alive$) / count(particle%state == alive$)
 
 #ifdef USE_GPU_TRACKING
-  ! GPU path: particle data must be uploaded, SC computed on device, then downloaded
+  ! GPU path: use persistent device buffers if available, otherwise upload/download
   if (bmad_com%gpu_tracking_on) then
     block
-    use gpu_tracking_mod, only: gpu_upload_particles, gpu_download_particles, gpu_space_charge_3d
+    use gpu_tracking_mod, only: gpu_upload_particles, gpu_download_particles, &
+                                gpu_space_charge_3d, gpu_persist_on_device
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
     real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:), charge_a(:)
@@ -1638,34 +1745,50 @@ if (ele%space_charge_method == fft_3d$) then
     real(rp) :: mc2_val
 
     np = size(particle)
-    allocate(vx(np), vpx(np), vy(np), vpy(np), vz(np), vpz(np))
-    allocate(state_a(np), beta_a(np), p0c_a(np), t_a(np), charge_a(np))
+    mc2_val = mass_of(particle(1)%species)
 
+    ! Build charge array (always needed on host for upload)
+    allocate(charge_a(np))
     do i = 1, np
-      vx(i) = particle(i)%vec(1); vpx(i) = particle(i)%vec(2)
-      vy(i) = particle(i)%vec(3); vpy(i) = particle(i)%vec(4)
-      vz(i) = particle(i)%vec(5); vpz(i) = particle(i)%vec(6)
-      state_a(i) = particle(i)%state; beta_a(i) = particle(i)%beta
-      p0c_a(i) = particle(i)%p0c; t_a(i) = particle(i)%t
       charge_a(i) = particle(i)%charge
     enddo
 
-    mc2_val = mass_of(particle(1)%species)
+    if (gpu_persist_on_device) then
+      ! Data is already on device from persistent session — no upload/download needed!
+      ! Pass huge sentinel for dct_ave so the CUDA kernel computes it from device data.
+      call gpu_space_charge_3d(charge_a, np, &
+          int(csr%mesh3d%nhi(1), C_INT), int(csr%mesh3d%nhi(2), C_INT), int(csr%mesh3d%nhi(3), C_INT), &
+          csr%mesh3d%gamma, csr%actual_track_step, mc2_val, 1.0e31_rp)
+    else
+      ! Data not on device — full upload/download cycle
+      allocate(vx(np), vpx(np), vy(np), vpy(np), vz(np), vpz(np))
+      allocate(state_a(np), beta_a(np), p0c_a(np), t_a(np))
 
-    call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np)
-    call gpu_space_charge_3d(charge_a, np, &
-        int(csr%mesh3d%nhi(1), C_INT), int(csr%mesh3d%nhi(2), C_INT), int(csr%mesh3d%nhi(3), C_INT), &
-        csr%mesh3d%gamma, csr%actual_track_step, mc2_val, dct_ave)
-    call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np, 1, 0)
+      do i = 1, np
+        vx(i) = particle(i)%vec(1); vpx(i) = particle(i)%vec(2)
+        vy(i) = particle(i)%vec(3); vpy(i) = particle(i)%vec(4)
+        vz(i) = particle(i)%vec(5); vpz(i) = particle(i)%vec(6)
+        state_a(i) = particle(i)%state; beta_a(i) = particle(i)%beta
+        p0c_a(i) = particle(i)%p0c; t_a(i) = particle(i)%t
+      enddo
 
-    do i = 1, np
-      particle(i)%vec(1) = vx(i); particle(i)%vec(2) = vpx(i)
-      particle(i)%vec(3) = vy(i); particle(i)%vec(4) = vpy(i)
-      particle(i)%vec(5) = vz(i); particle(i)%vec(6) = vpz(i)
-      particle(i)%state = state_a(i); particle(i)%beta = beta_a(i)
-    enddo
+      call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np)
+      call gpu_space_charge_3d(charge_a, np, &
+          int(csr%mesh3d%nhi(1), C_INT), int(csr%mesh3d%nhi(2), C_INT), int(csr%mesh3d%nhi(3), C_INT), &
+          csr%mesh3d%gamma, csr%actual_track_step, mc2_val, dct_ave)
+      call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np, 1, 0)
 
-    deallocate(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, charge_a)
+      do i = 1, np
+        particle(i)%vec(1) = vx(i); particle(i)%vec(2) = vpx(i)
+        particle(i)%vec(3) = vy(i); particle(i)%vec(4) = vpy(i)
+        particle(i)%vec(5) = vz(i); particle(i)%vec(6) = vpz(i)
+        particle(i)%state = state_a(i); particle(i)%beta = beta_a(i)
+      enddo
+
+      deallocate(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+    endif
+
+    deallocate(charge_a)
     end block
   else
 #endif
