@@ -2495,16 +2495,19 @@ end subroutine gpu_persistent_flush
 ! gpu_persistent_seed — upload bunch data to device after per-element
 ! GPU tracking, so the next element can use the persistent path.
 !------------------------------------------------------------------------
-subroutine gpu_persistent_seed(bunch, ele)
+subroutine gpu_persistent_seed(bunch, ele, force)
 
 use, intrinsic :: iso_c_binding
 
 type (bunch_struct), intent(in) :: bunch
 type (ele_struct),   intent(in) :: ele
+logical, optional, intent(in) :: force
 integer :: j, n
 
 #ifdef USE_GPU_TRACKING
-if (.not. ele_gpu_can_stay_on_device(ele)) return
+if (.not. logic_option(.false., force)) then
+  if (.not. ele_gpu_can_stay_on_device(ele)) return
+endif
 
 n = size(bunch%particle)
 

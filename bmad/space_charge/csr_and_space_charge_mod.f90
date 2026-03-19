@@ -295,7 +295,7 @@ if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
   gpu_csr_active = .true.
   ! Ensure data is on device (upload if not already there from previous element)
   if (.not. gpu_persist_on_device) then
-    call gpu_persistent_seed(bunch, ele)
+    call gpu_persistent_seed(bunch, ele, force=.true.)
   endif
 endif
 
@@ -316,7 +316,6 @@ do i_step = 0, n_step
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
     if (gpu_csr_active) then
       ! Track the runt body on GPU (data already on device).
-      ! No misalign/fringe/aperture — the CSR loop doesn't apply those per sub-step.
       call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
       if (.not. gpu_did_track) then
         ! GPU body failed for this runt — flush and fall back to CPU
