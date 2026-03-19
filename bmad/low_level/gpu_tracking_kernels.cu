@@ -1899,11 +1899,37 @@ __global__ void aperture_rect_kernel(
     if (state[i] != ALIVE_ST) return;
 
     double x = vx[i], y = vy[i];
+    /* Fast path: most particles are within aperture */
+    int viol_x1 = (x1_lim > 0.0 && x < -x1_lim);
+    int viol_x2 = (x2_lim > 0.0 && x >  x2_lim);
+    int viol_y1 = (y1_lim > 0.0 && y < -y1_lim);
+    int viol_y2 = (y2_lim > 0.0 && y >  y2_lim);
+    if (!(viol_x1 | viol_x2 | viol_y1 | viol_y2)) return;
 
-    if (x1_lim > 0.0 && x < -x1_lim) { state[i] = LOST_NEG_X; return; }
-    if (x2_lim > 0.0 && x >  x2_lim) { state[i] = LOST_POS_X; return; }
-    if (y1_lim > 0.0 && y < -y1_lim) { state[i] = LOST_NEG_Y; return; }
-    if (y2_lim > 0.0 && y >  y2_lim) { state[i] = LOST_POS_Y; return; }
+    /* Multiple violations possible at corners — pick largest fractional */
+    double f_max = 0.0;
+    int    lost  = LOST_NEG_X;
+    double denom_x = x2_lim + x1_lim;
+    double denom_y = y2_lim + y1_lim;
+
+    if (viol_x1) {
+        double f = (denom_x > 0.0) ? fabs((x + x1_lim) / denom_x) : 1.0;
+        if (f > f_max) { f_max = f; lost = LOST_NEG_X; }
+    }
+    if (viol_x2) {
+        double f = (denom_x > 0.0) ? fabs((x - x2_lim) / denom_x) : 1.0;
+        if (f > f_max) { f_max = f; lost = LOST_POS_X; }
+    }
+    if (viol_y1) {
+        double f = (denom_y > 0.0) ? fabs((y + y1_lim) / denom_y) : 1.0;
+        if (f > f_max) { f_max = f; lost = LOST_NEG_Y; }
+    }
+    if (viol_y2) {
+        double f = (denom_y > 0.0) ? fabs((y - y2_lim) / denom_y) : 1.0;
+        if (f > f_max) { f_max = f; lost = LOST_POS_Y; }
+    }
+
+    state[i] = lost;
 }
 
 extern "C" void gpu_check_aperture_rect_(

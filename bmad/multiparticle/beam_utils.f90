@@ -117,8 +117,6 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
           endif
         enddo
         bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
-        ! Seed persistent state: upload result to device for next element
-        call gpu_persistent_seed(bunch, ele)
         return
       endif
     endif

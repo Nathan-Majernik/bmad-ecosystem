@@ -1573,7 +1573,8 @@ case (drift$, pipe$, monitor$, instrument$)
 case (lcavity$)
   ! Lcavity fringe is already handled on GPU
 case (quadrupole$)
-  ! Quad fringe is now handled on GPU via gpu_quad_fringe
+  ! Quad fringe handled on GPU, but electric pole fringe needs CPU
+  if (associated(ele%a_pole_elec)) has_fringe_needs_cpu = .true.
 case (sbend$)
   call init_fringe_info(fringe_info, ele)
   if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
@@ -2197,10 +2198,9 @@ if (.not. can_stay) then
   return
 endif
 
-! Only use persistent path if data is already on device from a previous
-! element. First element in a sequence falls through to per-element path,
-! which then seeds the device for subsequent elements.
-if (.not. gpu_persist_on_device) return
+! First element: data not yet on device -- upload will happen below.
+! No early return: handle the first element via persistent path directly,
+! avoiding the redundant upload that gpu_persistent_seed would have done.
 
 n = size(bunch%particle)
 if (n == 0) return
