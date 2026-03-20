@@ -51,6 +51,61 @@ __global__ void sc_compute_z_adj(const double *z, const double *beta,
 __global__ void dct_ave_reduce_kernel(const double *z, const double *beta,
     const int *state, double *block_sum, int *block_count, int n);
 
+/* Fused pass-1 kernel: computes dct_ave reduction + x/y bounds in single pass.
+   Each block produces: sum(z/beta), count(alive), min_x, max_x, min_y, max_y. */
+__global__ void sc_fused_pass1_kernel(
+    const double *x, const double *y, const double *z,
+    const double *beta, const int *state,
+    double *b_sum_zb, int *b_count,
+    double *b_min_x, double *b_max_x,
+    double *b_min_y, double *b_max_y,
+    int n)
+{
+    extern __shared__ char shmem[];
+    /* Layout: [sum_zb, min_x, max_x, min_y, max_y] as doubles, [count] as int */
+    double *s_sum = (double*)shmem;
+    double *s_mnx = s_sum + blockDim.x;
+    double *s_mxx = s_mnx + blockDim.x;
+    double *s_mny = s_mxx + blockDim.x;
+    double *s_mxy = s_mny + blockDim.x;
+    int    *s_cnt = (int*)(s_mxy + blockDim.x);
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double loc_sum = 0; int loc_cnt = 0;
+    double loc_mnx = 1e30, loc_mxx = -1e30;
+    double loc_mny = 1e30, loc_mxy = -1e30;
+
+    if (i < n && state[i] == 1) {
+        loc_sum = z[i] / beta[i];
+        loc_cnt = 1;
+        loc_mnx = x[i]; loc_mxx = x[i];
+        loc_mny = y[i]; loc_mxy = y[i];
+    }
+    s_sum[tid] = loc_sum; s_cnt[tid] = loc_cnt;
+    s_mnx[tid] = loc_mnx; s_mxx[tid] = loc_mxx;
+    s_mny[tid] = loc_mny; s_mxy[tid] = loc_mxy;
+    __syncthreads();
+
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid+s];
+            s_cnt[tid] += s_cnt[tid+s];
+            if (s_mnx[tid+s] < s_mnx[tid]) s_mnx[tid] = s_mnx[tid+s];
+            if (s_mxx[tid+s] > s_mxx[tid]) s_mxx[tid] = s_mxx[tid+s];
+            if (s_mny[tid+s] < s_mny[tid]) s_mny[tid] = s_mny[tid+s];
+            if (s_mxy[tid+s] > s_mxy[tid]) s_mxy[tid] = s_mxy[tid+s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        b_sum_zb[blockIdx.x] = s_sum[0]; b_count[blockIdx.x] = s_cnt[0];
+        b_min_x[blockIdx.x] = s_mnx[0]; b_max_x[blockIdx.x] = s_mxx[0];
+        b_min_y[blockIdx.x] = s_mny[0]; b_max_y[blockIdx.x] = s_mxy[0];
+    }
+}
+
 /* =========================================================================
  * 3D FFT SPACE CHARGE -- CUDA KERNELS
  * ========================================================================= */
@@ -612,57 +667,30 @@ extern "C" void gpu_space_charge_3d_(
         }
     }
 
-    /* --- Step 1: Compute mesh bounds and dct_ave on GPU --- */
-    /* Use GPU reduction to avoid downloading 40 MB of particle data per sub-step. */
+    /* --- Step 1: Compute dct_ave + x/y bounds (fused pass 1), then z_adj + z bounds (pass 2) ---
+     * Pass 1: single fused kernel computes sum(z/beta), count(alive), min/max x, min/max y.
+     * This replaces 3 separate kernels + 1 sync with 1 kernel + 1 sync.
+     * Pass 2: z_adj + z bounds (needs dct_ave from pass 1). */
 
-    /* Compute dct_ave if sentinel value was passed (persistent GPU session).
-       Use GPU block reduction to avoid downloading 24 MB per sub-step. */
-    if (dct_ave > 1e30 || dct_ave < -1e30 || dct_ave != dct_ave) {
-        /* Block reduction (cached buffers) */
-        static double *d_block_sum = NULL; static int *d_block_count = NULL;
-        static int dct_cached_nb = 0;
-        if (n_blocks > dct_cached_nb) {
-            if (d_block_sum) { cudaFree(d_block_sum); cudaFree(d_block_count); }
-            cudaMalloc((void**)&d_block_sum, n_blocks * sizeof(double));
-            cudaMalloc((void**)&d_block_count, n_blocks * sizeof(int));
-            dct_cached_nb = n_blocks;
-        }
-        dct_ave_reduce_kernel<<<n_blocks, threads, threads*(sizeof(double)+sizeof(int))>>>(
-            dvec[4], dbeta, dstate, d_block_sum, d_block_count, n_particles);
-        cudaDeviceSynchronize();
-        /* Download tiny block results (static host buffers) */
-        if (n_blocks > h_sc_bsum_cap) {
-            free(h_sc_bsum); free(h_sc_bcnt);
-            h_sc_bsum = (double*)malloc(n_blocks * sizeof(double));
-            h_sc_bcnt = (int*)malloc(n_blocks * sizeof(int));
-            h_sc_bsum_cap = n_blocks;
-        }
-        cudaMemcpy(h_sc_bsum, d_block_sum, n_blocks * sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_sc_bcnt, d_block_count, n_blocks * sizeof(int), cudaMemcpyDeviceToHost);
-        double sum_zb = 0.0; int n_alive = 0;
-        for (int i = 0; i < n_blocks; i++) { sum_zb += h_sc_bsum[i]; n_alive += h_sc_bcnt[i]; }
-        dct_ave = (n_alive > 0) ? sum_zb / n_alive : 0.0;
-        /* d_block_sum/count and h_sc_bsum/bcnt are static -- not freed here */
-    }
-
-    /* Compute bounds using GPU block reduction (cached buffers) */
-    static double *d_bmin_x=NULL, *d_bmax_x=NULL, *d_bmin_y=NULL, *d_bmax_y=NULL, *d_bmin_z=NULL, *d_bmax_z=NULL;
-    static int cached_nblocks = 0;
-    if (n_blocks > cached_nblocks) {
+    static double *d_bmin_x=NULL, *d_bmax_x=NULL, *d_bmin_y=NULL, *d_bmax_y=NULL;
+    static double *d_bmin_z=NULL, *d_bmax_z=NULL;
+    static double *d_block_sum=NULL; static int *d_block_count=NULL;
+    static int reduce_cached_nb = 0;
+    if (n_blocks > reduce_cached_nb) {
         if (d_bmin_x) { cudaFree(d_bmin_x); cudaFree(d_bmax_x); cudaFree(d_bmin_y);
                         cudaFree(d_bmax_y); cudaFree(d_bmin_z); cudaFree(d_bmax_z); }
+        if (d_block_sum) { cudaFree(d_block_sum); cudaFree(d_block_count); }
         cudaMalloc((void**)&d_bmin_x, n_blocks*sizeof(double));
         cudaMalloc((void**)&d_bmax_x, n_blocks*sizeof(double));
         cudaMalloc((void**)&d_bmin_y, n_blocks*sizeof(double));
         cudaMalloc((void**)&d_bmax_y, n_blocks*sizeof(double));
         cudaMalloc((void**)&d_bmin_z, n_blocks*sizeof(double));
         cudaMalloc((void**)&d_bmax_z, n_blocks*sizeof(double));
-        cached_nblocks = n_blocks;
+        cudaMalloc((void**)&d_block_sum, n_blocks*sizeof(double));
+        cudaMalloc((void**)&d_block_count, n_blocks*sizeof(int));
+        reduce_cached_nb = n_blocks;
     }
 
-    /* Use the z_minmax_kernel for each coordinate.
-       For z, we need z - dct_ave*beta, so compute that in a temporary buffer. */
-    /* Compute z_adj = z - dct_ave * beta on device (reused for deposition below) */
     static double *d_z_adj = NULL;
     static int d_z_adj_size = 0;
     if (n_particles > d_z_adj_size) {
@@ -670,17 +698,23 @@ extern "C" void gpu_space_charge_3d_(
         cudaMalloc((void**)&d_z_adj, n_particles * sizeof(double));
         d_z_adj_size = n_particles;
     }
-    sc_compute_z_adj<<<n_blocks, threads>>>(dvec[4], dbeta, d_z_adj, dct_ave, n_particles);
-    {
 
-        /* Run minmax reductions for x, y, z_adj */
+    int need_dct = (dct_ave > 1e30 || dct_ave < -1e30 || dct_ave != dct_ave);
+
+    /* Pass 1: fused dct_ave + x/y bounds (1 kernel, reads all particles once) */
+    if (need_dct) {
+        size_t shmem1 = threads * (5*sizeof(double) + sizeof(int));
+        sc_fused_pass1_kernel<<<n_blocks, threads, shmem1>>>(
+            dvec[0], dvec[2], dvec[4], dbeta, dstate,
+            d_block_sum, d_block_count,
+            d_bmin_x, d_bmax_x, d_bmin_y, d_bmax_y, n_particles);
+    } else {
         z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(dvec[0], dstate, d_bmin_x, d_bmax_x, n_particles);
         z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(dvec[2], dstate, d_bmin_y, d_bmax_y, n_particles);
-        z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(d_z_adj, dstate, d_bmin_z, d_bmax_z, n_particles);
-        cudaDeviceSynchronize();
     }
+    cudaDeviceSynchronize();
 
-    /* Download block results (tiny: ~4K doubles x 6, static host buffers) */
+    /* Download pass 1 and compute dct_ave */
     if (n_blocks > h_sc_bounds_cap) {
         free(h_sc_bmin_x); free(h_sc_bmax_x); free(h_sc_bmin_y);
         free(h_sc_bmax_y); free(h_sc_bmin_z); free(h_sc_bmax_z);
@@ -692,10 +726,28 @@ extern "C" void gpu_space_charge_3d_(
         h_sc_bmax_z = (double*)malloc(n_blocks*sizeof(double));
         h_sc_bounds_cap = n_blocks;
     }
+    if (need_dct) {
+        if (n_blocks > h_sc_bsum_cap) {
+            free(h_sc_bsum); free(h_sc_bcnt);
+            h_sc_bsum = (double*)malloc(n_blocks*sizeof(double));
+            h_sc_bcnt = (int*)malloc(n_blocks*sizeof(int));
+            h_sc_bsum_cap = n_blocks;
+        }
+        cudaMemcpy(h_sc_bsum, d_block_sum, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_sc_bcnt, d_block_count, n_blocks*sizeof(int), cudaMemcpyDeviceToHost);
+        double sum_zb = 0.0; int n_alive = 0;
+        for (int i = 0; i < n_blocks; i++) { sum_zb += h_sc_bsum[i]; n_alive += h_sc_bcnt[i]; }
+        dct_ave = (n_alive > 0) ? sum_zb / n_alive : 0.0;
+    }
     cudaMemcpy(h_sc_bmin_x, d_bmin_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sc_bmax_x, d_bmax_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sc_bmin_y, d_bmin_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sc_bmax_y, d_bmax_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+
+    /* Pass 2: z_adj + z bounds (needs dct_ave from pass 1) */
+    sc_compute_z_adj<<<n_blocks, threads>>>(dvec[4], dbeta, d_z_adj, dct_ave, n_particles);
+    z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(d_z_adj, dstate, d_bmin_z, d_bmax_z, n_particles);
+    cudaDeviceSynchronize();
     cudaMemcpy(h_sc_bmin_z, d_bmin_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sc_bmax_z, d_bmax_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
 
@@ -705,7 +757,6 @@ extern "C" void gpu_space_charge_3d_(
         if (h_sc_bmin_y[i] < ymin) ymin = h_sc_bmin_y[i]; if (h_sc_bmax_y[i] > ymax) ymax = h_sc_bmax_y[i];
         if (h_sc_bmin_z[i] < zmin) zmin = h_sc_bmin_z[i]; if (h_sc_bmax_z[i] > zmax) zmax = h_sc_bmax_z[i];
     }
-    /* d_bmin/d_bmax and h_sc_bmin/bmax are static, not freed here */
 
     double dx = (xmax-xmin)/(nx-1), dy = (ymax-ymin)/(ny-1), dz = (zmax-zmin)/(nz-1);
     if (dx == 0) dx = 1e-10; if (dy == 0) dy = 1e-10; if (dz == 0) dz = 1e-10;
