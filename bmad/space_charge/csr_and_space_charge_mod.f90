@@ -565,17 +565,25 @@ deallocate(h_kick_csr_l, h_kick_lsc_l)
 
 ! 3D FFT space charge (on device — no upload/download needed)
 if (ele_in%space_charge_method == fft_3d$ .and. gpu_persist_on_device) then
-  allocate(h_charge_l(np_l))
-  do ii = 1, np_l
-    h_charge_l(ii) = bunch_in%particle(ii)%charge
-  enddo
-  mc2_l = mass_of(bunch_in%particle(1)%species)
-  ! Pass sentinel dct_ave (1e31) so CUDA kernel computes it from device data
-  call gpu_space_charge_3d(h_charge_l, int(np_l, C_INT), &
-      int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
-      int(csr_in%mesh3d%nhi(3), C_INT), &
-      csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
-  deallocate(h_charge_l)
+  ! Cache charge array — it doesn't change between sub-steps.
+  ! Use module-level saved array to avoid per-sub-step allocation + 1M-particle loop.
+  block
+    real(C_DOUBLE), allocatable, save :: h_charge_cached(:)
+    integer, save :: h_charge_cached_n = 0
+    if (np_l /= h_charge_cached_n) then
+      if (allocated(h_charge_cached)) deallocate(h_charge_cached)
+      allocate(h_charge_cached(np_l))
+      do ii = 1, np_l
+        h_charge_cached(ii) = bunch_in%particle(ii)%charge
+      enddo
+      h_charge_cached_n = np_l
+    endif
+    mc2_l = mass_of(bunch_in%particle(1)%species)
+    call gpu_space_charge_3d(h_charge_cached, int(np_l, C_INT), &
+        int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
+        int(csr_in%mesh3d%nhi(3), C_INT), &
+        csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+  end block
 endif
 
 end subroutine csr_apply_kicks_gpu
