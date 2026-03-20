@@ -284,6 +284,13 @@ interface
     integer(C_INT), value, intent(in) :: fringe_type, edge, time_dir, n
   end subroutine
 
+  subroutine gpu_bend_fringe(g_tot, e_angle, fint_gap, k1, &
+      entering, time_dir, n) bind(C, name='gpu_bend_fringe_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: g_tot, e_angle, fint_gap, k1
+    integer(C_INT), value, intent(in) :: entering, time_dir, n
+  end subroutine
+
   subroutine gpu_misalign_3d(h_W, Lx, Ly, Lz, set_flag, n) bind(C, name='gpu_misalign_3d_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), intent(in) :: h_W(9)
@@ -1704,8 +1711,17 @@ case (sextupole$)
   call init_fringe_info(fringe_info, ele)
   if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
 case (sbend$)
+  ! Bend fringe: basic_bend$ and hard_edge_only$ are handled on GPU.
+  ! Other fringe types (full$, sad_full$, soft_edge_only$, linear_edge$) need CPU.
   call init_fringe_info(fringe_info, ele)
-  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
+  if (fringe_info%has_fringe) then
+    select case (nint(ele%value(fringe_type$)))
+    case (basic_bend$, hard_edge_only$)
+      ! Handled by gpu_bend_fringe kernel
+    case default
+      has_fringe_needs_cpu = .true.
+    end select
+  endif
 end select
 if (has_fringe_needs_cpu) return
 
@@ -2041,6 +2057,46 @@ case (quadrupole$)
                        charge_dir_val, &
                        int(fringe_type_val, C_INT), int(edge, C_INT), &
                        int(bunch%particle(1)%time_dir, C_INT), np)
+
+case (sbend$)
+  fringe_type_val = nint(ele%value(fringe_type$))
+  if (fringe_type_val == none$) return
+  if (fringe_type_val /= basic_bend$ .and. fringe_type_val /= hard_edge_only$) return
+
+  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                   ele%orientation * bunch%particle(1)%direction
+
+  block
+    real(rp) :: g_tot_val, e_ang, fint_gap_val
+    integer :: entering, physical_end
+
+    if (ele%is_on) then
+      g_tot_val = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+      k1_val = ele%value(k1$)
+    else
+      g_tot_val = 0; k1_val = 0
+    endif
+
+    physical_end = physical_ele_end(edge, bunch%particle(1), ele%orientation)
+    if (physical_end == entrance_end$) then
+      e_ang = ele%value(e1$)
+      fint_gap_val = ele%value(fint$) * ele%value(hgap$)
+    else
+      e_ang = ele%value(e2$)
+      fint_gap_val = ele%value(fintx$) * ele%value(hgapx$)
+    endif
+
+    if (fringe_type_val == hard_edge_only$) fint_gap_val = 0
+
+    entering = 0
+    if ((edge == first_track_edge$ .and. bunch%particle(1)%direction == 1) .or. &
+        (edge == second_track_edge$ .and. bunch%particle(1)%direction == -1)) entering = 1
+
+    call gpu_bend_fringe(g_tot_val, e_ang, fint_gap_val, k1_val, &
+                          int(entering, C_INT), &
+                          int(bunch%particle(1)%time_dir, C_INT), np)
+  end block
+
 end select
 
 end subroutine dispatch_fringe_on_device

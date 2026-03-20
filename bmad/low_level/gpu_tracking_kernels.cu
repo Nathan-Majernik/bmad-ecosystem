@@ -1955,6 +1955,113 @@ __global__ void misalign_kernel(
     vx[i] = x; vpx[i] = px; vy[i] = y; vpy[i] = py;
 }
 
+/* ==========================================================================
+ * BEND FRINGE (Hwang) -- GPU port of hwang_bend_edge_kick
+ *
+ * Per-particle coordinate transform at bend entrance/exit edge.
+ * Parameters: g_tot, e_angle (e1 or e2), fint_gap, k1, time_dir.
+ * entering=1 for entrance, 0 for exit.
+ * ========================================================================== */
+
+__global__ void bend_fringe_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz,
+    const double *vpz, int *state,
+    double g_tot, double e_angle, double fint_gap, double k1,
+    int entering, int time_dir, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double td = (double)time_dir;
+    double e_factor = 1.0 / (1.0 + vpz[i]);
+    double cos_e = cos(e_angle), sin_e = sin(e_angle);
+    double tan_e = sin_e / cos_e, sec_e = 1.0 / cos_e;
+    double gt = g_tot * tan_e;
+    double gt2 = g_tot * tan_e * tan_e;
+    double gs2 = g_tot * sec_e * sec_e;
+    double k1_tane = k1 * tan_e;
+    double fg_factor = 2.0 * fint_gap * gs2 * g_tot * sec_e * (1.0 + sin_e * sin_e);
+
+    double v0 = vx[i], v1 = vpx[i], v2 = vy[i], v3 = vpy[i], v4 = vz[i];
+    double dx, dpx, dy, dpy, dz;
+    double w0 = v0, w2 = v2;
+
+    if (entering) {
+        dx  = (-gt2 * v0*v0 + gs2 * v2*v2) * e_factor / 2.0;
+        dpx = (gt * g_tot * (1.0 + 2.0*tan_e*tan_e) * v2*v2 / 2.0 + gt2 * (v0*v1 - v2*v3) + k1_tane * (v0*v0 - v2*v2)) * e_factor;
+        dy  = gt2 * v0 * v2 * e_factor;
+        dpy = (fg_factor * v2 - gt2 * v0 * v3 - (g_tot + gt2) * v1 * v2 - 2.0 * k1_tane * v0 * v2) * e_factor;
+        dz  = e_factor * e_factor * 0.5 * (v2*v2 * fg_factor
+              + v0*v0*v0 * (4.0*k1_tane - gt*gt2) / 6.0 + 0.5*v0*v2*v2 * (-4.0*k1_tane + gt*gs2)
+              + (v0*v0*v1 - 2.0*v0*v2*v3) * gt2 - v1*v2*v2 * gs2);
+
+        if (td == -1.0) {
+            w0 = v0 + td * dx;
+            double w1 = v1 + td * (dpx + gt * v0);
+            w2 = v2 + td * dy;
+            double w3 = v3 + td * (dpy - gt * v2);
+            dx  = (-gt2 * w0*w0 + gs2 * w2*w2) * e_factor / 2.0;
+            dpx = (gt * g_tot * (1.0 + 2.0*tan_e*tan_e) * w2*w2 / 2.0 + gt2 * (w0*w1 - w2*w3) + k1_tane * (w0*w0 - w2*w2)) * e_factor;
+            dy  = gt2 * w0 * w2 * e_factor;
+            dpy = (fg_factor * w2 - gt2 * w0 * w3 - (g_tot + gt2) * w1 * w2 - 2.0 * k1_tane * w0 * w2) * e_factor;
+            dz  = e_factor * e_factor * 0.5 * (w2*w2 * fg_factor
+                  + w0*w0*w0 * (4.0*k1_tane - gt*gt2) / 6.0 + 0.5*w0*w2*w2 * (-4.0*k1_tane + gt*gs2)
+                  + (w0*w0*w1 - 2.0*w0*w2*w3) * gt2 - w1*w2*w2 * gs2);
+        }
+
+        vx[i]  = v0 + td * dx;
+        vpx[i] = v1 + td * (dpx + gt * w0);
+        vy[i]  = v2 + td * dy;
+        vpy[i] = v3 + td * (dpy - gt * w2);
+        vz[i]  = v4 + td * dz;
+    } else {
+        dx  = (gt2 * v0*v0 - gs2 * v2*v2) * e_factor / 2.0;
+        dpx = (gt2 * (v2*v3 - v0*v1) + k1_tane * (v0*v0 - v2*v2) - gt * gt2 * (v0*v0 + v2*v2) / 2.0) * e_factor;
+        dy  = -gt2 * v0 * v2 * e_factor;
+        dpy = (fg_factor * v2 + gt2 * v0 * v3 + (g_tot + gt2) * v1 * v2 + (gt * gs2 - 2.0 * k1_tane) * v0 * v2) * e_factor;
+        dz  = e_factor * e_factor * 0.5 * (v2*v2 * fg_factor
+              + v0*v0*v0 * (4.0*k1_tane - gt*gt2) / 6.0 + 0.5*v0*v2*v2 * (-4.0*k1_tane + gt*gs2)
+              - (v0*v0*v1 - 2.0*v0*v2*v3) * gt2 + v1*v2*v2 * gs2);
+
+        if (td == -1.0) {
+            w0 = v0 + td * dx;
+            double w1 = v1 + td * (dpx + gt * w0);
+            w2 = v2 + td * dy;
+            double w3 = v3 + td * (dpy - gt * w2);
+            dx  = (gt2 * w0*w0 - gs2 * w2*w2) * e_factor / 2.0;
+            dpx = (gt2 * (w2*w3 - w0*w1) + k1_tane * (w0*w0 - w2*w2) - gt * gt2 * (w0*w0 + w2*w2) / 2.0) * e_factor;
+            dy  = -gt2 * w0 * w2 * e_factor;
+            dpy = (fg_factor * w2 + gt2 * w0 * w3 + (g_tot + gt2) * w1 * w2 + (gt * gs2 - 2.0 * k1_tane) * w0 * w2) * e_factor;
+            dz  = e_factor * e_factor * 0.5 * (w2*w2 * fg_factor
+                  + w0*w0*w0 * (4.0*k1_tane - gt*gt2) / 6.0 + 0.5*w0*w2*w2 * (-4.0*k1_tane + gt*gs2)
+                  - (w0*w0*w1 - 2.0*w0*w2*w3) * gt2 + w1*w2*w2 * gs2);
+        }
+
+        vx[i]  = v0 + td * dx;
+        vpx[i] = v1 + td * (dpx + gt * w0);
+        vy[i]  = v2 + td * dy;
+        vpy[i] = v3 + td * (dpy - gt * w2);
+        vz[i]  = v4 + td * dz;
+    }
+}
+
+extern "C" void gpu_bend_fringe_(
+    double g_tot, double e_angle, double fint_gap, double k1,
+    int entering, int time_dir, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    bend_fringe_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4],
+        d_vec[5], d_state,
+        g_tot, e_angle, fint_gap, k1,
+        entering, time_dir, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
+
 extern "C" void gpu_misalign_(
     double x_off, double y_off, double tilt,
     int set_flag, int n)
