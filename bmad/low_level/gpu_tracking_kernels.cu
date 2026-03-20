@@ -49,6 +49,10 @@
 /* Physical constants (must match Bmad values exactly) */
 #define C_LIGHT   2.99792458e8
 #define ALIVE_ST  1   /* alive$ */
+#define LOST_NEG_X 3  /* lost_neg_x$ */
+#define LOST_POS_X 4  /* lost_pos_x$ */
+#define LOST_NEG_Y 5  /* lost_neg_y$ */
+#define LOST_POS_Y 6  /* lost_pos_y$ */
 #define LOST_PZ   8   /* lost_pz$ */
 
 /* --------------------------------------------------------------------------
@@ -173,18 +177,35 @@ __device__ __forceinline__ double low_energy_z_correction_dev(
  * length ds.  Returns 0 on success, 1 if particle is lost (pxy2 >= 1).
  * Does NOT update s_pos -- callers handle that themselves.
  * -------------------------------------------------------------------------- */
+/* Returns 0 on success, or a LOST_xxx code on failure.
+ * Matches CPU orbit_too_large: px^2+py^2 > (1+pz)^2 → lost,
+ * with direction from the dominant momentum component. */
 __device__ int drift_body_dev(
     double *x, double *px, double *y, double *py, double *z, double *pz,
     double *beta, double *t, double mc2, double p0c, double ds)
 {
     double delta  = *pz;
     double rel_pc = 1.0 + delta;
+
+    if (rel_pc < 0.0) return LOST_PZ;
+    if (*beta <= 0.0) return LOST_PZ;
+
     double px_rel = *px / rel_pc;
     double py_rel = *py / rel_pc;
     double pxy2   = px_rel * px_rel + py_rel * py_rel;
 
-    if (pxy2 >= 1.0) return 1;
-    if (*beta <= 0.0) return 1;
+    if (pxy2 >= 1.0) {
+        /* Match CPU orbit_too_large: use un-normalized comparison for exact
+         * boundary agreement, and set direction from dominant component. */
+        double f_unstable = (*px)*(*px) + (*py)*(*py) - rel_pc*rel_pc;
+        if (f_unstable > 0.0) {
+            if (fabs(*px) > fabs(*py))
+                return (*px > 0.0) ? LOST_POS_X : LOST_NEG_X;
+            else
+                return (*py > 0.0) ? LOST_POS_Y : LOST_NEG_Y;
+        }
+        /* pxy2 >= 1 but f_unstable <= 0: rounding difference, treat as alive */
+    }
 
     double ps_rel = sqrt(1.0 - pxy2);
 
@@ -214,10 +235,10 @@ __global__ void drift_kernel(
     if (i >= n) return;
     if (state[i] != ALIVE_ST) return;
 
-    if (drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
-                        &beta[i], &t_time[i], mc2, p0c[i], length)) {
-        state[i] = LOST_PZ;
-        return;
+    {
+        int rc = drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
+                                &beta[i], &t_time[i], mc2, p0c[i], length);
+        if (rc) { state[i] = rc; return; }
     }
 
     /* s update (direction = +1) */
@@ -498,10 +519,10 @@ __global__ void sextupole_kernel(
     for (int istep = 1; istep <= n_step; istep++) {
 
         /* Drift through one sub-step */
-        if (drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
-                            &beta_val, &t_arr[i], mc2, p0c_val, step_len)) {
-            state[i] = LOST_PZ;
-            return;
+        {
+            int rc = drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
+                                    &beta_val, &t_arr[i], mc2, p0c_val, step_len);
+            if (rc) { state[i] = rc; return; }
         }
         /* Time handled at end (not from drift_body_dev) -- reset t */
         t_arr[i] = t_start;
@@ -865,9 +886,10 @@ __global__ void bend_kernel(
         /* ---- Branch 2: g=0 and dg=0 → pure drift ---- */
         } else if ((g == 0.0 && dg == 0.0) || step_len == 0.0) {
             double t_dummy = t_arr[i];
-            if (drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
-                                &beta_val, &t_dummy, mc2, p0c_val, step_len)) {
-                state[i] = LOST_PZ; return;
+            {
+                int rc = drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
+                                        &beta_val, &t_dummy, mc2, p0c_val, step_len);
+                if (rc) { state[i] = rc; return; }
             }
             /* time handled at end (not from drift_body_dev) */
 
@@ -1158,9 +1180,10 @@ __global__ void lcavity_kernel(
         s_now = step_s[ix];
 
         if (ds != 0.0) {
-            if (drift_body_dev(&x, &px, &y, &py, &z, &pz,
-                                &beta_val, &t, mc2, p0c, ds)) {
-                state[i] = LOST_PZ; return;
+            {
+                int rc = drift_body_dev(&x, &px, &y, &py, &z, &pz,
+                                        &beta_val, &t, mc2, p0c, ds);
+                if (rc) { state[i] = rc; return; }
             }
         }
 
@@ -2039,10 +2062,7 @@ extern "C" void gpu_misalign_3d_(
  * Lost particles have their state set to lost constants.
  * ========================================================================== */
 
-#define LOST_NEG_X 3   /* lost_neg_x$ */
-#define LOST_POS_X 4   /* lost_pos_x$ */
-#define LOST_NEG_Y 5   /* lost_neg_y$ */
-#define LOST_POS_Y 6   /* lost_pos_y$ */
+/* LOST_NEG_X etc. defined at top of file */
 
 __global__ void aperture_rect_kernel(
     const double *vx, const double *vy, int *state,
