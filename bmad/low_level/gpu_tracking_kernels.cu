@@ -2013,7 +2013,11 @@ extern "C" void gpu_s_update_(double s_val, int n)
 }
 
 /* ==========================================================================
- * ORBIT-TOO-LARGE CHECK -- flag particles with |coord| > 1 as lost
+ * ORBIT-TOO-LARGE CHECK -- matches CPU orbit_too_large logic
+ *
+ * CPU checks: |x| or |y| > max_aperture_limit (default 1000 m),
+ *             px^2 + py^2 > (1+pz)^2 for charged particles.
+ * CPU does NOT check |z| or |pz| directly.
  * ========================================================================== */
 
 __global__ void orbit_check_kernel(
@@ -2025,10 +2029,26 @@ __global__ void orbit_check_kernel(
     if (i >= n) return;
     if (state[i] != ALIVE_ST) return;
 
-    /* Matches orbit_too_large threshold */
-    if (fabs(vx[i])  > 1.0 || fabs(vpx[i]) > 1.0 ||
-        fabs(vy[i])  > 1.0 || fabs(vpy[i]) > 1.0 ||
-        fabs(vz[i])  > 1.0 || fabs(vpz[i]) > 1.0) {
+    /* bmad_com%max_aperture_limit default = 1000.0 m */
+    const double max_aper = 1000.0;
+
+    /* Transverse position check */
+    if (fabs(vx[i]) > max_aper) {
+        state[i] = (vx[i] > 0) ? LOST_POS_X : LOST_NEG_X;
+        return;
+    }
+    if (fabs(vy[i]) > max_aper) {
+        state[i] = (vy[i] > 0) ? LOST_POS_Y : LOST_NEG_Y;
+        return;
+    }
+
+    /* Momentum check: px^2 + py^2 must not exceed (1+pz)^2 */
+    double rel_p = 1.0 + vpz[i];
+    if (rel_p < 0.0) {
+        state[i] = LOST_PZ;
+        return;
+    }
+    if (vpx[i]*vpx[i] + vpy[i]*vpy[i] > rel_p*rel_p) {
         state[i] = LOST_PZ;
     }
 }
