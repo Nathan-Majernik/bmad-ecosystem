@@ -1,0 +1,10 @@
+no_digested
+parameter[lattice] = "GPU sextupole with extra multipoles"
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+parameter[geometry] = open
+s1: sextupole, L = 0.3, k2 = 50.0, b3 = 1e2, a2 = 5.0
+lat: line = (s1)
+use, lat

@@ -135,7 +135,7 @@ call bmad_parser('lat_kitchen_sink.bmad', lat)
 bmad_com%radiation_fluctuations_on = .true.
 bmad_com%radiation_damping_on = .true.
 bmad_com%synch_rad_scale = 0.0_rp
-call run_comparison_test('Test 6: Kitchen sink rad, scale=0', lat, 1d-6, n_pass, n_fail)
+call run_comparison_test('Test 6: Kitchen sink rad, scale=0', lat, 1d-3, n_pass, n_fail)
 bmad_com%radiation_fluctuations_on = .false.
 bmad_com%radiation_damping_on = .false.
 

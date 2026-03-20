@@ -95,6 +95,8 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
         call track_bunch_thru_drift_gpu(bunch, ele, gpu_did_track)
       case (quadrupole$)
         call track_bunch_thru_quad_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (sextupole$)
+        call track_bunch_thru_sextupole_gpu(bunch, ele, branch%param, gpu_did_track)
       case (sbend$)
         call track_bunch_thru_bend_gpu(bunch, ele, branch%param, gpu_did_track)
       case (lcavity$)

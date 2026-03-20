@@ -28,6 +28,11 @@
 !  23. Lcavity with phi0/phi0_err/voltage_err
 !  24. Lcavity with aperture
 !  25. Lcavity with fringe fields
+!  ...
+!  38. Plain sextupole
+!  39. Sextupole with misalignment
+!  40. Sextupole with higher multipoles
+!  41. Sextupole with aperture
 !  26. Lcavity fringe standing wave
 !  27. Plain pipe
 !  28. Pipe with misalignment
@@ -340,6 +345,30 @@ call run_comparison_test('Test 36: Lcavity abstime', lat, tol, n_pass, n_fail)
 ! ======================================================================
 call bmad_parser('lat_lcavity_abstime_multi.bmad', lat)
 call run_comparison_test('Test 37: Lcavity abstime multi-cav', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 38: Plain sextupole
+! ======================================================================
+call bmad_parser('lat_sext_only.bmad', lat)
+call run_comparison_test('Test 38: Plain sextupole', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 39: Sextupole with misalignment
+! ======================================================================
+call bmad_parser('lat_sext_misalign.bmad', lat)
+call run_comparison_test('Test 39: Sextupole with misalignment', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 40: Sextupole with higher multipoles
+! ======================================================================
+call bmad_parser('lat_sext_multipole.bmad', lat)
+call run_comparison_test('Test 40: Sextupole with multipoles', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 41: Sextupole with aperture
+! ======================================================================
+call bmad_parser('lat_sext_aperture.bmad', lat)
+call run_aperture_test('Test 41: Sextupole with aperture', lat, tol, n_pass, n_fail)
 
 ! ======================================================================
 ! Summary

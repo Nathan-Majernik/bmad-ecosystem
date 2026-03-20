@@ -12,6 +12,7 @@ public :: gpu_tracking_is_active
 public :: ele_gpu_eligible
 public :: track_bunch_thru_drift_gpu
 public :: track_bunch_thru_quad_gpu
+public :: track_bunch_thru_sextupole_gpu
 public :: track_bunch_thru_bend_gpu
 public :: track_bunch_thru_lcavity_gpu
 public :: track_bunch_thru_pipe_gpu
@@ -176,6 +177,41 @@ interface
     real(C_DOUBLE), intent(inout) :: s_pos(*)
     real(C_DOUBLE), value, intent(in) :: mc2, length
     integer(C_INT), value, intent(in) :: n
+  end subroutine
+
+  subroutine gpu_track_sextupole(vx, vpx, vy, vpy, vz, vpz, &
+                              state, beta, p0c, t_time, &
+                              mc2, ele_length, delta_ref_time, &
+                              e_tot_ele, charge_dir, n_particles, &
+                              a2_arr, b2_arr, cm_arr, &
+                              ix_mag_max, n_step, &
+                              ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_sextupole_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(inout) :: state(*)
+    real(C_DOUBLE), intent(inout) :: beta(*), p0c(*), t_time(*)
+    real(C_DOUBLE), value, intent(in) :: mc2, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele, charge_dir
+    integer(C_INT), value, intent(in) :: n_particles
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max, n_step
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_sextupole_dev(mc2, ele_length, delta_ref_time, &
+                                 e_tot_ele, charge_dir, n_particles, &
+                                 a2_arr, b2_arr, cm_arr, &
+                                 ix_mag_max, n_step, &
+                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_sextupole_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele, charge_dir
+    integer(C_INT), value, intent(in) :: n_particles
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max, n_step
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
   end subroutine
 
   subroutine gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
@@ -436,7 +472,7 @@ if (.not. ele%is_on) return
 
 ! Check supported element types
 select case (ele%key)
-case (drift$, quadrupole$, sbend$, lcavity$, pipe$, monitor$, instrument$)
+case (drift$, quadrupole$, sextupole$, sbend$, lcavity$, pipe$, monitor$, instrument$)
   eligible = .true.
 end select
 
@@ -1029,6 +1065,94 @@ call gpu_tracking_post(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
 end subroutine track_bunch_thru_quad_gpu
 
 !------------------------------------------------------------------------
+! track_bunch_thru_sextupole_gpu
+!
+! Per-element GPU tracking for sextupole elements.
+! Uses drift-kick-drift split-step integrator.
+!------------------------------------------------------------------------
+subroutine track_bunch_thru_sextupole_gpu (bunch, ele, param, did_track)
+
+use multipole_mod, only: ab_multipole_kicks
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer(C_INT) :: n
+integer :: ix_mag_max, ix_elec_max, n_step, j
+real(rp) :: mc2, ele_length, delta_ref_time, e_tot_ele
+real(rp) :: charge_dir, rel_tracking_charge, length
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+real(rp) :: b1_dummy
+logical :: has_misalign
+type (fringe_field_info_struct) :: fringe_info
+
+real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:)
+integer(C_INT), allocatable :: state_a(:)
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+n = size(bunch%particle)
+if (n == 0) return
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+! Extract multipole coefficients
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1_dummy)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+! Pre: misalignment, fringe, allocate SoA, bunch_to_soa
+call gpu_tracking_pre(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
+    state_a, beta_a, p0c_a, t_a, has_misalign, fringe_info, .true.)
+
+did_track = .true.
+
+call gpu_track_sextupole(vx, vpx, vy, vpy, vz, vpz, &
+                         state_a, beta_a, p0c_a, t_a, &
+                         mc2, ele_length, delta_ref_time, &
+                         e_tot_ele, charge_dir, n, &
+                         a2_arr, b2_arr, cm_arr, &
+                         int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                         ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+
+! Post: SoA->AoS, fringe, misalignment, update s
+call gpu_tracking_post(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
+    state_a, beta_a, p0c_a, t_a, has_misalign, fringe_info, .true., &
+    .true., .false., .true.)
+
+deallocate(vx, vpx, vy, vpy, vz, vpz)
+deallocate(state_a, beta_a, p0c_a, t_a)
+#endif
+
+end subroutine track_bunch_thru_sextupole_gpu
+
+!------------------------------------------------------------------------
 ! track_bunch_thru_bend_gpu
 !
 ! GPU batch tracking through a bend (sbend).
@@ -1575,6 +1699,10 @@ case (lcavity$)
 case (quadrupole$)
   ! Quad fringe handled on GPU, but electric pole fringe needs CPU
   if (associated(ele%a_pole_elec)) has_fringe_needs_cpu = .true.
+case (sextupole$)
+  ! Sextupole fringe falls back to CPU
+  call init_fringe_info(fringe_info, ele)
+  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
 case (sbend$)
   call init_fringe_info(fringe_info, ele)
   if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
@@ -2377,6 +2505,29 @@ case (quadrupole$)
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
                           ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 
+case (sextupole$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_sextupole_dev(mc2, ele_length, delta_ref_time, &
+                               e_tot_ele, charge_dir, np, &
+                               a2_arr, b2_arr, cm_arr, &
+                               int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                               ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+
 case (sbend$)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
@@ -2600,6 +2751,30 @@ case (quadrupole$)
                           a2_arr, b2_arr, cm_arr, &
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
                           ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  did_track = .true.
+
+case (sextupole$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_sextupole_dev(mc2, ele_length, delta_ref_time, &
+                               e_tot_ele, charge_dir, n, &
+                               a2_arr, b2_arr, cm_arr, &
+                               int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                               ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   did_track = .true.
 
 case (sbend$)

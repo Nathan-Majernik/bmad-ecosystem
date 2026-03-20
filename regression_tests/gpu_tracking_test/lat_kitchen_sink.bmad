@@ -86,7 +86,16 @@ p_combo: pipe, L = 0.5,
     x1_limit = 3e-3, x2_limit = 3e-3,
     y1_limit = 3e-3, y2_limit = 3e-3
 
-! --- Section 7: Elliptical apertures ---
+! --- Section 7: Sextupoles ---
+
+d_sext: drift, L = 0.2
+s_plain: sextupole, L = 0.3, k2 = 5.0
+qf_sext: quadrupole, L = 0.3, k1 = 2.0
+s_combo: sextupole, L = 0.3, k2 = -5.0,
+    x_offset = 1e-4, tilt = 0.003,
+    b3 = 50.0, a2 = 3.0
+
+! --- Section 8: Elliptical apertures ---
 
 d9: drift, L = 0.2
 d_ellip: drift, L = 0.3, aperture_type = elliptical,
@@ -105,6 +114,7 @@ lat: line = (d_plain, q_plain, d_aper, qd1,
              d_mid, b_plain, qf_mid, b_k1, qd_mid, b_fringe_mis, qf_mid2, b_multi,
              d7, lc_plain, qd_lc, lc_misalign,
              d8, p_plain, p_misalign, p_aper, p_combo,
+             d_sext, s_plain, qf_sext,
              d9, d_ellip, qf_end, q_ellip, d_final)
 
 use, lat

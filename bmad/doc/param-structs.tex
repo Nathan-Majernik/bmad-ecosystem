@@ -230,7 +230,7 @@ an ``unphysical'' magnetic or electric field.
 \item[\vn{gpu_tracking_on}] \Newline
 Toggle for GPU-accelerated batch particle tracking (\sref{s:gpu.tracking}). Default is \vn{False}.
 When set to \vn{True}, bunch tracking through eligible elements (\vn{drift}, \vn{quadrupole},
-\vn{sbend}, \vn{lcavity}, \vn{pipe}, \vn{monitor}, and \vn{instrument}) is offloaded to an NVIDIA
+\vn{sextupole}, \vn{sbend}, \vn{lcavity}, \vn{pipe}, \vn{monitor}, and \vn{instrument}) is offloaded to an NVIDIA
 GPU via CUDA kernels. Elements that are not eligible for GPU tracking are silently tracked on the
 CPU. The \vn{gpu_tracking_init} routine can be used to initialize this flag based on hardware
 availability and the \vn{ACC_ENABLE_GPU_TRACKING} environment variable. GPU tracking supports

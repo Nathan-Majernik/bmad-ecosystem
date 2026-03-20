@@ -112,8 +112,8 @@ When enabled, eligible elements are tracked on the GPU while unsupported element
 fall back silently to CPU tracking. GPU tracking is not compatible with spin
 tracking or backward tracking.
 
-**Supported elements:** drift, quadrupole (with fringe), sbend (with
-misalignment), lcavity (relative and absolute time tracking), pipe, monitor, and
+**Supported elements:** drift, quadrupole (with fringe), sextupole,
+sbend (with misalignment), lcavity (relative and absolute time tracking), pipe, monitor, and
 instrument. Rectangular and elliptical apertures are checked on device.
 
 **Persistent GPU session:** Particle data stays on the GPU across consecutive

@@ -1,0 +1,13 @@
+no_digested
+parameter[lattice] = "GPU sextupole with aperture"
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+parameter[geometry] = open
+s1: sextupole, L = 0.3, k2 = 50.0,
+    x1_limit = 0.00015, x2_limit = 0.00015,
+    y1_limit = 0.00015, y2_limit = 0.00015,
+    aperture_at = exit_end
+lat: line = (s1)
+use, lat

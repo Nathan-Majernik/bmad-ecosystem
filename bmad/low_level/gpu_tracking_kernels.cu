@@ -440,8 +440,105 @@ __global__ void quad_kernel(
     t_arr[i] = t_start + delta_ref_time + (z_start - vz[i]) / (beta_val * C_LIGHT);
 }
 
+/* ==========================================================================
+ * SEXTUPOLE KERNEL -- drift-kick-drift split-step integrator
+ *
+ * Tracks through a thick sextupole (or any thick multipole element) using:
+ *   1. Half multipole kick at entrance
+ *   2. n_step sub-steps of [drift + full kick] (half kick at last step)
+ *   3. Time update from z displacement
+ *
+ * Unlike the quad kernel, there is no linear focusing matrix -- all
+ * transverse impulse comes from nonlinear multipole kicks via drift sub-steps.
+ * ========================================================================== */
+
+__global__ void sextupole_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state, double *beta_arr, double *p0c_arr, double *t_arr,
+    double mc2, double ele_length,
+    double delta_ref_time, double e_tot_ele, double charge_dir,
+    int n_particles,
+    const double *d_a2, const double *d_b2, const double *d_cm,
+    int ix_mag_max, int n_step,
+    const double *d_ea2, const double *d_eb2, int ix_elec_max)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_particles) return;
+    if (state[i] != ALIVE_ST) return;
+
+    int has_mag = (ix_mag_max >= 0);
+    int has_elec = (ix_elec_max >= 0);
+    double step_len = ele_length / (double)n_step;
+    double z_start = vz[i];
+    double t_start = t_arr[i];
+    double beta_val = beta_arr[i];
+    double p0c_val = p0c_arr[i];
+    double beta_ref = p0c_val / e_tot_ele;
+
+    /* Entrance half magnetic multipole kick */
+    if (has_mag) {
+        double kx, ky;
+        multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                           vx[i], vy[i], &kx, &ky);
+        vpx[i] += 0.5 * kx;
+        vpy[i] += 0.5 * ky;
+    }
+
+    /* Entrance half electric multipole kick */
+    if (has_elec) {
+        double kx, ky;
+        multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                           vx[i], vy[i], &kx, &ky);
+        if (apply_electric_kick_dev(0.5 * kx / beta_val, 0.5 * ky / beta_val,
+                &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+    }
+
+    /* Body: n_step drift-kick sub-steps */
+    for (int istep = 1; istep <= n_step; istep++) {
+
+        /* Drift through one sub-step */
+        if (drift_body_dev(&vx[i], &vpx[i], &vy[i], &vpy[i], &vz[i], &vpz[i],
+                            &beta_val, &t_arr[i], mc2, p0c_val, step_len)) {
+            state[i] = LOST_PZ;
+            return;
+        }
+        /* Time handled at end (not from drift_body_dev) -- reset t */
+        t_arr[i] = t_start;
+
+        /* No low_energy_z_correction here: drift_body_dev already handles the
+           full z-update via the exact formula. The correction is only needed for
+           the quad kernel where z is updated via the focusing matrix (not drift). */
+
+        /* Magnetic multipole kick (half at last step, full otherwise) */
+        if (has_mag) {
+            double kx, ky;
+            multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                               vx[i], vy[i], &kx, &ky);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            vpx[i] += scl * kx;
+            vpy[i] += scl * ky;
+        }
+
+        /* Electric multipole kick (half at last step, full otherwise) */
+        if (has_elec) {
+            double kx, ky;
+            multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                               vx[i], vy[i], &kx, &ky);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            if (apply_electric_kick_dev(scl * kx / beta_val, scl * ky / beta_val,
+                    &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                    &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+        }
+    }
+
+    /* Time update */
+    t_arr[i] = t_start + delta_ref_time + (z_start - vz[i]) / (beta_val * C_LIGHT);
+}
+
+
 /* --------------------------------------------------------------------------
- * upload_particle_data -- H→D transfer of core particle arrays
+ * upload_particle_data -- H->D transfer of core particle arrays
  * -------------------------------------------------------------------------- */
 static int upload_particle_data(int n,
     double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
@@ -1502,6 +1599,64 @@ extern "C" void gpu_track_quad_dev_(
         d_ea2, d_eb2, ix_elec_max);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* Sextupole body-only: uploads multipoles, runs kernel */
+extern "C" void gpu_track_sextupole_dev_(
+    double mc2, double ele_length,
+    double delta_ref_time, double e_tot_ele, double charge_dir,
+    int n_particles,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max, int n_step,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    sextupole_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ele_length, delta_ref_time, e_tot_ele, charge_dir,
+        n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* Combined sextupole: upload, kernel, download */
+extern "C" void gpu_track_sextupole_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t,
+    double mc2, double ele_length,
+    double delta_ref_time, double e_tot_ele, double charge_dir,
+    int n_particles,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max, int n_step,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (ensure_buffers(n_particles) != 0) return;
+
+    if (upload_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                             h_state, h_beta, h_p0c, h_t) != 0) return;
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    sextupole_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ele_length, delta_ref_time, e_tot_ele, charge_dir,
+        n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    download_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                           h_state, h_beta, h_p0c, h_t, 1, 1);
 }
 
 /* Bend body-only: uploads multipoles, runs kernel */
