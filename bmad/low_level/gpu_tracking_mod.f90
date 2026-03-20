@@ -1146,8 +1146,8 @@ call gpu_tracking_post(bunch, ele, param, n, vx, vpx, vy, vpy, vz, vpz, &
     state_a, beta_a, p0c_a, t_a, has_misalign, fringe_info, .true., &
     .true., .false., .true.)
 
-deallocate(vx, vpx, vy, vpy, vz, vpz)
-deallocate(state_a, beta_a, p0c_a, t_a)
+if (allocated(vx)) deallocate(vx, vpx, vy, vpy, vz, vpz)
+if (allocated(state_a)) deallocate(state_a, beta_a, p0c_a, t_a)
 #endif
 
 end subroutine track_bunch_thru_sextupole_gpu
