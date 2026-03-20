@@ -186,15 +186,11 @@ else
 endif
 
 ! Flush persistent GPU data back to bunch.
-! When gpu_deferred_flush is on, skip the flush for normal elements —
-! the caller is responsible for flushing when it needs CPU-side data.
-! EXCEPTION: always flush when CSR/SC is active, because Tao immediately
-! inspects particle states for lost-particle counting after each element.
-! Without this flush, Tao sees stale CPU data and marks all particles as lost.
-if (bmad_com%gpu_tracking_on) then
-  if (.not. bmad_com%gpu_deferred_flush .or. bmad_com%csr_and_space_charge_on) then
-    call gpu_persistent_flush(bunch, branch%ele(e2%ix_ele))
-  endif
+! When gpu_deferred_flush is on, the caller has explicitly requested deferred
+! flushing and is responsible for flushing when it needs CPU-side data.
+! Respect this even with CSR/SC active — the caller controls flush points.
+if (bmad_com%gpu_tracking_on .and. .not. bmad_com%gpu_deferred_flush) then
+  call gpu_persistent_flush(bunch, branch%ele(e2%ix_ele))
 endif
 
 end subroutine track_bunch
