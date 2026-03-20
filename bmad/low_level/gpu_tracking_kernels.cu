@@ -2224,7 +2224,12 @@ __global__ void orbit_check_kernel(
         return;
     }
     if (vpx[i]*vpx[i] + vpy[i]*vpy[i] > rel_p*rel_p) {
-        state[i] = LOST_PZ;
+        /* Match CPU: assign directional code based on dominant momentum */
+        if (fabs(vpx[i]) > fabs(vpy[i])) {
+            state[i] = (vpx[i] > 0) ? LOST_POS_X : LOST_NEG_X;
+        } else {
+            state[i] = (vpy[i] > 0) ? LOST_POS_Y : LOST_NEG_Y;
+        }
     }
 }
 
