@@ -557,7 +557,7 @@ block
     allocate(h_charge_cached_bin(np_l))
     do ii = 1, np_l
       if (bunch_in%particle(ii)%state == alive$) then
-        h_charge_cached_bin(ii) = bunch_in%particle(ii)%charge * charge_of(bunch_in%particle(ii)%species)
+        h_charge_cached_bin(ii) = bunch_in%particle(ii)%charge
       else
         h_charge_cached_bin(ii) = 0
       endif
@@ -589,6 +589,7 @@ do ii = 1, nb_l
       (csr_in%slice(ii)%charge - csr_in%slice(ii-1)%charge) / csr_in%dz_slice**2
   endif
 enddo
+
 
 deallocate(h_charge_l, h_bin_charge_l, h_bin_x0_wt_l, h_bin_y0_wt_l, h_bin_n_particle_l)
 
