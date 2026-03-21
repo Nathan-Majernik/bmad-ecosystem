@@ -312,6 +312,12 @@ interface
     integer(C_INT), value, intent(in) :: entering, time_dir, n
   end subroutine
 
+  subroutine gpu_sad_bend_fringe(g, fb, n) bind(C, name='gpu_sad_bend_fringe_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: g, fb
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
   subroutine gpu_misalign_3d(h_W, Lx, Ly, Lz, set_flag, n) bind(C, name='gpu_misalign_3d_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), intent(in) :: h_W(9)
@@ -322,6 +328,17 @@ interface
   subroutine gpu_misalign(x_off, y_off, tilt, set_flag, n) bind(C, name='gpu_misalign_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: x_off, y_off, tilt
+    integer(C_INT), value, intent(in) :: set_flag, n
+  end subroutine
+
+  subroutine gpu_bend_offset(g, rho, L_half, bend_angle, &
+      ref_tilt, roll_tot, x_off, y_off, z_off, x_pitch, y_pitch, &
+      set_flag, n) bind(C, name='gpu_bend_offset_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: g, rho, L_half, bend_angle
+    real(C_DOUBLE), value, intent(in) :: ref_tilt, roll_tot
+    real(C_DOUBLE), value, intent(in) :: x_off, y_off, z_off
+    real(C_DOUBLE), value, intent(in) :: x_pitch, y_pitch
     integer(C_INT), value, intent(in) :: set_flag, n
   end subroutine
 
@@ -1764,8 +1781,8 @@ case (sextupole$)
     end select
   endif
 case (sbend$)
-  ! Bend fringe: basic_bend$ and hard_edge_only$ are handled on GPU.
-  ! Other fringe types (full$, sad_full$, soft_edge_only$, linear_edge$) need CPU.
+  ! Bend fringe: basic_bend$, hard_edge_only$, full$, sad_full$, soft_edge_only$ handled on GPU.
+  ! Other fringe types (linear_edge$) need CPU.
   call init_fringe_info(fringe_info, ele)
   if (fringe_info%has_fringe) then
     select case (nint(ele%value(fringe_type$)))
@@ -1773,6 +1790,8 @@ case (sbend$)
       ! Handled by gpu_bend_fringe kernel (Hwang)
     case (full$)
       ! Handled by gpu_exact_bend_fringe kernel (PTC-style)
+    case (sad_full$, soft_edge_only$)
+      ! Handled by gpu_sad_bend_fringe kernel + gpu_bend_fringe for sad_full$
     case default
       has_fringe_needs_cpu = .true.
     end select
@@ -1916,11 +1935,19 @@ do ie = ix_start, ix_end
     ! Entrance aperture check on device (before misalignment, in lab frame)
     call dispatch_aperture_on_device(ele, n, entrance_end$)
 
-    ! Misalignment on device via 2D offset+tilt kernel.
-    ! For bends, use ref_tilt_tot; for others, use tilt_tot (=roll_tot).
+    ! Misalignment on device.
+    ! For bends with curvature/ref_tilt/roll, use full curvature-aware bend_offset.
+    ! For others, use simple 2D offset+tilt kernel.
     has_misalign = ele%bookkeeping_state%has_misalign
     if (has_misalign) then
-      if (ele%key == sbend$) then
+      if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+                                   .or. ele%value(roll$) /= 0)) then
+        call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
+             ele%value(l$) * 0.5_rp, ele%value(angle$), &
+             ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
+             ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
+             ele%value(x_pitch$), ele%value(y_pitch$), 1, n)
+      elseif (ele%key == sbend$) then
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(ref_tilt_tot$), 1, n)
       else
@@ -1950,7 +1977,14 @@ do ie = ix_start, ix_end
 
     ! Remove misalignment
     if (has_misalign) then
-      if (ele%key == sbend$) then
+      if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+                                   .or. ele%value(roll$) /= 0)) then
+        call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
+             ele%value(l$) * 0.5_rp, ele%value(angle$), &
+             ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
+             ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
+             ele%value(x_pitch$), ele%value(y_pitch$), -1, n)
+      elseif (ele%key == sbend$) then
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(ref_tilt_tot$), -1, n)
       else
@@ -2174,6 +2208,113 @@ case (sbend$)
 
       ! Hard multipole edge kick at exit (after exact fringe)
       if (physical_end_exact == exit_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        bp_arr = 0; ap_arr = 0
+        bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(0, C_INT), np)
+      endif
+    end block
+    return
+  endif
+
+  ! SAD fringe types: sad_full$ and soft_edge_only$
+  if (fringe_type_val == sad_full$ .or. fringe_type_val == soft_edge_only$) then
+    block
+      real(rp) :: g_sad, fb_sad, c_dir_sad
+      integer :: physical_end_sad
+
+      physical_end_sad = physical_ele_end(edge, bunch%particle(1), ele%orientation)
+
+      ! Compute fb = 12 * fint * hgap (entrance) or 12 * fintx * hgapx (exit)
+      if (physical_end_sad == entrance_end$) then
+        fb_sad = 12 * ele%value(fint$) * ele%value(hgap$)
+      else
+        fb_sad = 12 * ele%value(fintx$) * ele%value(hgapx$)
+      endif
+
+      ! Compute g with all sign factors baked in
+      ! c_dir includes time_dir (matching sad_soft_bend_edge_kick)
+      c_dir_sad = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                  ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+      g_sad = (ele%value(g$) + ele%value(dg$)) * c_dir_sad
+      if (edge == second_track_edge$) g_sad = -g_sad
+
+      ! Hard multipole edge kick at entrance (before bend fringe)
+      if (physical_end_sad == entrance_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        bp_arr = 0; ap_arr = 0
+        bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(1, C_INT), np)
+      endif
+
+      if (fringe_type_val == sad_full$) then
+        ! sad_full$: sad_soft then hwang at entrance, hwang then sad_soft at exit
+        if (edge == first_track_edge$) then
+          ! SAD soft kick first, then Hwang (with fint_gap=0)
+          if (fb_sad /= 0 .and. g_sad /= 0) &
+            call gpu_sad_bend_fringe(g_sad, fb_sad, np)
+          ! Hwang kick with fint_gap = 0 (hard_edge_only behavior)
+          charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                           ele%orientation * bunch%particle(1)%direction
+          block
+            real(rp) :: g_hwang, e_ang_hwang
+            integer :: entering_hwang
+            if (ele%is_on) then
+              g_hwang = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+              k1_val = ele%value(k1$)
+            else
+              g_hwang = 0; k1_val = 0
+            endif
+            if (physical_end_sad == entrance_end$) then
+              e_ang_hwang = ele%value(e1$)
+            else
+              e_ang_hwang = ele%value(e2$)
+            endif
+            entering_hwang = 0
+            if ((edge == first_track_edge$ .and. bunch%particle(1)%direction == 1) .or. &
+                (edge == second_track_edge$ .and. bunch%particle(1)%direction == -1)) entering_hwang = 1
+            call gpu_bend_fringe(g_hwang, e_ang_hwang, 0.0_rp, k1_val, &
+                                  int(entering_hwang, C_INT), &
+                                  int(bunch%particle(1)%time_dir, C_INT), np)
+          end block
+        else
+          ! Hwang kick first (with fint_gap=0), then SAD soft kick
+          charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                           ele%orientation * bunch%particle(1)%direction
+          block
+            real(rp) :: g_hwang, e_ang_hwang
+            integer :: entering_hwang
+            if (ele%is_on) then
+              g_hwang = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+              k1_val = ele%value(k1$)
+            else
+              g_hwang = 0; k1_val = 0
+            endif
+            if (physical_end_sad == entrance_end$) then
+              e_ang_hwang = ele%value(e1$)
+            else
+              e_ang_hwang = ele%value(e2$)
+            endif
+            entering_hwang = 0
+            if ((edge == first_track_edge$ .and. bunch%particle(1)%direction == 1) .or. &
+                (edge == second_track_edge$ .and. bunch%particle(1)%direction == -1)) entering_hwang = 1
+            call gpu_bend_fringe(g_hwang, e_ang_hwang, 0.0_rp, k1_val, &
+                                  int(entering_hwang, C_INT), &
+                                  int(bunch%particle(1)%time_dir, C_INT), np)
+          end block
+          if (fb_sad /= 0 .and. g_sad /= 0) &
+            call gpu_sad_bend_fringe(g_sad, fb_sad, np)
+        endif
+      else
+        ! soft_edge_only$: just the SAD soft kick
+        if (fb_sad /= 0 .and. g_sad /= 0) &
+          call gpu_sad_bend_fringe(g_sad, fb_sad, np)
+      endif
+
+      ! Hard multipole edge kick at exit (after bend fringe)
+      if (physical_end_sad == exit_end$) then
         charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
                          ele%orientation * bunch%particle(1)%direction
         bp_arr = 0; ap_arr = 0
@@ -2569,7 +2710,14 @@ call dispatch_aperture_on_device_pub(ele, n, entrance_end$)
 ! Misalignment
 has_misalign = ele%bookkeeping_state%has_misalign
 if (has_misalign) then
-  if (ele%key == sbend$) then
+  if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+                               .or. ele%value(roll$) /= 0)) then
+    call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
+         ele%value(l$) * 0.5_rp, ele%value(angle$), &
+         ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
+         ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
+         ele%value(x_pitch$), ele%value(y_pitch$), 1, n)
+  elseif (ele%key == sbend$) then
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(ref_tilt_tot$), 1, n)
   else
@@ -2599,7 +2747,14 @@ call dispatch_fringe_on_device_pub(ele, param, n, second_track_edge$)
 
 ! Remove misalignment
 if (has_misalign) then
-  if (ele%key == sbend$) then
+  if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+                               .or. ele%value(roll$) /= 0)) then
+    call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
+         ele%value(l$) * 0.5_rp, ele%value(angle$), &
+         ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
+         ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
+         ele%value(x_pitch$), ele%value(y_pitch$), -1, n)
+  elseif (ele%key == sbend$) then
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(ref_tilt_tot$), -1, n)
   else

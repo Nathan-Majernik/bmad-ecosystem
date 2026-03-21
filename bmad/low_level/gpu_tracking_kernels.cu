@@ -2329,6 +2329,51 @@ extern "C" void gpu_exact_bend_fringe_(
 }
 
 
+/* ==========================================================================
+ * SAD soft-edge bend fringe kernel
+ *
+ * Port of sad_soft_bend_edge_kick from fringe_mod.f90 (sbend case only).
+ * Parameters are pre-signed by the Fortran dispatch:
+ *   g  = (g$ + dg$) * c_dir, negated if second_track_edge$
+ *        where c_dir = charge_to_mass * orientation * direction * time_dir
+ *   fb = 12 * fint * hgap  (or fintx * hgapx for exit end)
+ * ========================================================================== */
+
+__global__ void sad_bend_fringe_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz,
+    const double *vpz, int *state,
+    double g, double fb, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double px    = vpx[i];
+    double y     = vy[i];
+    double rel_p = 1.0 + vpz[i];
+
+    double c1 = fb * fb * g / (24.0 * rel_p);
+    double c2 = fb * g * g / (6.0 * rel_p);
+    double c3 = 2.0 * g * g / (3.0 * fb * rel_p);
+
+    vx[i]  = vx[i]  + c1 * vpz[i];
+    vpy[i] = vpy[i] + c2 * y - c3 * y * y * y;
+    vz[i]  = vz[i]  + (c1 * px + c2 * y * y / 2.0 - c3 * y * y * y * y / 4.0) / rel_p;
+}
+
+extern "C" void gpu_sad_bend_fringe_(double g, double fb, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    sad_bend_fringe_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4],
+        d_vec[5], d_state,
+        g, fb, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
+
 extern "C" void gpu_misalign_(
     double x_off, double y_off, double tilt,
     int set_flag, int n)
@@ -2424,6 +2469,448 @@ extern "C" void gpu_misalign_3d_(
         d_vec[0], d_vec[1], d_vec[2], d_vec[3],
         d_vec[4], d_vec[5], d_state,
         d_misalign_W, Lx, Ly, Lz, set_flag, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
+/* ==========================================================================
+ * BEND OFFSET KERNEL -- curvature-aware offset_particle for sbends
+ *
+ * Replicates the CPU offset_particle bend path (set$ and unset$):
+ *   set$:   lab -> body using bend_shift transforms
+ *   unset$: body -> lab using inverse bend_shift transforms
+ *
+ * Assumes direction=1, time_dir=1, orientation=1 (GPU forward tracking).
+ * ========================================================================== */
+
+/* ---------- cos_one: cos(a)-1 to machine precision ---------- */
+__device__ __forceinline__ double cos_one_dev(double a) {
+    double s = sin(a * 0.5);
+    return -2.0 * s * s;
+}
+
+/* ---------- 3x3 identity ---------- */
+__device__ void mat3_identity(double M[3][3]) {
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            M[i][j] = (i == j) ? 1.0 : 0.0;
+}
+
+/* ---------- left-multiply 3x3: M = R * M  (in-place) ---------- */
+__device__ void mat3_lmul(double R[3][3], double M[3][3]) {
+    double T[3][3];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            T[i][j] = 0.0;
+            for (int k = 0; k < 3; k++) T[i][j] += R[i][k] * M[k][j];
+        }
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) M[i][j] = T[i][j];
+}
+
+/* ---------- mat-vec: out = M * v ---------- */
+__device__ void mat3_vec(double M[3][3], const double v[3], double out[3]) {
+    for (int i = 0; i < 3; i++) {
+        out[i] = 0.0;
+        for (int j = 0; j < 3; j++) out[i] += M[i][j] * v[j];
+    }
+}
+
+/* ---------- rotate_mat: left-multiply M by rotation about axis by angle ---------- */
+/* axis: 0=x, 1=y, 2=z */
+__device__ void rotate_mat_dev(double M[3][3], int axis, double angle) {
+    if (angle == 0.0) return;
+    double ca = cos(angle), sa = sin(angle);
+    /* Build rotation R, then M <- R * M */
+    double R[3][3];
+    mat3_identity(R);
+    switch (axis) {
+    case 0: /* x-axis */
+        R[1][1] = ca; R[1][2] = -sa;
+        R[2][1] = sa; R[2][2] =  ca;
+        break;
+    case 1: /* y-axis */
+        R[0][0] =  ca; R[0][2] = sa;
+        R[2][0] = -sa; R[2][2] = ca;
+        break;
+    case 2: /* z-axis */
+        R[0][0] = ca; R[0][1] = -sa;
+        R[1][0] = sa; R[1][1] =  ca;
+        break;
+    }
+    mat3_lmul(R, M);
+}
+
+/* ---------- rotate_vec: rotate vec about axis by angle ---------- */
+__device__ void rotate_vec_dev(double v[3], int axis, double angle) {
+    if (angle == 0.0) return;
+    double ca = cos(angle), sa = sin(angle);
+    double t;
+    switch (axis) {
+    case 0: /* x */
+        t    = ca*v[1] - sa*v[2];
+        v[2] = sa*v[1] + ca*v[2];
+        v[1] = t;
+        break;
+    case 1: /* y */
+        t    = sa*v[2] + ca*v[0];
+        v[2] = ca*v[2] - sa*v[0];
+        v[0] = t;
+        break;
+    case 2: /* z */
+        t    = ca*v[0] - sa*v[1];
+        v[1] = sa*v[0] + ca*v[1];
+        v[0] = t;
+        break;
+    }
+}
+
+/* ---------- bend_shift_dev: port of Fortran bend_shift ---------- */
+/* Transforms position (r, w) by shifting along a bend with curvature g
+ * by arc length delta_s, with optional ref_tilt. */
+__device__ void bend_shift_dev(double r[3], double w[3][3],
+                               double g, double delta_s, double ref_tilt) {
+    double angle = delta_s * g;
+
+    if (angle == 0.0) {
+        r[2] -= delta_s;
+        return;
+    }
+
+    /* Build S_mat */
+    double S[3][3];
+    mat3_identity(S);
+    if (ref_tilt != 0.0) {
+        rotate_mat_dev(S, 2, -ref_tilt);  /* z-axis, -ref_tilt */
+        rotate_mat_dev(S, 1, angle);      /* y-axis, angle */
+        rotate_mat_dev(S, 2, ref_tilt);   /* z-axis, ref_tilt */
+    } else {
+        rotate_mat_dev(S, 1, angle);      /* y-axis, angle */
+    }
+
+    /* L_vec = [cos_one(angle), 0, -sin(angle)] / g */
+    double L[3];
+    L[0] = cos_one_dev(angle) / g;
+    L[1] = 0.0;
+    L[2] = -sin(angle) / g;
+    if (ref_tilt != 0.0) rotate_vec_dev(L, 2, ref_tilt);
+
+    /* r_new = S * r + L */
+    double rn[3];
+    mat3_vec(S, r, rn);
+    rn[0] += L[0]; rn[1] += L[1]; rn[2] += L[2];
+    r[0] = rn[0]; r[1] = rn[1]; r[2] = rn[2];
+
+    /* w_new = S * w */
+    mat3_lmul(S, w);
+}
+
+/* ---------- floor_angles_to_w_mat_dev: (theta=x_pitch, phi=y_pitch, psi=roll) ---------- */
+__device__ void floor_angles_to_w_mat_dev(double theta, double phi, double psi,
+                                           double wm[3][3]) {
+    double st = sin(theta), ct = cos(theta);
+    double sp = sin(phi),   cp = cos(phi);
+    double ss = sin(psi),   cs = cos(psi);
+
+    wm[0][0] =  ct*cs - st*sp*ss;
+    wm[0][1] = -ct*ss - st*sp*cs;
+    wm[0][2] =  st*cp;
+    wm[1][0] =  cp*ss;
+    wm[1][1] =  cp*cs;
+    wm[1][2] =  sp;
+    wm[2][0] = -st*cs - ct*sp*ss;
+    wm[2][1] =  st*ss - ct*sp*cs;
+    wm[2][2] =  ct*cp;
+}
+
+/* ---------- floor_angles_to_w_mat_inv_dev: inverse (= transpose for orthogonal) ---------- */
+__device__ void floor_angles_to_w_mat_inv_dev(double theta, double phi, double psi,
+                                               double wm[3][3]) {
+    double st = sin(theta), ct = cos(theta);
+    double sp = sin(phi),   cp = cos(phi);
+    double ss = sin(psi),   cs = cos(psi);
+
+    wm[0][0] =  ct*cs - st*sp*ss;
+    wm[0][1] =  cp*ss;
+    wm[0][2] = -st*cs - ct*sp*ss;
+    wm[1][0] = -ct*ss - st*sp*cs;
+    wm[1][1] =  cp*cs;
+    wm[1][2] =  st*ss - ct*sp*cs;
+    wm[2][0] =  st*cp;
+    wm[2][1] =  sp;
+    wm[2][2] =  ct*cp;
+}
+
+/* ---------- w_mat_for_tilt_dev: z-axis rotation matrix for tilt ---------- */
+__device__ void w_mat_for_tilt_dev(double tilt, double wm[3][3]) {
+    double c = cos(tilt), s = sin(tilt);
+    wm[0][0] = c;   wm[0][1] = -s;  wm[0][2] = 0.0;
+    wm[1][0] = s;   wm[1][1] =  c;  wm[1][2] = 0.0;
+    wm[2][0] = 0.0; wm[2][1] = 0.0; wm[2][2] = 1.0;
+}
+
+/* ---------- ele_misalignment_L_S_calc_dev: for sbends ---------- */
+__device__ void ele_misalignment_L_S_calc_dev(
+    double x_off, double y_off, double z_off,
+    double x_pitch, double y_pitch,  /* Note: x_pitch$ and y_pitch$ (not _tot) for bends */
+    double roll_tot, double ref_tilt_tot,
+    double bend_angle, double rho,
+    double L_mis[3], double S_mis[3][3]) {
+
+    L_mis[0] = x_off;
+    L_mis[1] = y_off;
+    L_mis[2] = z_off;
+
+    /* Roll contribution to L_mis */
+    if (roll_tot != 0.0) {
+        double ha = bend_angle * 0.5;
+        double Lc[3];
+        Lc[0] = rho * cos_one_dev(ha);
+        Lc[1] = 0.0;
+        Lc[2] = rho * sin(ha);
+        rotate_vec_dev(Lc, 1, ha);           /* y-axis by half angle */
+        rotate_vec_dev(Lc, 2, ref_tilt_tot); /* z-axis by ref_tilt */
+        L_mis[0] -= Lc[0];
+        L_mis[1] -= Lc[1];
+        L_mis[2] -= Lc[2];
+        rotate_vec_dev(Lc, 2, roll_tot);     /* z-axis by roll */
+        L_mis[0] += Lc[0];
+        L_mis[1] += Lc[1];
+        L_mis[2] += Lc[2];
+    }
+
+    /* S_mis = floor_angles_to_w_mat(x_pitch, y_pitch, roll_tot) */
+    floor_angles_to_w_mat_dev(x_pitch, y_pitch, roll_tot, S_mis);
+}
+
+/* ---------- transpose a 3x3 in-place ---------- */
+__device__ void mat3_transpose(double M[3][3]) {
+    double t;
+    t = M[0][1]; M[0][1] = M[1][0]; M[1][0] = t;
+    t = M[0][2]; M[0][2] = M[2][0]; M[2][0] = t;
+    t = M[1][2]; M[1][2] = M[2][1]; M[2][1] = t;
+}
+
+/* ---------- The main bend_offset kernel ----------
+ *
+ * Parameters (all pre-computed on host and passed as scalars):
+ *   g          = curvature (1/rho)
+ *   rho        = radius of curvature (rho$)
+ *   L_half     = half-length
+ *   bend_angle = g * length = angle$
+ *   ref_tilt   = ref_tilt_tot$
+ *   roll_tot   = roll_tot$
+ *   x_off, y_off, z_off = offset_tot values
+ *   x_pitch, y_pitch    = pitch$ values (not _tot)
+ *   set_flag   = 1 for set (lab->body), -1 for unset (body->lab)
+ *
+ * Assumptions (GPU forward tracking):
+ *   direction = 1, time_dir = 1, orientation = 1
+ *   For set:   particle at entrance (s_pos0=0, ds_center=L_half)
+ *   For unset: particle at exit     (s_pos0=length, ds_center=-L_half)
+ */
+__global__ void bend_offset_kernel(
+    double *vx, double *vpx, double *vy, double *vpy,
+    double *vz, double *vpz,
+    int *state,
+    double g, double rho, double L_half, double bend_angle,
+    double ref_tilt, double roll_tot,
+    double x_off, double y_off, double z_off,
+    double x_pitch, double y_pitch,
+    int set_flag, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double x = vx[i], px = vpx[i], y = vy[i], py = vpy[i];
+    double rel_p = 1.0 + vpz[i];
+    /* sign_z_vel = orientation * direction = 1 for GPU */
+    int sign_z_vel = 1;
+
+    /* ds_center: set -> L_half, unset -> -L_half */
+    double ds_center = (set_flag == 1) ? L_half : -L_half;
+
+    /* position: r = [x, y, 0], w = I */
+    double r[3] = {x, y, 0.0};
+    double w[3][3];
+    mat3_identity(w);
+
+    if (set_flag == 1) {
+        /* ============== SET (lab -> body) ============== */
+
+        /* Step 1: bend_shift from particle s_pos to element center */
+        /* ds = orientation * ds_center = 1 * L_half = L_half */
+        bend_shift_dev(r, w, g, L_half, ref_tilt);
+
+        /* Step 2: ele_misalignment_L_S_calc -> L_mis, S_mis */
+        double L_mis[3], S_mis[3][3];
+        ele_misalignment_L_S_calc_dev(x_off, y_off, z_off,
+            x_pitch, y_pitch, roll_tot, ref_tilt, bend_angle, rho,
+            L_mis, S_mis);
+
+        /* Step 3: position%r = transpose(S_mis) * (r - L_mis) */
+        /*         position%w = transpose(S_mis) * w */
+        double ws[3][3];
+        /* ws = transpose(S_mis) */
+        for (int ii = 0; ii < 3; ii++)
+            for (int jj = 0; jj < 3; jj++)
+                ws[ii][jj] = S_mis[jj][ii];
+
+        double rd[3] = {r[0] - L_mis[0], r[1] - L_mis[1], r[2] - L_mis[2]};
+        double rn[3];
+        mat3_vec(ws, rd, rn);
+        r[0] = rn[0]; r[1] = rn[1]; r[2] = rn[2];
+        mat3_lmul(ws, w);
+
+        /* Step 4: ref_tilt correction (if needed) */
+        if (ref_tilt != 0.0) {
+            bend_shift_dev(r, w, g, -L_half, ref_tilt);
+
+            /* ws = w_mat_for_tilt(-ref_tilt) */
+            w_mat_for_tilt_dev(-ref_tilt, ws);
+            double rt[3];
+            mat3_vec(ws, r, rt);
+            r[0] = rt[0]; r[1] = rt[1]; r[2] = rt[2];
+            mat3_lmul(ws, w);
+
+            bend_shift_dev(r, w, g, L_half, 0.0);
+        }
+
+        /* Step 5: drift_to = upstream_end$
+         * sign_z_vel * time_dir = 1, so shift by -L_half */
+        bend_shift_dev(r, w, g, -L_half, 0.0);
+        /* r[2] += (1 - sign_z_vel * time_dir) * L_half = 0 */
+        /* s_body = r[2] (which should be ~0) */
+        double s_body = r[2];
+
+        /* Step 6: transform momenta */
+        double pz_sq = rel_p * rel_p - px * px - py * py;
+        if (pz_sq <= 0.0) { state[i] = LOST_PZ; return; }
+        double pz_val = sign_z_vel * sqrt(pz_sq);
+
+        double p_vec[3];
+        double p_vec0[3] = {px, py, pz_val};
+        mat3_vec(w, p_vec0, p_vec);
+
+        vx[i]  = r[0];
+        vpx[i] = p_vec[0];
+        vy[i]  = r[1];
+        vpy[i] = p_vec[1];
+
+        /* Step 7: drift to edge (s_target = 0 for upstream_end$) */
+        /* ds = s_target - s_body = 0 - s_body = -s_body */
+        double ds = -s_body;
+        if (fabs(ds) > 1e-14) {
+            /* track_a_drift with include_ref_motion=false, orientation=1 */
+            double rpx = vx[i], rppx = vpx[i], rpy = vy[i], rppy = vpy[i];
+            double drp = 1.0 + vpz[i];
+            double px_rel = vpx[i] / drp;
+            double py_rel = vpy[i] / drp;
+            double pxy2 = px_rel * px_rel + py_rel * py_rel;
+            if (pxy2 >= 1.0) { state[i] = LOST_PZ; return; }
+            double ps_rel = sqrt(1.0 - pxy2);
+            vx[i] = vx[i] + ds * px_rel / ps_rel;
+            vy[i] = vy[i] + ds * py_rel / ps_rel;
+            /* vz change: dz = -ds / ps_rel  (include_ref_motion=false) */
+            vz[i] = vz[i] - ds / ps_rel;
+        }
+
+    } else {
+        /* ============== UNSET (body -> lab) ============== */
+
+        /* Step 1: bend_shift from particle s_pos to center */
+        /* ds_center = -L_half (particle is at exit, s_pos0=length=2*L_half) */
+        bend_shift_dev(r, w, g, -L_half, 0.0);
+
+        /* Step 2: ref_tilt correction (if needed) */
+        if (ref_tilt != 0.0) {
+            bend_shift_dev(r, w, g, -L_half, 0.0);
+
+            /* ws = w_mat_for_tilt(ref_tilt) */
+            double ws2[3][3];
+            w_mat_for_tilt_dev(ref_tilt, ws2);
+            double rt2[3];
+            mat3_vec(ws2, r, rt2);
+            r[0] = rt2[0]; r[1] = rt2[1]; r[2] = rt2[2];
+            mat3_lmul(ws2, w);
+
+            bend_shift_dev(r, w, g, L_half, ref_tilt);
+        }
+
+        /* Step 3: ele_misalignment_L_S_calc -> L_mis, S_mis */
+        double L_mis[3], S_mis[3][3];
+        ele_misalignment_L_S_calc_dev(x_off, y_off, z_off,
+            x_pitch, y_pitch, roll_tot, ref_tilt, bend_angle, rho,
+            L_mis, S_mis);
+
+        /* Step 4: position%r = S_mis * r + L_mis */
+        /*         position%w = S_mis * w */
+        double rn[3];
+        mat3_vec(S_mis, r, rn);
+        r[0] = rn[0] + L_mis[0]; r[1] = rn[1] + L_mis[1]; r[2] = rn[2] + L_mis[2];
+        mat3_lmul(S_mis, w);
+
+        /* Step 5: drift_to = downstream_end$
+         * sign_z_vel * time_dir = 1, shift by +L_half */
+        bend_shift_dev(r, w, g, L_half, ref_tilt);
+        /* r[2] += (1 + sign_z_vel * time_dir) * L_half = r[2] + 2*L_half */
+        r[2] += 2.0 * L_half;
+
+        /* s_lab = r[2]  (should be ~length = 2*L_half) */
+        double s_lab = r[2];
+
+        /* Step 6: transform momenta */
+        double pz_sq = rel_p * rel_p - px * px - py * py;
+        if (pz_sq <= 0.0) { state[i] = LOST_PZ; return; }
+        double pz_val = sign_z_vel * sqrt(pz_sq);
+
+        double p_vec[3];
+        double p_vec0[3] = {px, py, pz_val};
+        mat3_vec(w, p_vec0, p_vec);
+
+        vx[i]  = r[0];
+        vpx[i] = p_vec[0];
+        vy[i]  = r[1];
+        vpy[i] = p_vec[1];
+
+        /* Step 7: drift to edge (s_target = 2*L_half for downstream_end$) */
+        /* ds = s_target - s_lab = 2*L_half - s_lab */
+        double ds = 2.0 * L_half - s_lab;
+        if (fabs(ds) > 1e-14) {
+            /* track_a_drift with include_ref_motion=false, orientation=+1 */
+            double drp = 1.0 + vpz[i];
+            double px_rel = vpx[i] / drp;
+            double py_rel = vpy[i] / drp;
+            double pxy2 = px_rel * px_rel + py_rel * py_rel;
+            if (pxy2 >= 1.0) { state[i] = LOST_PZ; return; }
+            double ps_rel = sqrt(1.0 - pxy2);
+            vx[i] = vx[i] + ds * px_rel / ps_rel;
+            vy[i] = vy[i] + ds * py_rel / ps_rel;
+            /* vz change: dz = -ds / ps_rel (include_ref_motion=false) */
+            vz[i] = vz[i] - ds / ps_rel;
+        }
+    }
+}
+
+extern "C" void gpu_bend_offset_(
+    double g, double rho, double L_half, double bend_angle,
+    double ref_tilt, double roll_tot,
+    double x_off, double y_off, double z_off,
+    double x_pitch, double y_pitch,
+    int set_flag, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    bend_offset_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3],
+        d_vec[4], d_vec[5], d_state,
+        g, rho, L_half, bend_angle,
+        ref_tilt, roll_tot,
+        x_off, y_off, z_off,
+        x_pitch, y_pitch,
+        set_flag, n);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 }
