@@ -659,8 +659,8 @@ if (.not. ele%is_on) return
 
 ! Check supported element types
 select case (ele%key)
-case (drift$, quadrupole$, sextupole$, sbend$, lcavity$, pipe$, monitor$, instrument$, &
-      kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$)
+case (drift$, quadrupole$, sextupole$, octupole$, thick_multipole$, sbend$, lcavity$, pipe$, &
+      monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$)
   eligible = .true.
 end select
 
@@ -3489,7 +3489,7 @@ case (quadrupole$)
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
                           ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 
-case (sextupole$)
+case (sextupole$, octupole$, thick_multipole$)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
   mc2 = mass_of(bunch%particle(1)%species)
@@ -4018,7 +4018,7 @@ case (quadrupole$)
                           ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   did_track = .true.
 
-case (sextupole$)
+case (sextupole$, octupole$, thick_multipole$)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
   mc2 = mass_of(bunch%particle(1)%species)

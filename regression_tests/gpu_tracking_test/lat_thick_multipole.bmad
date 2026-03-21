@@ -1,0 +1,12 @@
+parameter[geometry] = open
+parameter[particle] = electron
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+beginning[p0c] = 1e9
+
+d1: drift, l = 0.5
+tm1: thick_multipole, l = 0.4, b2 = 10.0, b3 = 200.0, ds_step = 0.05
+d2: drift, l = 0.5
+
+lat: line = (d1, tm1, d2)
+use, lat

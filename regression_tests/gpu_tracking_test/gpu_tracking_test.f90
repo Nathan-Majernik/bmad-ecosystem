@@ -429,6 +429,18 @@ call bmad_parser('lat_kitchen_sink.bmad', lat)
 call run_multi_bunch_test('Test 50: Multi-bunch kitchen sink', lat, 1d-3, n_pass, n_fail, 5)
 
 ! ======================================================================
+! TEST 51: Octupole
+! ======================================================================
+call bmad_parser('lat_octupole_only.bmad', lat)
+call run_comparison_test('Test 51: Plain octupole', lat, 1d-3, n_pass, n_fail)
+
+! ======================================================================
+! TEST 52: Thick multipole (combined sextupole + octupole)
+! ======================================================================
+call bmad_parser('lat_thick_multipole.bmad', lat)
+call run_comparison_test('Test 52: Thick multipole', lat, 1d-3, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *
