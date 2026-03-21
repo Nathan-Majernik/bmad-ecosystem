@@ -435,8 +435,10 @@ do i_step = 0, n_step
   ! Apply kicks to particles — GPU path modifies device data directly
   if (csr_timer_on) call cpu_time(csr_t0)
   if (gpu_csr_active) then
+    ! GPU path: kicks applied on device
     call csr_apply_kicks_gpu(ele, csr, bunch)
   else
+    ! CPU path: kicks applied to bunch%particle
     call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
   endif
 
@@ -573,7 +575,7 @@ call gpu_csr_bin_particles(h_charge_l, int(np_l, C_INT), &
     z_min_l, csr_in%dz_slice, dz_particle_l, &
     int(nb_l, C_INT), int(space_charge_com%particle_bin_span, C_INT))
 
-! Copy results into csr%slice
+! Copy results into csr%slice and compute edge_dcharge_density_dz
 do ii = 1, nb_l
   csr_in%slice(ii)%charge = h_bin_charge_l(ii)
   if (h_bin_n_particle_l(ii) > 0 .and. h_bin_charge_l(ii) /= 0) then
@@ -581,6 +583,11 @@ do ii = 1, nb_l
     csr_in%slice(ii)%y0 = h_bin_y0_wt_l(ii) / h_bin_charge_l(ii)
   endif
   csr_in%slice(ii)%n_particle = h_bin_n_particle_l(ii)
+  ! Compute charge density gradient (needed by csr_bin_kicks for CSR kick calculation)
+  if (ii > 1) then
+    csr_in%slice(ii)%edge_dcharge_density_dz = &
+      (csr_in%slice(ii)%charge - csr_in%slice(ii-1)%charge) / csr_in%dz_slice**2
+  endif
 enddo
 
 deallocate(h_charge_l, h_bin_charge_l, h_bin_x0_wt_l, h_bin_y0_wt_l, h_bin_n_particle_l)
