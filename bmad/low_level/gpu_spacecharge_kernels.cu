@@ -831,20 +831,20 @@ extern "C" void gpu_space_charge_3d_(
             d_sc_cgrn_c[c], dx, dy, dz, gamma, icomp,
             nx2, ny2, nz2, 0.0, 0.0, 0.0);
 
-        CUDA_SC_CHECK(cudaMemcpy(d_sc_cgrn2_c[c], d_sc_cgrn_c[c],
-            dbl_size * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToDevice));
+        /* Stencil writes to cgrn2, reads from cgrn (no D2D copy needed) */
         igf_stencil_kernel<<<blocks_s, threads>>>(
-            d_sc_cgrn2_c[c], d_sc_cgrn_c[c], nx2, ny2, nz2);
+            d_sc_cgrn_c[c], d_sc_cgrn2_c[c], nx2, ny2, nz2);
 
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn_c[c], d_sc_cgrn_c[c], CUFFT_FORWARD));
+        /* Subsequent pipeline uses cgrn2 (the stencil output) */
+        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_FORWARD));
 
         complex_multiply_kernel<<<blocks_d, threads>>>(
-            d_sc_crho, d_sc_cgrn_c[c], dbl_size);
+            d_sc_crho, d_sc_cgrn2_c[c], dbl_size);
 
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn_c[c], d_sc_cgrn_c[c], CUFFT_INVERSE));
+        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
 
         extract_field_kernel<<<blocks_m, threads>>>(
-            d_sc_cgrn_c[c], d_sc_efield + c*mesh_size,
+            d_sc_cgrn2_c[c], d_sc_efield + c*mesh_size,
             nx, ny, nz, nx2, ny2, nz2, scale);
     }
 
