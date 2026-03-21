@@ -441,6 +441,24 @@ call bmad_parser('lat_thick_multipole.bmad', lat)
 call run_comparison_test('Test 52: Thick multipole', lat, 1d-3, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 53: Plain wiggler
+! ======================================================================
+call bmad_parser('lat_wiggler_only.bmad', lat)
+call run_comparison_test('Test 53: Plain wiggler', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 54: Plain undulator
+! ======================================================================
+call bmad_parser('lat_undulator_only.bmad', lat)
+call run_comparison_test('Test 54: Plain undulator', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 55: Wiggler with misalignment
+! ======================================================================
+call bmad_parser('lat_wiggler_misalign.bmad', lat)
+call run_comparison_test('Test 55: Wiggler with misalignment', lat, tol, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *

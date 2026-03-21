@@ -1,0 +1,10 @@
+no_digested
+parameter[lattice] = "GPU tracking plain wiggler"
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 3e9
+parameter[particle] = electron
+parameter[geometry] = open
+wig1: wiggler, L = 2.0, b_max = 0.8, n_period = 20, l_period = 0.1, tracking_method = bmad_standard
+lat: line = (wig1)
+use, lat
