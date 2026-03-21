@@ -1,0 +1,19 @@
+no_digested
+
+parameter[lattice] = "GPU tracking bend with soft_edge_only fringe"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+d1: drift, L = 0.5
+b1: sbend, L = 1.0, g = 0.5, fringe_type = soft_edge_only,
+    fint = 0.5, hgap = 0.02, fintx = 0.4, hgapx = 0.025,
+    e1 = 0.1, e2 = 0.15
+
+lat: line = (d1, b1, d1)
+
+use, lat

@@ -374,6 +374,18 @@ call bmad_parser('lat_sext_aperture.bmad', lat)
 call run_aperture_test('Test 41: Sextupole with aperture', lat, 1d-4, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 42: Bend with sad_full fringe
+! ======================================================================
+call bmad_parser('lat_bend_sad_full.bmad', lat)
+call run_comparison_test('Test 42: Bend sad_full fringe', lat, 1d-6, n_pass, n_fail)
+
+! ======================================================================
+! TEST 43: Bend with soft_edge_only fringe
+! ======================================================================
+call bmad_parser('lat_bend_soft_edge.bmad', lat)
+call run_comparison_test('Test 43: Bend soft_edge_only fringe', lat, 1d-6, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *
