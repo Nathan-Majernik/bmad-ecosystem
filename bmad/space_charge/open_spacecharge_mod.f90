@@ -193,12 +193,14 @@ endif
 ! If allocated, check that the mesh sizes agree. Otherwise deallocate and below will allocate. 
 if (allocated(mesh3d%rho)) then
   nlo = mesh3d%nlo
-  nhi = mesh3d%nhi  
-  good_mesh_sizes= .true. 
-  do i=1, 3
-    if (lbound(mesh3d%rho, i) /= nlo(i) ) good_mesh_sizes = .false.
-    if (ubound(mesh3d%rho, i) /= nhi(i) ) good_mesh_sizes = .false.
-  enddo
+  nhi = mesh3d%nhi
+  good_mesh_sizes = allocated(mesh3d%rho)
+  if (good_mesh_sizes) then
+    do i=1, 3
+      if (lbound(mesh3d%rho, i) /= nlo(i) ) good_mesh_sizes = .false.
+      if (ubound(mesh3d%rho, i) /= nhi(i) ) good_mesh_sizes = .false.
+    enddo
+  endif
   
   if (.not. good_mesh_sizes) then
    ! print *, 'mesh size changed, deallocating'
