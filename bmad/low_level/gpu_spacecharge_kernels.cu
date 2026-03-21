@@ -821,32 +821,51 @@ extern "C" void gpu_space_charge_3d_(
         grn_cached_size = dbl_size;
     }
 
-    /* Launch all 3 components on the default stream (serialized but no sync between).
-     * Each component uses its own workspace so there's no data hazard. */
+    /* Launch all 3 E-field components concurrently using CUDA streams.
+     * Each component has its own workspace, FFT plan, and stream. */
+    static cudaStream_t sc_streams[3] = {0, 0, 0};
+    static cufftHandle sc_comp_plans[3] = {0, 0, 0};
+    static int sc_comp_nx2 = 0, sc_comp_ny2 = 0, sc_comp_nz2 = 0;
+    static int streams_created = 0;
+    if (!streams_created) {
+        for (int c = 0; c < 3; c++) cudaStreamCreate(&sc_streams[c]);
+        streams_created = 1;
+    }
+    /* Create per-component FFT plans if mesh size changed */
+    if (nx2 != sc_comp_nx2 || ny2 != sc_comp_ny2 || nz2 != sc_comp_nz2) {
+        for (int c = 0; c < 3; c++) {
+            if (sc_comp_plans[c]) cufftDestroy(sc_comp_plans[c]);
+            cufftPlan3d(&sc_comp_plans[c], nx2, ny2, nz2, CUFFT_Z2Z);
+            cufftSetStream(sc_comp_plans[c], sc_streams[c]);
+        }
+        sc_comp_nx2 = nx2; sc_comp_ny2 = ny2; sc_comp_nz2 = nz2;
+    }
+
     for (int icomp = 1; icomp <= 3; icomp++) {
         int c = icomp - 1;
-        CUDA_SC_CHECK(cudaMemset(d_sc_cgrn_c[c], 0, dbl_size * sizeof(cufftDoubleComplex)));
+        cudaMemsetAsync(d_sc_cgrn_c[c], 0, dbl_size * sizeof(cufftDoubleComplex), sc_streams[c]);
 
-        green_function_kernel<<<blocks_d, threads>>>(
+        green_function_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
             d_sc_cgrn_c[c], dx, dy, dz, gamma, icomp,
             nx2, ny2, nz2, 0.0, 0.0, 0.0);
 
-        /* Stencil writes to cgrn2, reads from cgrn (no D2D copy needed) */
-        igf_stencil_kernel<<<blocks_s, threads>>>(
+        igf_stencil_kernel<<<blocks_s, threads, 0, sc_streams[c]>>>(
             d_sc_cgrn_c[c], d_sc_cgrn2_c[c], nx2, ny2, nz2);
 
-        /* Subsequent pipeline uses cgrn2 (the stencil output) */
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_FORWARD));
+        CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_FORWARD));
 
-        complex_multiply_kernel<<<blocks_d, threads>>>(
+        complex_multiply_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
             d_sc_crho, d_sc_cgrn2_c[c], dbl_size);
 
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
+        CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
 
-        extract_field_kernel<<<blocks_m, threads>>>(
+        extract_field_kernel<<<blocks_m, threads, 0, sc_streams[c]>>>(
             d_sc_cgrn2_c[c], d_sc_efield + c*mesh_size,
             nx, ny, nz, nx2, ny2, nz2, scale);
     }
+
+    /* Sync all 3 streams before proceeding to interpolation on default stream */
+    for (int c = 0; c < 3; c++) cudaStreamSynchronize(sc_streams[c]);
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
     sc_interpolate_kick_kernel<<<blocks_p, threads>>>(

@@ -288,15 +288,25 @@ csr%actual_track_step = csr%ds_track_step * (csr%eleinfo(ele%ix_ele)%L_chord / e
 ! We check ele_gpu_eligible (body kernel exists) rather than ele_gpu_can_stay_on_device
 ! (which excludes CSR elements and elements with fringe — both handled by this routine).
 ! If data isn't already on device, upload it now.
+! GPU CSR path: use GPU for body tracking + binning + kicks when:
+! 1. GPU is available and element is eligible
+! 2. Particle count is large enough to amortize per-sub-step GPU overhead
+!    (below ~100K particles, the CPU is faster for CSR sub-stepping)
 gpu_csr_active = .false.
 if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
     .not. bmad_com%spin_tracking_on .and. &
-    bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+    bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
+    size(bunch%particle) >= 100000) then
   gpu_csr_active = .true.
-  ! Ensure data is on device (upload if not already there from previous element)
   if (.not. gpu_persist_on_device) then
     call gpu_persistent_seed(bunch, ele, force=.true.)
   endif
+endif
+
+! If GPU CSR is NOT active but data is on device from a previous element,
+! flush to CPU so the CPU CSR loop can access particle data.
+if (.not. gpu_csr_active .and. gpu_persist_on_device) then
+  call gpu_persistent_flush(bunch, ele)
 endif
 
 call save_a_bunch_step (ele, bunch, bunch_track, s_start)
