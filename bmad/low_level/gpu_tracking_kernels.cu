@@ -2190,58 +2190,104 @@ __global__ void exact_bend_fringe_kernel(
     vz[i] = X[4]; vpz[i] = X[5];
 }
 
-/* Hard multipole edge kick for bends (n_max=1, k1 only).
- * Port of hard_multipole_edge_kick for sbend$ with fringe_type=full$.
- * Uses complex polynomial: poly = (x+iy)^2, cab = charge_dir*k1/(12*rel_p) */
-__global__ void hard_bend_edge_kernel(
+/* General hard multipole edge kick (port of hard_multipole_edge_kick).
+ * Handles arbitrary n_max: n=1 for bends/quads (k1), n=2 for sextupoles (k2), etc.
+ * bp/ap arrays are in constant memory, indexed [0..n_max-1] for orders n=1..n_max. */
+#define MAX_HARD_MULTI_ORDER 8
+static __constant__ double c_hard_bp[MAX_HARD_MULTI_ORDER];
+static __constant__ double c_hard_ap[MAX_HARD_MULTI_ORDER];
+
+__global__ void hard_multipole_edge_kernel(
     double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
-    int *state, double k1, double charge_dir, int is_entrance, int n)
+    int *state, int n_max, double charge_dir, int is_entrance, int n_particles)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    if (i >= n_particles) return;
     if (state[i] != ALIVE_ST) return;
 
     double x = vx[i], y = vy[i], px = vpx[i], py = vpy[i];
     double rel_p = 1.0 + vpz[i];
     if (rel_p <= 0) return;
 
-    /* cab = charge_dir * k1 / (4 * (n+2) * rel_p) with n=1 -> / (12 * rel_p) */
-    double cab = charge_dir * k1 / (12.0 * rel_p);
-    if (is_entrance) cab = -cab;
+    /* Complex polynomial iteration: poly = (x+iy)^{n+1}, poly_n1 = (x+iy)^n */
+    double pn1_r = 1.0, pn1_i = 0.0;  /* poly_{n-1}, starts at 1 */
+    double poly_r = x, poly_i = y;     /* poly, starts at x+iy */
 
-    /* poly = (x+iy)^2 = (x^2 - y^2) + i(2xy) */
-    double pr = x*x - y*y, pi_val = 2.0*x*y;
+    double fx = 0, dfx_dx = 0, dfx_dy = 0;
+    double fy = 0, dfy_dx = 0, dfy_dy = 0;
 
-    /* cn = (n+3)/(n+1) = 4/2 = 2 for n=1 */
-    double cn = 2.0;
+    for (int nn = 1; nn <= n_max; nn++) {
+        /* Advance: poly_n1 = poly, poly = poly * (x+iy) */
+        pn1_r = poly_r; pn1_i = poly_i;
+        double new_r = poly_r * x - poly_i * y;
+        double new_i = poly_r * y + poly_i * x;
+        poly_r = new_r; poly_i = new_i;
 
-    /* fx = real(cab * poly * (x - cn*i*y)) */
-    /* (x - cn*i*y) = x - 2iy */
-    double xny_r = x, xny_i = -cn*y;
-    /* poly * xny = (pr + i*pi) * (xny_r + i*xny_i) */
-    double prod_r = pr*xny_r - pi_val*xny_i;
-    /* double prod_i = pr*xny_i + pi_val*xny_r;  // not needed for fx */
-    double fx = cab * prod_r;
+        double bp = c_hard_bp[nn - 1];
+        double ap = c_hard_ap[nn - 1];
+        if (bp == 0.0 && ap == 0.0) continue;
 
-    /* fy = real(cab * poly * (y + cn*i*x)) */
-    double xny2_r = y, xny2_i = cn*x;
-    double prod2_r = pr*xny2_r - pi_val*xny2_i;
-    double fy = cab * prod2_r;
+        /* cab = charge_dir * (bp + i*ap) / (4*(n+2)*rel_p) */
+        double scale = charge_dir / (4.0 * (nn + 2) * rel_p);
+        double cab_r = bp * scale;
+        double cab_i = ap * scale;
+        if (is_entrance) { cab_r = -cab_r; cab_i = -cab_i; }
 
-    /* Derivatives for the symplectic kick */
-    /* dpoly_dx = 2*(x+iy) = 2x + 2iy */
-    double dpr_dx = 2*x, dpi_dx = 2*y;
-    double dpr_dy = -2*y, dpi_dy = 2*x;
+        /* dpoly_dx = (n+1) * poly_n1 */
+        double dpx_r = (nn + 1) * pn1_r;
+        double dpx_i = (nn + 1) * pn1_i;
+        /* dpoly_dy = i * dpoly_dx */
+        double dpy_r = -dpx_i;
+        double dpy_i = dpx_r;
 
-    /* dfx_dx = real(cab * (dpoly_dx * xny + poly)) */
-    double dfx_dx = cab * (dpr_dx*xny_r - dpi_dx*xny_i + pr);
-    /* dfx_dy = real(cab * (dpoly_dy * xny + poly * dxny_dy)) where dxny_dy = -cn*i */
-    double dfx_dy = cab * (dpr_dy*xny_r - dpi_dy*xny_i + pr*0.0 - pi_val*(-cn));
-    /* dfy_dx = real(cab * (dpoly_dx * xny2 + poly * dxny2_dx)) where dxny2_dx = cn*i */
-    double dfy_dx = cab * (dpr_dx*xny2_r - dpi_dx*xny2_i + pr*0.0 - pi_val*(cn));
-    /* dfy_dy = real(cab * (dpoly_dy * xny2 + poly)) */
-    double dfy_dy = cab * (dpr_dy*xny2_r - dpi_dy*xny2_i + pr);
+        double cn = (double)(nn + 3) / (double)(nn + 1);
 
+        /* --- fx terms: xny = (x, -cn*y) --- */
+        double xny_r = x, xny_i = -cn * y;
+
+        /* poly * xny */
+        double pxny_r = poly_r * xny_r - poly_i * xny_i;
+        double pxny_i = poly_r * xny_i + poly_i * xny_r;
+        /* cab * poly * xny */
+        fx += cab_r * pxny_r - cab_i * pxny_i;
+
+        /* dfx_dx += Re(cab * (dpoly_dx * xny + poly)) */
+        double t1_r = dpx_r * xny_r - dpx_i * xny_i + poly_r;
+        double t1_i = dpx_r * xny_i + dpx_i * xny_r + poly_i;
+        dfx_dx += cab_r * t1_r - cab_i * t1_i;
+
+        /* dfx_dy += Re(cab * (dpoly_dy * xny + poly * dxny_dy))
+         * dxny_dy = (0, -cn) */
+        double pdxnydy_r = poly_i * cn;   /* Re(poly * (0 + -cn*i)) = poly_i * cn */
+        double pdxnydy_i = -poly_r * cn;  /* Im(poly * (0 + -cn*i)) = -poly_r * cn */
+        double t2_r = dpy_r * xny_r - dpy_i * xny_i + pdxnydy_r;
+        double t2_i = dpy_r * xny_i + dpy_i * xny_r + pdxnydy_i;
+        dfx_dy += cab_r * t2_r - cab_i * t2_i;
+
+        /* --- fy terms: xny2 = (y, cn*x) --- */
+        double xny2_r = y, xny2_i = cn * x;
+
+        /* poly * xny2 */
+        double pxny2_r = poly_r * xny2_r - poly_i * xny2_i;
+        double pxny2_i = poly_r * xny2_i + poly_i * xny2_r;
+        /* cab * poly * xny2 */
+        fy += cab_r * pxny2_r - cab_i * pxny2_i;
+
+        /* dfy_dx += Re(cab * (dpoly_dx * xny2 + poly * dxny2_dx))
+         * dxny2_dx = (0, cn) */
+        double pdxny2dx_r = -poly_i * cn;  /* Re(poly * (0 + cn*i)) = -poly_i * cn */
+        double pdxny2dx_i = poly_r * cn;   /* Im(poly * (0 + cn*i)) = poly_r * cn */
+        double t3_r = dpx_r * xny2_r - dpx_i * xny2_i + pdxny2dx_r;
+        double t3_i = dpx_r * xny2_i + dpx_i * xny2_r + pdxny2dx_i;
+        dfy_dx += cab_r * t3_r - cab_i * t3_i;
+
+        /* dfy_dy += Re(cab * (dpoly_dy * xny2 + poly)) */
+        double t4_r = dpy_r * xny2_r - dpy_i * xny2_i + poly_r;
+        double t4_i = dpy_r * xny2_i + dpy_i * xny2_r + poly_i;
+        dfy_dy += cab_r * t4_r - cab_i * t4_i;
+    }
+
+    /* Symplectic kick */
     double denom = (1.0 - dfx_dx) * (1.0 - dfy_dy) - dfx_dy * dfy_dx;
     if (fabs(denom) < 1e-30) return;
 
@@ -2252,14 +2298,18 @@ __global__ void hard_bend_edge_kernel(
     vz[i] = vz[i] + (vpx[i] * fx + vpy[i] * fy) / rel_p;
 }
 
-extern "C" void gpu_hard_bend_edge_(double k1, double charge_dir, int is_entrance, int n)
+extern "C" void gpu_hard_multipole_edge_(
+    double *h_bp, double *h_ap, int n_max,
+    double charge_dir, int is_entrance, int n_particles)
 {
-    if (n <= 0) return;
+    if (n_particles <= 0 || n_max <= 0 || n_max > MAX_HARD_MULTI_ORDER) return;
+    cudaMemcpyToSymbol(c_hard_bp, h_bp, n_max * sizeof(double));
+    cudaMemcpyToSymbol(c_hard_ap, h_ap, n_max * sizeof(double));
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
-    hard_bend_edge_kernel<<<blocks, threads>>>(
+    int blocks = (n_particles + threads - 1) / threads;
+    hard_multipole_edge_kernel<<<blocks, threads>>>(
         d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
-        d_state, k1, charge_dir, is_entrance, n);
+        d_state, n_max, charge_dir, is_entrance, n_particles);
     CUDA_CHECK_VOID(cudaGetLastError());
 }
 

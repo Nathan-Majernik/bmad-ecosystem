@@ -290,10 +290,12 @@ interface
     integer(C_INT), value, intent(in) :: fringe_type, edge, time_dir, n
   end subroutine
 
-  subroutine gpu_hard_bend_edge(k1, charge_dir, is_entrance, n) bind(C, name='gpu_hard_bend_edge_')
+  subroutine gpu_hard_multipole_edge(h_bp, h_ap, n_max, charge_dir, is_entrance, n_particles) &
+      bind(C, name='gpu_hard_multipole_edge_')
     use, intrinsic :: iso_c_binding
-    real(C_DOUBLE), value, intent(in) :: k1, charge_dir
-    integer(C_INT), value, intent(in) :: is_entrance, n
+    real(C_DOUBLE), intent(in) :: h_bp(*), h_ap(*)
+    integer(C_INT), value, intent(in) :: n_max, is_entrance, n_particles
+    real(C_DOUBLE), value, intent(in) :: charge_dir
   end subroutine
 
   subroutine gpu_exact_bend_fringe(g_tot, beta0, edge_angle, fint_signed, hgap, &
@@ -1751,9 +1753,16 @@ case (quadrupole$)
   ! Quad fringe handled on GPU, but electric pole fringe needs CPU
   if (associated(ele%a_pole_elec)) has_fringe_needs_cpu = .true.
 case (sextupole$)
-  ! Sextupole fringe falls back to CPU
+  ! Sextupole fringe: full$ and hard_edge_only$ handled on GPU via hard_multipole_edge
   call init_fringe_info(fringe_info, ele)
-  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
+  if (fringe_info%has_fringe) then
+    select case (nint(ele%value(fringe_type$)))
+    case (full$, hard_edge_only$)
+      ! Handled on GPU
+    case default
+      has_fringe_needs_cpu = .true.
+    end select
+  endif
 case (sbend$)
   ! Bend fringe: basic_bend$ and hard_edge_only$ are handled on GPU.
   ! Other fringe types (full$, sad_full$, soft_edge_only$, linear_edge$) need CPU.
@@ -2088,6 +2097,7 @@ integer, intent(in) :: edge
 integer :: fringe_type_val
 real(rp) :: charge_dir_val, k1_val
 real(rp) :: an_tmp(0:n_pole_maxx), bn_tmp(0:n_pole_maxx)
+real(C_DOUBLE) :: bp_arr(8), ap_arr(8)
 integer :: ix_tmp
 
 select case (ele%key)
@@ -2103,6 +2113,22 @@ case (quadrupole$)
                        charge_dir_val, &
                        int(fringe_type_val, C_INT), int(edge, C_INT), &
                        int(bunch%particle(1)%time_dir, C_INT), np)
+
+case (sextupole$)
+  fringe_type_val = nint(ele%value(fringe_type$))
+  if (fringe_type_val == none$) return
+  if (fringe_type_val /= full$ .and. fringe_type_val /= hard_edge_only$) return
+
+  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                   ele%orientation * bunch%particle(1)%direction
+  bp_arr = 0; ap_arr = 0
+  bp_arr(2) = ele%value(k2$)   ! n=2 only for sextupoles
+  block
+    integer :: is_ent
+    is_ent = merge(1, 0, edge == first_track_edge$)
+    call gpu_hard_multipole_edge(bp_arr, ap_arr, int(2, C_INT), charge_dir_val, &
+                                 int(is_ent, C_INT), np)
+  end block
 
 case (sbend$)
   fringe_type_val = nint(ele%value(fringe_type$))
@@ -2125,7 +2151,9 @@ case (sbend$)
       if (physical_end_exact == entrance_end$) then
         charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
                          ele%orientation * bunch%particle(1)%direction
-        call gpu_hard_bend_edge(ele%value(k1$), charge_dir_val, 1, np)
+        bp_arr = 0; ap_arr = 0
+        bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(1, C_INT), np)
       endif
 
       if (physical_end_exact == entrance_end$) then
@@ -2148,7 +2176,9 @@ case (sbend$)
       if (physical_end_exact == exit_end$) then
         charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
                          ele%orientation * bunch%particle(1)%direction
-        call gpu_hard_bend_edge(ele%value(k1$), charge_dir_val, 0, np)
+        bp_arr = 0; ap_arr = 0
+        bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(0, C_INT), np)
       endif
     end block
     return
