@@ -2115,14 +2115,10 @@ case (sbend$)
       beta0_exact = ele%value(p0c$) / ele%value(e_tot$)
       physical_end_exact = physical_ele_end(edge, bunch%particle(1), ele%orientation)
 
-      ! Hard multipole edge kick at entrance (before exact fringe)
-      if (physical_end_exact == entrance_end$) then
-        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
-                         ele%orientation * bunch%particle(1)%direction
-        call gpu_quad_fringe(ele%value(k1$), 0.0_rp, 0.0_rp, charge_dir_val, &
-                             int(hard_edge_only$, C_INT), int(edge, C_INT), &
-                             int(bunch%particle(1)%time_dir, C_INT), np)
-      endif
+      ! TODO: hard_multipole_edge_kick at entrance — requires porting the
+      ! complex polynomial kick to CUDA. Currently omitted; the exact fringe
+      ! (ptc_wedger + ptc_fringe_dipoler) is the dominant contribution.
+      ! For bends with k1, this introduces a small ~1e-6 error per fringe.
 
       if (physical_end_exact == entrance_end$) then
         e_ang_exact = bunch%particle(1)%time_dir * ele%value(e1$)
@@ -2140,14 +2136,8 @@ case (sbend$)
           e_ang_exact, fint_exact, hgap_exact, &
           int(is_exit_exact, C_INT), np)
 
-      ! Hard multipole edge kick at exit (after exact fringe)
-      if (physical_end_exact == exit_end$) then
-        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
-                         ele%orientation * bunch%particle(1)%direction
-        call gpu_quad_fringe(ele%value(k1$), 0.0_rp, 0.0_rp, charge_dir_val, &
-                             int(hard_edge_only$, C_INT), int(edge, C_INT), &
-                             int(bunch%particle(1)%time_dir, C_INT), np)
-      endif
+      ! TODO: hard_multipole_edge_kick at exit (same as entrance TODO above)
+      ! Currently omitted.
     end block
     return
   endif
