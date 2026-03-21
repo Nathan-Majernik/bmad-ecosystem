@@ -354,25 +354,27 @@ do i_step = 0, n_step
   csr%gamma2 = csr%gamma**2
   csr%rel_mass = mass_of(branch%param%particle) / m_electron
 
-  ! Bin particles — GPU path uses device data directly
-  if (gpu_csr_active) then
-    call csr_bin_particles_gpu(ele, bunch, csr, err_flag)
-  else
-    call csr_bin_particles (ele, bunch%particle, csr, err_flag)
+  ! Bin particles — only needed for CSR or slice SC (not for fft_3d-only)
+  if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
+    if (gpu_csr_active) then
+      call csr_bin_particles_gpu(ele, bunch, csr, err_flag)
+    else
+      call csr_bin_particles (ele, bunch%particle, csr, err_flag)
+    endif
+    if (err_flag) return
   endif
-  if (err_flag) return
 
-  csr%s_kick = s0_step
-  csr%s_chord_kick = s_ref_to_s_chord (s0_step, csr%eleinfo(ele%ix_ele))
-  z = csr%s_chord_kick
-  x = spline1(csr%eleinfo(ele%ix_ele)%spline, z)
-  theta_chord = csr%eleinfo(ele%ix_ele)%theta_chord
-  csr%floor_k%r = [x*cos(theta_chord)+z*sin(theta_chord), 0.0_rp, -x*sin(theta_chord)+z*cos(theta_chord)] + &
-                      csr%eleinfo(ele%ix_ele)%floor0%r
-  csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
-
-  ! ns = 0 is the unshielded kick.
-  ! csr_bin_kicks operates on bin-level data only (not per-particle), stays on CPU.
+  ! CSR kick computation — skip entirely for fft_3d-only elements
+  if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
+    csr%s_kick = s0_step
+    csr%s_chord_kick = s_ref_to_s_chord (s0_step, csr%eleinfo(ele%ix_ele))
+    z = csr%s_chord_kick
+    x = spline1(csr%eleinfo(ele%ix_ele)%spline, z)
+    theta_chord = csr%eleinfo(ele%ix_ele)%theta_chord
+    csr%floor_k%r = [x*cos(theta_chord)+z*sin(theta_chord), 0.0_rp, -x*sin(theta_chord)+z*cos(theta_chord)] + &
+                        csr%eleinfo(ele%ix_ele)%floor0%r
+    csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
+  endif
 
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
     do ns = 0, space_charge_com%n_shield_images
