@@ -799,47 +799,53 @@ extern "C" void gpu_space_charge_3d_(
     CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_crho, d_sc_crho, CUFFT_FORWARD));
     /* No sync needed -- next kernels on same stream */
 
-    /* --- Step 4: For each E-field component: Green function + FFT + multiply + IFFT --- */
+    /* --- Step 4: For each E-field component: Green function + FFT + multiply + IFFT ---
+     * Each component is independent (reads d_sc_crho, writes to its own d_sc_efield slice).
+     * Process all 3 concurrently using separate workspace buffers. */
     int blocks_d = (dbl_size + threads - 1) / threads;
-    double delta[3] = {dx, dy, dz};
+    int stencil_size = (nx2-1)*(ny2-1)*(nz2-1);
+    int blocks_s = (stencil_size + threads - 1) / threads;
+    double scale = SC_FPEI / (double)(nx2*ny2*nz2);
 
+    /* Allocate per-component Green function workspaces (cached) */
+    static cufftDoubleComplex *d_sc_cgrn_c[3] = {NULL, NULL, NULL};
+    static cufftDoubleComplex *d_sc_cgrn2_c[3] = {NULL, NULL, NULL};
+    static int grn_cached_size = 0;
+    if (dbl_size > grn_cached_size) {
+        size_t csz = (size_t)dbl_size * sizeof(cufftDoubleComplex);
+        for (int c = 0; c < 3; c++) {
+            if (d_sc_cgrn_c[c]) { cudaFree(d_sc_cgrn_c[c]); cudaFree(d_sc_cgrn2_c[c]); }
+            cudaMalloc((void**)&d_sc_cgrn_c[c], csz);
+            cudaMalloc((void**)&d_sc_cgrn2_c[c], csz);
+        }
+        grn_cached_size = dbl_size;
+    }
+
+    /* Launch all 3 components on the default stream (serialized but no sync between).
+     * Each component uses its own workspace so there's no data hazard. */
     for (int icomp = 1; icomp <= 3; icomp++) {
-        /* Compute Green function on device */
-        CUDA_SC_CHECK(cudaMemset(d_sc_cgrn, 0, dbl_size * sizeof(cufftDoubleComplex)));
+        int c = icomp - 1;
+        CUDA_SC_CHECK(cudaMemset(d_sc_cgrn_c[c], 0, dbl_size * sizeof(cufftDoubleComplex)));
 
         green_function_kernel<<<blocks_d, threads>>>(
-            d_sc_cgrn, dx, dy, dz, gamma, icomp,
+            d_sc_cgrn_c[c], dx, dy, dz, gamma, icomp,
             nx2, ny2, nz2, 0.0, 0.0, 0.0);
-        /* No sync -- D2D copy on same stream waits for kernel */
 
-        /* Apply IGF stencil */
-        int stencil_size = (nx2-1)*(ny2-1)*(nz2-1);
-        int blocks_s = (stencil_size + threads - 1) / threads;
-        CUDA_SC_CHECK(cudaMemcpy(d_sc_cgrn2, d_sc_cgrn,
+        CUDA_SC_CHECK(cudaMemcpy(d_sc_cgrn2_c[c], d_sc_cgrn_c[c],
             dbl_size * sizeof(cufftDoubleComplex), cudaMemcpyDeviceToDevice));
         igf_stencil_kernel<<<blocks_s, threads>>>(
-            d_sc_cgrn2, d_sc_cgrn, nx2, ny2, nz2);
-        /* No sync -- cuFFT on same stream waits for kernel */
+            d_sc_cgrn2_c[c], d_sc_cgrn_c[c], nx2, ny2, nz2);
 
-        /* FFT of Green function */
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn, d_sc_cgrn, CUFFT_FORWARD));
-        /* No sync -- next kernel on same stream */
+        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn_c[c], d_sc_cgrn_c[c], CUFFT_FORWARD));
 
-        /* Multiply in frequency domain */
         complex_multiply_kernel<<<blocks_d, threads>>>(
-            d_sc_crho, d_sc_cgrn, dbl_size);
-        /* No sync -- cuFFT on same stream waits for kernel */
+            d_sc_crho, d_sc_cgrn_c[c], dbl_size);
 
-        /* Inverse FFT */
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn, d_sc_cgrn, CUFFT_INVERSE));
-        /* No sync -- next kernel on same stream */
+        CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn_c[c], d_sc_cgrn_c[c], CUFFT_INVERSE));
 
-        /* Extract field component */
-        double scale = SC_FPEI / (double)(nx2*ny2*nz2);
         extract_field_kernel<<<blocks_m, threads>>>(
-            d_sc_cgrn, d_sc_efield + (icomp-1)*mesh_size,
+            d_sc_cgrn_c[c], d_sc_efield + c*mesh_size,
             nx, ny, nz, nx2, ny2, nz2, scale);
-        /* No sync needed within loop -- next iteration memset is on same stream */
     }
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
