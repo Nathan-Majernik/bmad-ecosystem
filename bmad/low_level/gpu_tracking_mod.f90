@@ -179,6 +179,12 @@ interface
     integer(C_INT), value, intent(in) :: n
   end subroutine
 
+  subroutine gpu_track_drift_dev_no_s(mc2, length, n) bind(C, name='gpu_track_drift_dev_no_s_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, length
+    integer(C_INT), value, intent(in) :: n
+  end subroutine
+
   subroutine gpu_track_sextupole(vx, vpx, vy, vpy, vz, vpz, &
                               state, beta, p0c, t_time, &
                               mc2, ele_length, delta_ref_time, &
@@ -2577,7 +2583,7 @@ case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   mc2 = mass_of(bunch%particle(1)%species)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
-  call gpu_track_drift_dev(gp_s, mc2, ele_length, np)
+  call gpu_track_drift_dev_no_s(mc2, ele_length, np)
 
 case (quadrupole$)
   ele_length = ele%value(l$)
@@ -2842,7 +2848,7 @@ case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   mc2 = mass_of(bunch%particle(1)%species)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
-  call gpu_track_drift_dev(gp_s, mc2, ele_length, n)
+  call gpu_track_drift_dev_no_s(mc2, ele_length, n)
   did_track = .true.
 
 case (quadrupole$)

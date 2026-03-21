@@ -1600,6 +1600,18 @@ extern "C" void gpu_track_drift_dev_(
     CUDA_CHECK_VOID(cudaMemcpy(h_s, d_s, db, cudaMemcpyDeviceToHost));
 }
 
+/* Drift body-only WITHOUT s-array transfer (for persistent/CSR path where
+ * gpu_s_update is called separately). Saves 16 MB of PCIe per sub-step. */
+extern "C" void gpu_track_drift_dev_no_s_(double mc2, double length, int n)
+{
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    drift_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_s, d_t, mc2, length, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
 /* Quad body-only: uploads multipoles, runs kernel */
 extern "C" void gpu_track_quad_dev_(
     double mc2, double b1, double ele_length,
