@@ -797,7 +797,11 @@ extern "C" void gpu_space_charge_3d_(
     /* No sync needed -- cuFFT on default stream is serialized */
 
     CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_crho, d_sc_crho, CUFFT_FORWARD));
-    /* No sync needed -- next kernels on same stream */
+
+    /* Record event on default stream so component streams can wait for charge FFT */
+    static cudaEvent_t sc_crho_ready = 0;
+    if (!sc_crho_ready) cudaEventCreate(&sc_crho_ready);
+    cudaEventRecord(sc_crho_ready, 0);  /* 0 = default stream */
 
     /* --- Step 4: For each E-field component: Green function + FFT + multiply + IFFT ---
      * Each component is independent (reads d_sc_crho, writes to its own d_sc_efield slice).
@@ -854,6 +858,8 @@ extern "C" void gpu_space_charge_3d_(
 
         CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_FORWARD));
 
+        /* Wait for charge density FFT on default stream before multiplying */
+        cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
         complex_multiply_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
             d_sc_crho, d_sc_cgrn2_c[c], dbl_size);
 
