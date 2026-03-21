@@ -916,20 +916,20 @@ extern "C" void gpu_space_charge_3d_(
         grn_cache_valid = 1;
     } else {
         /* Cache hit: skip Green fn computation. Multiply from cache + IFFT + extract.
-         * Serial on default stream (3 concurrent FFTs saturate L4 bandwidth). */
+         * Run on per-component streams for concurrency. */
         for (int icomp = 1; icomp <= 3; icomp++) {
             int c = icomp - 1;
-            complex_multiply_src_kernel<<<blocks_d, threads>>>(
+            cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
+            complex_multiply_src_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
                 d_sc_crho, d_sc_grn_cache[c], d_sc_cgrn2_c[c], dbl_size);
-            CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
-            extract_field_kernel<<<blocks_m, threads>>>(
+            CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
+            extract_field_kernel<<<blocks_m, threads, 0, sc_streams[c]>>>(
                 d_sc_cgrn2_c[c], d_sc_efield + c*mesh_size,
                 nx, ny, nz, nx2, ny2, nz2, scale);
         }
     }
 
-    /* Sync streams from cache-miss path */
-    if (!grn_hit) for (int c = 0; c < 3; c++) cudaStreamSynchronize(sc_streams[c]);
+    /* Sync all 3 component streams before interpolation on default stream */
     for (int c = 0; c < 3; c++) cudaStreamSynchronize(sc_streams[c]);
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
