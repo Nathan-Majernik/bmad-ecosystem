@@ -413,11 +413,11 @@ do i_step = 0, n_step
 
       csr%y_source = ns * space_charge_com%beam_chamber_height
 
-      if (gpu_csr_active) then
-        call csr_bin_kicks_gpu_wrap(ele, csr, err_flag)
-      else
-        call csr_bin_kicks (ele, s0_step, csr, err_flag)
-      endif
+      ! Always use CPU for bin kicks — it's O(n_bin) sequential root-findings
+      ! which is fast on CPU (~1ms). The GPU version has kernel launch + geometry
+      ! upload overhead that exceeds CPU compute, and poor warp efficiency from
+      ! divergent branching in the root-finding loop.
+      call csr_bin_kicks (ele, s0_step, csr, err_flag)
       if (err_flag) return
     enddo
   endif
