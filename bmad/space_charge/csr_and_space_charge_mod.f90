@@ -335,17 +335,25 @@ do i_step = 0, n_step
   if (i_step /= 0) then
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
     if (csr_timer_on) call cpu_time(csr_t0)
-    if (gpu_csr_active) then
-      ! Track the runt body on GPU (data already on device).
+    if (gpu_csr_active .and. ele_gpu_can_stay_on_device(ele)) then
+      ! GPU body-only: for elements that can stay on device (no unsupported fringe).
+      ! gpu_track_body_on_device skips fringe/misalignment — that's correct for
+      ! interior runts. For edge runts, the persistent session handles supported
+      ! fringe types (basic_bend, hard_edge_only, quad). Elements with full$ fringe
+      ! fail ele_gpu_can_stay_on_device and fall through to CPU path below.
       call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
       if (.not. gpu_did_track) then
-        ! GPU body failed for this runt — flush and fall back to CPU
         call gpu_persistent_flush(bunch, runt)
         gpu_csr_active = .false.
         call track1_bunch_hom (bunch, runt)
       endif
     else
+      ! CPU body: for non-GPU elements or elements with unsupported fringe.
+      ! track1_bunch_hom -> track1 handles fringe at element edges correctly.
+      if (gpu_persist_on_device) call gpu_persistent_flush(bunch, ele)
       call track1_bunch_hom (bunch, runt)
+      if (gpu_csr_active .and. .not. gpu_persist_on_device) &
+        call gpu_persistent_seed(bunch, ele, force=.true.)
     endif
     if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_body = csr_dt_body + (csr_t1 - csr_t0); endif
   endif
