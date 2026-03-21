@@ -1633,7 +1633,7 @@ extern "C" void gpu_track_quad_dev_(
         n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
         d_ea2, d_eb2, ix_elec_max);
     CUDA_CHECK_VOID(cudaGetLastError());
-    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+    /* sync removed -- persistent path launches next kernel on same stream */
 }
 
 /* Sextupole body-only: uploads multipoles, runs kernel */
@@ -1657,7 +1657,7 @@ extern "C" void gpu_track_sextupole_dev_(
         n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
         d_ea2, d_eb2, ix_elec_max);
     CUDA_CHECK_VOID(cudaGetLastError());
-    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+    /* sync removed -- persistent path launches next kernel on same stream */
 }
 
 /* Combined sextupole: upload, kernel, download */
@@ -1688,7 +1688,7 @@ extern "C" void gpu_track_sextupole_(
         n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
         d_ea2, d_eb2, ix_elec_max);
     CUDA_CHECK_VOID(cudaGetLastError());
-    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+    /* sync removed -- persistent path launches next kernel on same stream */
 
     download_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
                            h_state, h_beta, h_p0c, h_t, 1, 1);
@@ -1717,7 +1717,7 @@ extern "C" void gpu_track_bend_dev_(
         n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
         d_ea2, d_eb2, ix_elec_max);
     CUDA_CHECK_VOID(cudaGetLastError());
-    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+    /* sync removed -- persistent path launches next kernel on same stream */
 }
 
 /* Lcavity body-only: uploads step data, runs kernel */
