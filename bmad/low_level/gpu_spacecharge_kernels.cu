@@ -116,21 +116,25 @@ __global__ void sc_fused_pass1_kernel(
  * -------------------------------------------------------------------------- */
 __global__ void deposit_kernel(
     const double *x, const double *y, const double *z,
+    const double *beta, /* per-particle beta for z_adj computation */
     const double *charge, const int *state,
     double *rho,
     double xmin, double ymin, double zmin,
     double dxi, double dyi, double dzi,
     double dx, double dy, double dz,
     int nx, int ny, int nz,
+    double dct_ave, /* z_adj = z - dct_ave*beta */
     int n_particles)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_particles) return;
     if (state[i] != SC_ALIVE_ST) return;
 
+    double z_adj = z[i] - dct_ave * beta[i];
+
     int ip = (int)floor((x[i] - xmin) * dxi + 1.0) - 1;  /* 0-based */
     int jp = (int)floor((y[i] - ymin) * dyi + 1.0) - 1;
-    int kp = (int)floor((z[i] - zmin) * dzi + 1.0) - 1;
+    int kp = (int)floor((z_adj - zmin) * dzi + 1.0) - 1;
 
     /* Clamp to valid range */
     if (ip < 0) ip = 0; if (ip >= nx-1) ip = nx-2;
@@ -139,7 +143,7 @@ __global__ void deposit_kernel(
 
     double ab = ((xmin - x[i]) + (ip+1)*dx) * dxi;
     double de = ((ymin - y[i]) + (jp+1)*dy) * dyi;
-    double gh = ((zmin - z[i]) + (kp+1)*dz) * dzi;
+    double gh = ((zmin - z_adj) + (kp+1)*dz) * dzi;
 
     double q = charge[i];
 
@@ -771,16 +775,16 @@ extern "C" void gpu_space_charge_3d_(
     /* --- Step 2: Deposit particles on mesh --- */
     CUDA_SC_CHECK(cudaMemset(d_sc_rho, 0, mesh_size * sizeof(double)));
 
-    /* d_z_adj (= vz - dct_ave*beta) was already computed above for bounds.
-     * Reuse it for deposition -- no additional download needed. */
+    /* Deposit using raw z (dvec[4]) + beta. The kernel computes z_adj = z - dct_ave*beta
+     * internally, eliminating the need for a separate sc_compute_z_adj kernel. */
     int blocks_p = (n_particles + threads - 1) / threads;
 
     deposit_kernel<<<blocks_p, threads>>>(
-        dvec[0], dvec[2], d_z_adj,
+        dvec[0], dvec[2], dvec[4], dbeta,
         d_sc_charge, dstate,
         d_sc_rho,
         xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
-        nx, ny, nz, n_particles);
+        nx, ny, nz, dct_ave, n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
     /* No sync needed -- next operations are on same default stream */
 
