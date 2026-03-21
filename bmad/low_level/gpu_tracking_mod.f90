@@ -479,7 +479,8 @@ if (.not. ele%is_on) return
 
 ! Check supported element types
 select case (ele%key)
-case (drift$, quadrupole$, sextupole$, sbend$, lcavity$, pipe$, monitor$, instrument$)
+case (drift$, quadrupole$, sextupole$, sbend$, lcavity$, pipe$, monitor$, instrument$, &
+      kicker$, hkicker$, vkicker$, marker$)
   eligible = .true.
 end select
 
@@ -502,7 +503,7 @@ if (ele%value(l$) == 0) return
 
 ! Drifts, pipes, monitors, and instruments don't produce radiation
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$)
+case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   return
 end select
 
@@ -1699,10 +1700,11 @@ if (bmad_com%csr_and_space_charge_on) then
   if (ele%csr_method /= off$ .or. ele%space_charge_method /= off$) return
 endif
 
-! Pipe, monitor, and instrument elements can have multipoles that require
+! Pipe, monitor, instrument, kicker elements can have multipoles that require
 ! the pipe GPU path (quad kernel with b1=0). Without multipoles, they're
-! simple drifts and can stay on device.
-if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$) then
+! simple drifts and can stay on device. Markers are always zero-length no-ops.
+if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$ .or. &
+    ele%key == kicker$ .or. ele%key == hkicker$ .or. ele%key == vkicker$) then
   if (allocated(ele%multipole_cache)) then
     if (ele%multipole_cache%ix_pole_mag_max > -1 .or. &
         ele%multipole_cache%ix_kick_mag_max > -1 .or. &
@@ -1722,8 +1724,8 @@ endif
 ! Check for fringe that requires CPU
 has_fringe_needs_cpu = .false.
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$)
-  ! Drifts, pipes, monitors, and instruments never have fringe
+case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$)
+  ! These elements have no fringe or fringe is handled by the thick multipole path
 case (lcavity$)
   ! Lcavity fringe is already handled on GPU
 case (quadrupole$)
@@ -2134,7 +2136,7 @@ type (lat_param_struct), intent(in) :: param
 integer(C_INT), intent(in) :: np
 
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$)
+case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   call dispatch_drift_body(ele, np)
 case (quadrupole$)
   call dispatch_quad_body(ele, param, np)
@@ -2571,7 +2573,7 @@ type (lat_param_struct), intent(in) :: param
 integer(C_INT), intent(in) :: np
 
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$)
+case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   mc2 = mass_of(bunch%particle(1)%species)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
@@ -2836,7 +2838,7 @@ n = size(bunch%particle)
 if (n == 0) return
 
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$)
+case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   mc2 = mass_of(bunch%particle(1)%species)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
