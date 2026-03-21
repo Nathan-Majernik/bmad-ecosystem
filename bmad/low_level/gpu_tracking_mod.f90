@@ -28,6 +28,7 @@ public :: gpu_csr_bin_kicks
 public :: gpu_persistent_track_element, gpu_persistent_flush, gpu_persistent_seed
 public :: gpu_persist_on_device
 public :: gpu_track_body_on_device
+public :: gpu_multi_bunch_save, gpu_multi_bunch_restore, gpu_multi_bunch_cleanup
 
 ! Whether gpu_tracking_init has been called
 logical, save :: gpu_trk_initialized = .false.
@@ -42,6 +43,29 @@ real(rp), allocatable, save :: gp_vx(:), gp_vpx(:), gp_vy(:), gp_vpy(:)
 real(rp), allocatable, save :: gp_vz(:), gp_vpz(:)
 real(rp), allocatable, save :: gp_beta(:), gp_p0c(:), gp_t(:), gp_s(:)
 integer, allocatable, save :: gp_state(:)
+
+! --------------------------------------------------------------------------
+! Multi-bunch GPU buffer management
+!
+! When tracking multiple bunches, the single set of device buffers must be
+! shared. Rather than discarding device data when switching bunches, we save
+! the device state to per-bunch host-side slots and restore when switching back.
+! This avoids costly AoS-to-SoA re-conversion and keeps the GPU pipeline hot.
+! --------------------------------------------------------------------------
+
+integer, parameter :: MAX_GPU_BUNCHES = 64   ! Max bunches we cache
+
+type :: gpu_bunch_slot_struct
+  logical :: valid = .false.          ! Does this slot contain saved data?
+  integer :: n_particles = 0          ! Number of particles stored
+  integer(8) :: bunch_id = 0          ! Bunch fingerprint (memory address)
+  real(rp), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+  real(rp), allocatable :: beta(:), p0c(:), t(:), s(:)
+  integer, allocatable :: state(:)
+end type
+
+type (gpu_bunch_slot_struct), save :: gpu_bunch_slots(MAX_GPU_BUNCHES)
+integer, save :: gpu_active_slot = 0  ! Slot index currently on device (0 = none)
 
 #ifdef USE_GPU_TRACKING
 ! ----- C interfaces (gpu_tracking_kernels.cu) ---------------------------------
@@ -520,6 +544,30 @@ interface
   subroutine gpu_spacecharge_cleanup() bind(C, name='gpu_spacecharge_cleanup_')
   end subroutine
 
+  ! ----- Multi-bunch buffer save/restore -----
+
+  integer(C_INT) function gpu_save_bunch_buffers(vx, vpx, vy, vpy, vz, vpz, &
+                              state, beta, p0c, t_time, s_pos, n) bind(C, name='gpu_save_bunch_buffers_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(out) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(out) :: state(*)
+    real(C_DOUBLE), intent(out) :: beta(*), p0c(*), t_time(*), s_pos(*)
+    integer(C_INT), value, intent(in) :: n
+  end function
+
+  integer(C_INT) function gpu_restore_bunch_buffers(vx, vpx, vy, vpy, vz, vpz, &
+                              state, beta, p0c, t_time, s_pos, n) bind(C, name='gpu_restore_bunch_buffers_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(in) :: state(*)
+    real(C_DOUBLE), intent(in) :: beta(*), p0c(*), t_time(*), s_pos(*)
+    integer(C_INT), value, intent(in) :: n
+  end function
+
+  integer(C_INT) function gpu_get_buffer_cap() bind(C, name='gpu_get_buffer_cap_')
+    use, intrinsic :: iso_c_binding
+  end function
+
 end interface
 #endif
 
@@ -568,7 +616,11 @@ subroutine gpu_tracking_reset()
 #ifdef USE_GPU_TRACKING
 call gpu_tracking_cleanup()
 #endif
+call gpu_multi_bunch_cleanup()
 gpu_trk_initialized = .false.
+gpu_persist_on_device = .false.
+gpu_persist_bunch_id = 0
+gpu_active_slot = 0
 bmad_com%gpu_tracking_on = .false.
 end subroutine
 
@@ -3256,13 +3308,16 @@ if (n > gpu_persist_n) then
   gpu_persist_n = n
 endif
 
-! Detect new beam: if bunch identity changed (different allocation),
-! invalidate persistent state so we re-upload.
+! Detect bunch switch: if bunch identity changed (different allocation),
+! save current device data to its slot and try to restore the new bunch.
 block
   integer(8) :: bunch_id
   bunch_id = transfer(loc(bunch%particle(1)%vec(1)), bunch_id)
   if (gpu_persist_on_device .and. bunch_id /= gpu_persist_bunch_id) then
-    gpu_persist_on_device = .false.
+    ! Save current bunch's device data to its slot
+    call gpu_multi_bunch_save(gpu_persist_bunch_id, gpu_persist_n)
+    ! Try to restore the new bunch from a saved slot
+    call gpu_multi_bunch_restore(bunch_id, n, gpu_persist_on_device)
   endif
   gpu_persist_bunch_id = bunch_id
 end block
@@ -3663,6 +3718,19 @@ enddo
 bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
 gpu_persist_on_device = .false.
 
+! Invalidate the saved multi-bunch slot for this bunch so stale data isn't restored
+block
+  integer :: ib
+  integer(8) :: bid
+  bid = gpu_persist_bunch_id
+  do ib = 1, MAX_GPU_BUNCHES
+    if (gpu_bunch_slots(ib)%valid .and. gpu_bunch_slots(ib)%bunch_id == bid) then
+      gpu_bunch_slots(ib)%valid = .false.
+      exit
+    endif
+  enddo
+end block
+
 end subroutine gpu_persistent_flush
 
 !------------------------------------------------------------------------
@@ -3706,6 +3774,172 @@ gpu_persist_bunch_id = transfer(loc(bunch%particle(1)%vec(1)), gpu_persist_bunch
 #endif
 
 end subroutine gpu_persistent_seed
+
+!------------------------------------------------------------------------
+! gpu_multi_bunch_save — save current device buffers to a per-bunch slot
+!
+! Called when switching away from a bunch whose data is on device.
+! The device data is downloaded to a host-side slot indexed by bunch_id.
+!------------------------------------------------------------------------
+subroutine gpu_multi_bunch_save(bunch_id, n_part)
+
+use, intrinsic :: iso_c_binding
+
+integer(8), intent(in) :: bunch_id
+integer, intent(in) :: n_part
+
+#ifdef USE_GPU_TRACKING
+integer :: slot, i, oldest_slot
+integer(C_INT) :: rc
+
+! Find existing slot for this bunch_id, or allocate a new one
+slot = 0
+do i = 1, MAX_GPU_BUNCHES
+  if (gpu_bunch_slots(i)%valid .and. gpu_bunch_slots(i)%bunch_id == bunch_id) then
+    slot = i
+    exit
+  endif
+enddo
+
+! No existing slot found — find an empty one
+if (slot == 0) then
+  do i = 1, MAX_GPU_BUNCHES
+    if (.not. gpu_bunch_slots(i)%valid) then
+      slot = i
+      exit
+    endif
+  enddo
+endif
+
+! All slots full — reuse slot 1 (oldest)
+if (slot == 0) slot = 1
+
+! Ensure slot arrays are large enough
+if (.not. allocated(gpu_bunch_slots(slot)%vx) .or. &
+    size(gpu_bunch_slots(slot)%vx) < n_part) then
+  if (allocated(gpu_bunch_slots(slot)%vx)) then
+    deallocate(gpu_bunch_slots(slot)%vx, gpu_bunch_slots(slot)%vpx)
+    deallocate(gpu_bunch_slots(slot)%vy, gpu_bunch_slots(slot)%vpy)
+    deallocate(gpu_bunch_slots(slot)%vz, gpu_bunch_slots(slot)%vpz)
+    deallocate(gpu_bunch_slots(slot)%state)
+    deallocate(gpu_bunch_slots(slot)%beta, gpu_bunch_slots(slot)%p0c)
+    deallocate(gpu_bunch_slots(slot)%t, gpu_bunch_slots(slot)%s)
+  endif
+  allocate(gpu_bunch_slots(slot)%vx(n_part), gpu_bunch_slots(slot)%vpx(n_part))
+  allocate(gpu_bunch_slots(slot)%vy(n_part), gpu_bunch_slots(slot)%vpy(n_part))
+  allocate(gpu_bunch_slots(slot)%vz(n_part), gpu_bunch_slots(slot)%vpz(n_part))
+  allocate(gpu_bunch_slots(slot)%state(n_part))
+  allocate(gpu_bunch_slots(slot)%beta(n_part), gpu_bunch_slots(slot)%p0c(n_part))
+  allocate(gpu_bunch_slots(slot)%t(n_part), gpu_bunch_slots(slot)%s(n_part))
+endif
+
+! Download device buffers into the slot
+rc = gpu_save_bunch_buffers( &
+      gpu_bunch_slots(slot)%vx, gpu_bunch_slots(slot)%vpx, &
+      gpu_bunch_slots(slot)%vy, gpu_bunch_slots(slot)%vpy, &
+      gpu_bunch_slots(slot)%vz, gpu_bunch_slots(slot)%vpz, &
+      gpu_bunch_slots(slot)%state, &
+      gpu_bunch_slots(slot)%beta, gpu_bunch_slots(slot)%p0c, &
+      gpu_bunch_slots(slot)%t, gpu_bunch_slots(slot)%s, &
+      int(n_part, C_INT))
+
+if (rc == 0) then
+  gpu_bunch_slots(slot)%valid = .true.
+  gpu_bunch_slots(slot)%n_particles = n_part
+  gpu_bunch_slots(slot)%bunch_id = bunch_id
+  gpu_active_slot = slot
+endif
+#endif
+
+end subroutine gpu_multi_bunch_save
+
+!------------------------------------------------------------------------
+! gpu_multi_bunch_restore — restore a previously saved bunch to device
+!
+! Called when switching to a bunch that may have saved device state.
+! Sets was_restored=.true. if the bunch was found and restored, so the
+! caller knows data is on device and doesn't need a fresh upload.
+!------------------------------------------------------------------------
+subroutine gpu_multi_bunch_restore(bunch_id, n_part, was_restored)
+
+use, intrinsic :: iso_c_binding
+
+integer(8), intent(in) :: bunch_id
+integer, intent(in) :: n_part
+logical, intent(out) :: was_restored
+
+#ifdef USE_GPU_TRACKING
+integer :: i
+integer(C_INT) :: rc
+
+was_restored = .false.
+
+do i = 1, MAX_GPU_BUNCHES
+  if (gpu_bunch_slots(i)%valid .and. gpu_bunch_slots(i)%bunch_id == bunch_id .and. &
+      gpu_bunch_slots(i)%n_particles == n_part) then
+    ! Found saved data — upload it back to device
+    rc = gpu_restore_bunch_buffers( &
+          gpu_bunch_slots(i)%vx, gpu_bunch_slots(i)%vpx, &
+          gpu_bunch_slots(i)%vy, gpu_bunch_slots(i)%vpy, &
+          gpu_bunch_slots(i)%vz, gpu_bunch_slots(i)%vpz, &
+          gpu_bunch_slots(i)%state, &
+          gpu_bunch_slots(i)%beta, gpu_bunch_slots(i)%p0c, &
+          gpu_bunch_slots(i)%t, gpu_bunch_slots(i)%s, &
+          int(n_part, C_INT))
+    if (rc == 0) then
+      was_restored = .true.
+      gpu_active_slot = i
+      ! Also update the module-level SoA arrays so they stay consistent
+      ! (flush uses gp_vx etc. for the D->H transfer target)
+      if (n_part > gpu_persist_n) then
+        if (allocated(gp_vx)) deallocate(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
+                                          gp_state, gp_beta, gp_p0c, gp_t, gp_s)
+        allocate(gp_vx(n_part), gp_vpx(n_part), gp_vy(n_part), gp_vpy(n_part))
+        allocate(gp_vz(n_part), gp_vpz(n_part))
+        allocate(gp_state(n_part), gp_beta(n_part), gp_p0c(n_part), gp_t(n_part), gp_s(n_part))
+        gpu_persist_n = n_part
+      endif
+      ! Copy the slot's s array to gp_s for consistency with gpu_persistent_flush
+      gp_s(1:n_part) = gpu_bunch_slots(i)%s(1:n_part)
+    endif
+    return
+  endif
+enddo
+
+! Not found — caller will do a fresh upload
+was_restored = .false.
+#else
+was_restored = .false.
+#endif
+
+end subroutine gpu_multi_bunch_restore
+
+!------------------------------------------------------------------------
+! gpu_multi_bunch_cleanup — invalidate all saved bunch slots
+!
+! Should be called when the beam is re-initialized or when tracking
+! is complete, to free memory and prevent stale data.
+!------------------------------------------------------------------------
+subroutine gpu_multi_bunch_cleanup()
+
+integer :: i
+
+do i = 1, MAX_GPU_BUNCHES
+  gpu_bunch_slots(i)%valid = .false.
+  gpu_bunch_slots(i)%n_particles = 0
+  gpu_bunch_slots(i)%bunch_id = 0
+  if (allocated(gpu_bunch_slots(i)%vx)) then
+    deallocate(gpu_bunch_slots(i)%vx, gpu_bunch_slots(i)%vpx)
+    deallocate(gpu_bunch_slots(i)%vy, gpu_bunch_slots(i)%vpy)
+    deallocate(gpu_bunch_slots(i)%vz, gpu_bunch_slots(i)%vpz)
+    deallocate(gpu_bunch_slots(i)%state)
+    deallocate(gpu_bunch_slots(i)%beta, gpu_bunch_slots(i)%p0c)
+    deallocate(gpu_bunch_slots(i)%t, gpu_bunch_slots(i)%s)
+  endif
+enddo
+gpu_active_slot = 0
+
+end subroutine gpu_multi_bunch_cleanup
 
 !------------------------------------------------------------------------
 ! gpu_track_body_on_device — run ONLY the body kernel for an element

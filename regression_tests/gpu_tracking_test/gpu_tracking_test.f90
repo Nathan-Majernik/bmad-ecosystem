@@ -416,6 +416,19 @@ call bmad_parser('lat_bend_exact_multipole.bmad', lat)
 call run_comparison_test('Test 48: Bend exact_multipoles', lat, 1d-6, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 49: Multi-bunch tracking (3 bunches)
+! ======================================================================
+call bmad_parser('lat.bmad', lat)
+call run_multi_bunch_test('Test 49: Multi-bunch (3 bunches)', lat, tol, n_pass, n_fail, 3)
+
+! ======================================================================
+! TEST 50: Multi-bunch tracking (5 bunches, different lattice)
+! Kitchen sink has sextupoles which amplify small FP ordering differences
+! ======================================================================
+call bmad_parser('lat_kitchen_sink.bmad', lat)
+call run_multi_bunch_test('Test 50: Multi-bunch kitchen sink', lat, 1d-3, n_pass, n_fail, 5)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *
@@ -543,6 +556,70 @@ endif
 end subroutine run_aperture_test
 
 !------------------------------------------------------------------------
+! run_multi_bunch_test — track a multi-bunch beam on CPU and GPU, compare
+!------------------------------------------------------------------------
+subroutine run_multi_bunch_test(test_name, lat, tol, n_pass, n_fail, n_bunch)
+character(*), intent(in) :: test_name
+type (lat_struct), target, intent(inout) :: lat
+real(rp), intent(in) :: tol
+integer, intent(inout) :: n_pass, n_fail
+integer, intent(in) :: n_bunch
+
+type (beam_init_struct) :: mb_beam_init
+type (beam_struct) :: b_cpu, b_gpu
+type (branch_struct), pointer :: br
+real(rp) :: mdiff
+integer :: ib
+logical :: errf
+
+br => lat%branch(0)
+
+! Set up multi-bunch beam init
+mb_beam_init = beam_init
+mb_beam_init%n_bunch = n_bunch
+
+! Init identical beams
+call init_beam_distribution(br%ele(0), br%param, mb_beam_init, b_cpu, errf)
+call init_beam_distribution(br%ele(0), br%param, mb_beam_init, b_gpu, errf)
+do ib = 1, n_bunch
+  b_gpu%bunch(ib)%particle = b_cpu%bunch(ib)%particle
+enddo
+
+! CPU run
+bmad_com%gpu_tracking_on = .false.
+call track_beam(lat, b_cpu, err=errf)
+
+! GPU run
+bmad_com%gpu_tracking_on = .true.
+call track_beam(lat, b_gpu, err=errf)
+
+! Compare all bunches: coordinates and particle states
+mdiff = compute_max_diff_multi(b_cpu, b_gpu, n_bunch)
+
+! Also check for state mismatches across all bunches
+block
+  integer :: jb, jp, npp, n_state_mm
+  n_state_mm = 0
+  do jb = 1, n_bunch
+    npp = min(size(b_cpu%bunch(jb)%particle), size(b_gpu%bunch(jb)%particle))
+    do jp = 1, npp
+      if (b_cpu%bunch(jb)%particle(jp)%state /= b_gpu%bunch(jb)%particle(jp)%state) &
+        n_state_mm = n_state_mm + 1
+    enddo
+  enddo
+  if (mdiff < tol .and. n_state_mm == 0) then
+    print '(A,A,T50,A,ES10.2)', '  PASS  ', test_name, 'max_diff=', mdiff
+    n_pass = n_pass + 1
+  else
+    print '(A,A,T50,A,ES10.2,A,I4)', '  FAIL  ', test_name, 'max_diff=', mdiff, &
+          '  state_mm=', n_state_mm
+    n_fail = n_fail + 1
+  endif
+end block
+
+end subroutine run_multi_bunch_test
+
+!------------------------------------------------------------------------
 ! compute_max_diff — max absolute difference across all particle coords
 !------------------------------------------------------------------------
 function compute_max_diff(b1, b2) result(mdiff)
@@ -560,5 +637,30 @@ do j = 1, np
   mdiff = max(mdiff, abs(b1%bunch(1)%particle(j)%s - b2%bunch(1)%particle(j)%s))
 enddo
 end function compute_max_diff
+
+!------------------------------------------------------------------------
+! compute_max_diff_multi — max absolute difference across all bunches
+! Only compares particles that are alive in both beams.
+!------------------------------------------------------------------------
+function compute_max_diff_multi(b1, b2, n_bunch) result(mdiff)
+type (beam_struct), intent(in) :: b1, b2
+integer, intent(in) :: n_bunch
+real(rp) :: mdiff
+integer :: ib, j, k, np
+
+mdiff = 0
+do ib = 1, n_bunch
+  np = min(size(b1%bunch(ib)%particle), size(b2%bunch(ib)%particle))
+  do j = 1, np
+    if (b1%bunch(ib)%particle(j)%state /= alive$ .or. &
+        b2%bunch(ib)%particle(j)%state /= alive$) cycle
+    do k = 1, 6
+      mdiff = max(mdiff, abs(b1%bunch(ib)%particle(j)%vec(k) - b2%bunch(ib)%particle(j)%vec(k)))
+    enddo
+    mdiff = max(mdiff, abs(b1%bunch(ib)%particle(j)%t - b2%bunch(ib)%particle(j)%t))
+    mdiff = max(mdiff, abs(b1%bunch(ib)%particle(j)%s - b2%bunch(ib)%particle(j)%s))
+  enddo
+enddo
+end function compute_max_diff_multi
 
 end program gpu_tracking_test

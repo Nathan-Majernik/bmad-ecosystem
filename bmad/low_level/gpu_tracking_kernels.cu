@@ -4091,6 +4091,72 @@ extern "C" void gpu_orbit_check_(int n)
 }
 
 /* --------------------------------------------------------------------------
+ * gpu_save_bunch_buffers -- download current device particle buffers to
+ * caller-supplied host arrays so another bunch can use the device.
+ * Returns 0 on success, -1 on failure.
+ * -------------------------------------------------------------------------- */
+extern "C" int gpu_save_bunch_buffers_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t, double *h_s,
+    int n)
+{
+    if (n <= 0 || n > d_cap) return -1;
+    size_t db = (size_t)n * sizeof(double);
+    size_t ib = (size_t)n * sizeof(int);
+    CUDA_CHECK(cudaMemcpy(h_vx,    d_vec[0], db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_vpx,   d_vec[1], db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_vy,    d_vec[2], db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_vpy,   d_vec[3], db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_vz,    d_vec[4], db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_vpz,   d_vec[5], db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_state,  d_state,  ib, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_beta,   d_beta,   db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_p0c,    d_p0c,    db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_t,      d_t,      db, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_s,      d_s,      db, cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_restore_bunch_buffers -- upload previously saved host arrays back to
+ * device buffers so tracking can resume for this bunch.
+ * Calls ensure_buffers to (re-)allocate if needed.
+ * Returns 0 on success, -1 on failure.
+ * -------------------------------------------------------------------------- */
+extern "C" int gpu_restore_bunch_buffers_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t, double *h_s,
+    int n)
+{
+    if (n <= 0) return -1;
+    if (ensure_buffers(n) != 0) return -1;
+    size_t db = (size_t)n * sizeof(double);
+    size_t ib = (size_t)n * sizeof(int);
+    CUDA_CHECK(cudaMemcpy(d_vec[0], h_vx,    db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vec[1], h_vpx,   db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vec[2], h_vy,    db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vec[3], h_vpy,   db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vec[4], h_vz,    db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vec[5], h_vpz,   db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_state,  h_state,  ib, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_beta,   h_beta,   db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_p0c,    h_p0c,    db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_t,      h_t,      db, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_s,      h_s,      db, cudaMemcpyHostToDevice));
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_get_buffer_cap -- return current device buffer capacity (particles)
+ * -------------------------------------------------------------------------- */
+extern "C" int gpu_get_buffer_cap_(void)
+{
+    return d_cap;
+}
+
+/* --------------------------------------------------------------------------
  * gpu_tracking_cleanup -- release cached device buffers
  * -------------------------------------------------------------------------- */
 extern "C" void gpu_tracking_cleanup_(void)
