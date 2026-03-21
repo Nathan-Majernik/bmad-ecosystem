@@ -2369,6 +2369,232 @@ extern "C" void gpu_track_sol_quad_dev_(
     CUDA_CHECK_VOID(cudaGetLastError());
 }
 
+/* =========================================================================
+ * WIGGLER / UNDULATOR KERNEL
+ *
+ * Replicates track_a_wiggler for the averaged-field model (planar or helical).
+ * The tracking uses:
+ *   1. Averaged quadrupole focusing in each plane (k1x, k1y)
+ *   2. Octupole kicks at entrance and exit of each sub-step
+ *   3. quad_mat2_calc for the 2x2 body transfer in each plane
+ *   4. low_energy_z_correction
+ *   5. Final time correction for the undulating path length
+ *
+ * Parameters:
+ *   k1x, k1y   -- averaged focusing strengths (pre-computed on host)
+ *   kz          -- 2*pi / l_period
+ *   is_helical  -- 1 for helical_model$, 0 for planar_model$
+ *   osc_amp     -- osc_amplitude$ value
+ *   p0c_ele     -- ele%value(p0c$)
+ * ========================================================================= */
+
+__global__ void wiggler_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state, double *beta_arr, double *p0c_arr, double *t_arr,
+    double mc2, double ele_length,
+    double delta_ref_time, double e_tot_ele, double p0c_ele,
+    double k1x, double k1y, double kz, int is_helical,
+    double osc_amp,
+    int n_particles, int n_step,
+    /* Multipole parameters */
+    const double *d_a2, const double *d_b2, const double *d_cm,
+    int ix_mag_max,
+    const double *d_ea2, const double *d_eb2, int ix_elec_max)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_particles) return;
+    if (state[i] != ALIVE_ST) return;
+
+    int has_mag = (ix_mag_max >= 0);
+    int has_elec = (ix_elec_max >= 0);
+    double step_len = ele_length / (double)n_step;
+    double z_start = vz[i];
+    double t_start = t_arr[i];
+    double beta_val = beta_arr[i];
+    double p0c_val = p0c_arr[i];
+    double beta_ref = p0c_val / e_tot_ele;
+    double kz2 = kz * kz;
+
+    /* Entrance half magnetic multipole kick */
+    if (has_mag) {
+        double kx_m, ky_m;
+        multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                           vx[i], vy[i], &kx_m, &ky_m);
+        vpx[i] += 0.5 * kx_m;
+        vpy[i] += 0.5 * ky_m;
+    }
+
+    /* Entrance half electric multipole kick */
+    if (has_elec) {
+        double kx_e, ky_e;
+        multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                           vx[i], vy[i], &kx_e, &ky_e);
+        if (apply_electric_kick_dev(0.5 * kx_e / beta_val, 0.5 * ky_e / beta_val,
+                &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+    }
+
+    /* Body: n_step sub-steps */
+    for (int istep = 1; istep <= n_step; istep++) {
+
+        double rel_p = 1.0 + vpz[i];
+        double k1yy = k1y / (rel_p * rel_p);
+
+        /* Entrance half octupole kick */
+        double k3l = 2.0 * step_len * k1yy;
+        if (istep == 1) k3l *= 0.5;
+
+        vpy[i] += k3l * rel_p * kz2 * vy[i] * vy[i] * vy[i] / 3.0;
+        if (is_helical) {
+            vpx[i] += k3l * rel_p * kz2 * vx[i] * vx[i] * vx[i] / 3.0;
+        }
+
+        /* quad_mat2_calc for each plane */
+        double cx_x, sx_x, zc_x1, zc_x2, zc_x3;
+        double cx_y, sx_y, zc_y1, zc_y2, zc_y3;
+
+        if (is_helical) {
+            quad_mat2_calc_dev(k1yy, step_len, rel_p, &cx_x, &sx_x, &zc_x1, &zc_x2, &zc_x3);
+        } else {
+            quad_mat2_calc_dev(k1x / (rel_p * rel_p), step_len, rel_p, &cx_x, &sx_x, &zc_x1, &zc_x2, &zc_x3);
+        }
+        quad_mat2_calc_dev(k1yy, step_len, rel_p, &cx_y, &sx_y, &zc_y1, &zc_y2, &zc_y3);
+
+        /* Save pre-matrix coords for z update */
+        double x0 = vx[i], px0 = vpx[i];
+        double y0 = vy[i], py0 = vpy[i];
+
+        /* z update from quad focusing */
+        vz[i] += zc_x1*x0*x0 + zc_x2*x0*px0 + zc_x3*px0*px0 +
+                 zc_y1*y0*y0 + zc_y2*y0*py0 + zc_y3*py0*py0;
+
+        /* Apply 2x2 matrices */
+        double k_val_x = is_helical ? k1yy : k1x / (rel_p * rel_p);
+        vx[i]  = cx_x * x0 + (sx_x / rel_p) * px0;
+        vpx[i] = (k_val_x * sx_x * rel_p) * x0 + cx_x * px0;
+        vy[i]  = cx_y * y0 + (sx_y / rel_p) * py0;
+        vpy[i] = (k1yy * sx_y * rel_p) * y0 + cx_y * py0;
+
+        /* Low energy z correction */
+        vz[i] += low_energy_z_correction_dev(vpz[i], step_len, beta_val, beta_ref, mc2, e_tot_ele);
+
+        /* Exit half octupole kick */
+        k3l = 2.0 * step_len * k1yy;
+        if (istep == n_step) k3l *= 0.5;
+
+        vpy[i] += k3l * rel_p * kz2 * vy[i] * vy[i] * vy[i] / 3.0;
+        if (is_helical) {
+            vpx[i] += k3l * rel_p * kz2 * vx[i] * vx[i] * vx[i] / 3.0;
+        }
+
+        /* Magnetic multipole kick (half at last step, full otherwise) */
+        if (has_mag) {
+            double kx_m, ky_m;
+            multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                               vx[i], vy[i], &kx_m, &ky_m);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            vpx[i] += scl * kx_m;
+            vpy[i] += scl * ky_m;
+        }
+
+        /* Electric multipole kick (half at last step, full otherwise) */
+        if (has_elec) {
+            double kx_e, ky_e;
+            multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                               vx[i], vy[i], &kx_e, &ky_e);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            if (apply_electric_kick_dev(scl * kx_e / beta_val, scl * ky_e / beta_val,
+                    &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                    &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+        }
+    }
+
+    /* Final time: standard formula matching CPU */
+    double rel_p = 1.0 + vpz[i];
+    t_arr[i] = t_start + delta_ref_time + (z_start - vz[i]) / (beta_val * C_LIGHT);
+
+    /* Undulation path length correction -- matches CPU track_a_wiggler final section.
+     * For helical: factor = length * (kz * osc_amp)^2 / 2
+     * For planar:  factor = length * (kz * osc_amp)^2 / 4  */
+    double factor;
+    if (is_helical) {
+        factor = ele_length * (kz * osc_amp) * (kz * osc_amp) / 2.0;
+    } else {
+        factor = ele_length * (kz * osc_amp) * (kz * osc_amp) / 4.0;
+    }
+
+    t_arr[i] += factor / (C_LIGHT * beta_val * rel_p * rel_p);
+    vz[i]    += factor * (beta_val / beta_ref - 1.0 / (rel_p * rel_p));
+}
+
+/* =========================================================================
+ * HOST WRAPPER: gpu_track_wiggler (combined upload + body + download)
+ * ========================================================================= */
+extern "C" void gpu_track_wiggler_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t,
+    double mc2, double ele_length,
+    double delta_ref_time, double e_tot_ele, double p0c_ele,
+    double k1x, double k1y, double kz, int is_helical,
+    double osc_amp,
+    int n_particles, int n_step,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (ensure_buffers(n_particles) != 0) return;
+
+    if (upload_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                             h_state, h_beta, h_p0c, h_t) != 0) return;
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    wiggler_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ele_length, delta_ref_time, e_tot_ele, p0c_ele,
+        k1x, k1y, kz, is_helical, osc_amp,
+        n_particles, n_step,
+        d_a2, d_b2, d_cm, ix_mag_max,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    if (download_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                               h_state, h_beta, h_p0c, h_t,
+                               (ix_elec_max >= 0), 0) != 0) return;
+}
+
+/* Wiggler body-only: data already on device */
+extern "C" void gpu_track_wiggler_dev_(
+    double mc2, double ele_length,
+    double delta_ref_time, double e_tot_ele, double p0c_ele,
+    double k1x, double k1y, double kz, int is_helical,
+    double osc_amp,
+    int n_particles, int n_step,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    wiggler_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ele_length, delta_ref_time, e_tot_ele, p0c_ele,
+        k1x, k1y, kz, is_helical, osc_amp,
+        n_particles, n_step,
+        d_a2, d_b2, d_cm, ix_mag_max,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
 /* ==========================================================================
  * CURAND RNG STATE MANAGEMENT
  * ========================================================================== */

@@ -17,6 +17,7 @@ public :: track_bunch_thru_bend_gpu
 public :: track_bunch_thru_lcavity_gpu
 public :: track_bunch_thru_solenoid_gpu
 public :: track_bunch_thru_sol_quad_gpu
+public :: track_bunch_thru_wiggler_gpu
 public :: track_bunch_thru_pipe_gpu
 public :: check_entrance_aperture_for_gpu
 public :: gpu_rad_eligible
@@ -342,6 +343,53 @@ interface
     integer(C_INT), value, intent(in) :: ix_elec_max
   end subroutine
 
+  subroutine gpu_track_wiggler(vx, vpx, vy, vpy, vz, vpz, &
+                            state, beta, p0c, t_time, &
+                            mc2, ele_length, &
+                            delta_ref_time, e_tot_ele, p0c_ele, &
+                            k1x, k1y, kz, is_helical, &
+                            osc_amp, &
+                            n_particles, n_step, &
+                            a2_arr, b2_arr, cm_arr, &
+                            ix_mag_max, &
+                            ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_wiggler_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(inout) :: state(*)
+    real(C_DOUBLE), intent(inout) :: beta(*), p0c(*), t_time(*)
+    real(C_DOUBLE), value, intent(in) :: mc2, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele, p0c_ele
+    real(C_DOUBLE), value, intent(in) :: k1x, k1y, kz
+    integer(C_INT), value, intent(in) :: is_helical
+    real(C_DOUBLE), value, intent(in) :: osc_amp
+    integer(C_INT), value, intent(in) :: n_particles, n_step
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_wiggler_dev(mc2, ele_length, &
+                                 delta_ref_time, e_tot_ele, p0c_ele, &
+                                 k1x, k1y, kz, is_helical, &
+                                 osc_amp, &
+                                 n_particles, n_step, &
+                                 a2_arr, b2_arr, cm_arr, &
+                                 ix_mag_max, &
+                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_wiggler_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele, p0c_ele
+    real(C_DOUBLE), value, intent(in) :: k1x, k1y, kz
+    integer(C_INT), value, intent(in) :: is_helical
+    real(C_DOUBLE), value, intent(in) :: osc_amp
+    integer(C_INT), value, intent(in) :: n_particles, n_step
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
   subroutine gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
                                  ele_length, delta_ref_time, e_tot_ele, &
                                  rel_charge_dir, p0c_ele, n_particles, &
@@ -660,7 +708,8 @@ if (.not. ele%is_on) return
 ! Check supported element types
 select case (ele%key)
 case (drift$, quadrupole$, sextupole$, octupole$, thick_multipole$, sbend$, lcavity$, pipe$, &
-      monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$)
+      monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$, &
+      wiggler$, undulator$)
   eligible = .true.
 end select
 
@@ -2049,6 +2098,164 @@ enddo
 end subroutine track_bunch_thru_sol_quad_gpu
 
 !------------------------------------------------------------------------
+! track_bunch_thru_wiggler_gpu
+!
+! GPU batch tracking through a wiggler or undulator element.
+! Uses the averaged-field model: quadrupole focusing with octupole
+! kicks, matching track_a_wiggler.  Supports both planar and helical
+! field models.
+!------------------------------------------------------------------------
+subroutine track_bunch_thru_wiggler_gpu (bunch, ele, param, did_track)
+
+use multipole_mod, only: ab_multipole_kicks
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer, parameter :: n_multi = n_pole_maxx + 1
+integer(C_INT) :: n
+integer :: ix_mag_max, ix_elec_max, n_step, j
+real(rp) :: ele_length, mc2, delta_ref_time, e_tot_ele, p0c_ele_val
+real(rp) :: rel_tracking_charge, length
+real(rp) :: k1x_val, k1y_val, kz_val, ky2_val, factor_val, osc_amp_val
+integer(C_INT) :: is_helical_val
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+type (ele_struct), pointer :: field_ele
+type (fringe_field_info_struct) :: fringe_info
+logical :: has_misalign, apply_rad
+
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+
+real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:)
+integer(C_INT), allocatable :: state_a(:)
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+n = size(bunch%particle)
+if (n == 0) return
+ele_length = ele%value(l$)
+if (ele_length == 0) then
+  did_track = .true.
+  return
+endif
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+p0c_ele_val = ele%value(p0c$)
+osc_amp_val = ele%value(osc_amplitude$)
+
+has_misalign = ele%bookkeeping_state%has_misalign
+call init_fringe_info(fringe_info, ele)
+
+! Get field element to determine helical vs planar
+field_ele => pointer_to_field_ele(ele, 1)
+
+! Compute kz, ky2
+if (ele%value(l_period$) == 0) then
+  kz_val = 1d100
+  ky2_val = 0
+else
+  kz_val = twopi / ele%value(l_period$)
+  ky2_val = kz_val**2 + ele%value(kx$)**2
+endif
+
+! Compute averaged focusing strengths
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+factor_val = abs(rel_tracking_charge) * 0.5_rp * (c_light * ele%value(b_max$) / ele%value(p0c$))**2
+
+if (field_ele%field_calc == helical_model$) then
+  k1x_val = -factor_val
+  k1y_val = -factor_val
+  is_helical_val = 1
+else
+  k1x_val =  factor_val * (ele%value(kx$) / kz_val)**2
+  k1y_val = -factor_val * ky2_val / kz_val**2
+  is_helical_val = 0
+endif
+
+! Multipoles
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+n_step = max(nint(ele%value(l$) / ele%value(ds_step$)), 1)
+if (ix_mag_max < 0 .and. ix_elec_max < 0) n_step = 1
+
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) call ensure_rad_map(ele)
+
+! Entrance: misalignment on CPU
+allocate(vx(n), vpx(n), vy(n), vpy(n), vz(n), vpz(n))
+allocate(state_a(n), beta_a(n), p0c_a(n), t_a(n))
+
+if (has_misalign) call apply_misalign_to_bunch(bunch, ele, n, set$)
+
+call bunch_to_soa(bunch, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+
+! Precompute multipole arrays
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+did_track = .true.
+
+if (apply_rad .and. associated(ele%rad_map)) then
+  call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                            state_a, beta_a, p0c_a, t_a, n)
+  call call_gpu_rad_kick(n, ele%rad_map%rm0)
+  call gpu_track_wiggler_dev(mc2, ele_length, delta_ref_time, &
+                              e_tot_ele, p0c_ele_val, &
+                              k1x_val, k1y_val, kz_val, is_helical_val, &
+                              osc_amp_val, &
+                              n, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  call call_gpu_rad_kick(n, ele%rad_map%rm1)
+  call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, &
+                              n, merge(1, 0, ix_elec_max >= 0), 0)
+else
+  call gpu_track_wiggler(vx, vpx, vy, vpy, vz, vpz, &
+                      state_a, beta_a, p0c_a, t_a, &
+                      mc2, ele_length, &
+                      delta_ref_time, e_tot_ele, p0c_ele_val, &
+                      k1x_val, k1y_val, kz_val, is_helical_val, &
+                      osc_amp_val, &
+                      n, int(n_step, C_INT), &
+                      a2_arr, b2_arr, cm_arr, &
+                      int(ix_mag_max, C_INT), &
+                      ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+endif
+
+! Exit: SoA->AoS, misalignment
+call soa_to_bunch(bunch, ele, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, &
+                   .false., .false.)
+deallocate(vx, vpx, vy, vpy, vz, vpz)
+deallocate(state_a, beta_a, p0c_a, t_a)
+
+if (has_misalign) call apply_misalign_to_bunch(bunch, ele, n, unset$)
+
+do j = 1, n
+  if (bunch%particle(j)%state == alive$) then
+    bunch%particle(j)%s = ele%s
+  endif
+enddo
+#endif
+
+end subroutine track_bunch_thru_wiggler_gpu
+
+!------------------------------------------------------------------------
 ! track_bunch_thru_pipe_gpu
 !
 ! GPU batch tracking through a pipe element.  A pipe is tracked as a
@@ -2308,6 +2515,12 @@ case (sbend$)
 case (solenoid$, sol_quad$)
   ! Solenoid/sol_quad fringe requires apply_sol_fringe=.false. which needs CPU dispatch.
   ! For persistent on-device path, these always fall through to per-element tracking.
+  call init_fringe_info(fringe_info, ele)
+  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
+case (wiggler$, undulator$)
+  ! Wiggler/undulator: init_fringe_info always sets has_fringe=.true., but the actual
+  ! fringe is handled implicitly by the body tracking (offset_particle in CPU).
+  ! For persistent mode, conservatively require CPU dispatch.
   call init_fringe_info(fringe_info, ele)
   if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
 end select
@@ -2912,6 +3125,8 @@ case (solenoid$)
   call dispatch_solenoid_body(ele, param, np)
 case (sol_quad$)
   call dispatch_sol_quad_body(ele, param, np)
+case (wiggler$, undulator$)
+  call dispatch_wiggler_body(ele, param, np)
 end select
 
 end subroutine dispatch_body_kernel_on_device
@@ -3202,6 +3417,71 @@ else
                               ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 endif
 end subroutine dispatch_sol_quad_body
+
+!------------------------------------------------------------------------
+subroutine dispatch_wiggler_body(ele, param, np)
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+type (ele_struct), pointer :: field_ele
+real(rp) :: k1x_val, k1y_val, kz_val, factor_val, ky2_val, osc_amp_val, p0c_ele_val
+integer(C_INT) :: is_helical_val
+
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+p0c_ele_val = ele%value(p0c$)
+osc_amp_val = ele%value(osc_amplitude$)
+
+field_ele => pointer_to_field_ele(ele, 1)
+
+! Compute kz, ky2
+if (ele%value(l_period$) == 0) then
+  kz_val = 1d100
+  ky2_val = 0
+else
+  kz_val = twopi / ele%value(l_period$)
+  ky2_val = kz_val**2 + ele%value(kx$)**2
+endif
+
+! Compute averaged focusing strengths (sign-independent of charge and direction)
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+factor_val = abs(rel_tracking_charge) * 0.5_rp * (c_light * ele%value(b_max$) / ele%value(p0c$))**2
+
+if (field_ele%field_calc == helical_model$) then
+  k1x_val = -factor_val
+  k1y_val = -factor_val
+  is_helical_val = 1
+else
+  k1x_val =  factor_val * (ele%value(kx$) / kz_val)**2
+  k1y_val = -factor_val * ky2_val / kz_val**2
+  is_helical_val = 0
+endif
+
+! Multipoles
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = max(nint(ele%value(l$) / ele%value(ds_step$)), 1)
+if (ix_mag_max < 0 .and. ix_elec_max < 0) n_step = 1
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+call gpu_track_wiggler_dev(mc2, ele_length, delta_ref_time, &
+                            e_tot_ele, p0c_ele_val, &
+                            k1x_val, k1y_val, kz_val, is_helical_val, &
+                            osc_amp_val, &
+                            np, int(n_step, C_INT), &
+                            a2_arr, b2_arr, cm_arr, &
+                            int(ix_mag_max, C_INT), &
+                            ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+end subroutine dispatch_wiggler_body
 
 end subroutine track_bunch_thru_elements_gpu
 
@@ -3686,6 +3966,62 @@ case (sol_quad$)
                                 int(ix_mag_max, C_INT), &
                                 ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   endif
+
+case (wiggler$, undulator$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  block
+    type (ele_struct), pointer :: field_ele_p
+    real(rp) :: k1x_p, k1y_p, kz_p, factor_p, ky2_p, osc_amp_p, p0c_ele_p
+    integer(C_INT) :: is_helical_p
+
+    p0c_ele_p = ele%value(p0c$)
+    osc_amp_p = ele%value(osc_amplitude$)
+    field_ele_p => pointer_to_field_ele(ele, 1)
+
+    if (ele%value(l_period$) == 0) then
+      kz_p = 1d100
+      ky2_p = 0
+    else
+      kz_p = twopi / ele%value(l_period$)
+      ky2_p = kz_p**2 + ele%value(kx$)**2
+    endif
+
+    rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+    factor_p = abs(rel_tracking_charge) * 0.5_rp * (c_light * ele%value(b_max$) / ele%value(p0c$))**2
+
+    if (field_ele_p%field_calc == helical_model$) then
+      k1x_p = -factor_p
+      k1y_p = -factor_p
+      is_helical_p = 1
+    else
+      k1x_p =  factor_p * (ele%value(kx$) / kz_p)**2
+      k1y_p = -factor_p * ky2_p / kz_p**2
+      is_helical_p = 0
+    endif
+
+    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+    call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+    n_step = max(nint(ele%value(l$) / ele%value(ds_step$)), 1)
+    if (ix_mag_max < 0 .and. ix_elec_max < 0) n_step = 1
+
+    call precompute_multipole_arrays(bunch%particle(1), ele, &
+        ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+        ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+    call gpu_track_wiggler_dev(mc2, ele_length, delta_ref_time, &
+                                e_tot_ele, p0c_ele_p, &
+                                k1x_p, k1y_p, kz_p, is_helical_p, &
+                                osc_amp_p, &
+                                np, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  end block
 end select
 end subroutine
 
@@ -3970,6 +4306,10 @@ real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
 logical :: has_mag_multipoles, has_elec_multipoles
+! Wiggler scratch
+real(rp) :: k1x_wig, k1y_wig, kz_wig, ky2_wig, factor_wig, osc_amp_wig, p0c_ele_wig
+integer(C_INT) :: is_helical_wig
+type (ele_struct), pointer :: field_ele_wig
 ! Exact bend multipole scratch
 integer :: ix_exact_mag_max
 integer(C_INT) :: is_exact
@@ -4153,6 +4493,58 @@ case (sol_quad$)
                                 int(ix_mag_max, C_INT), &
                                 ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   endif
+  did_track = .true.
+
+case (wiggler$, undulator$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  p0c_ele_wig = ele%value(p0c$)
+  osc_amp_wig = ele%value(osc_amplitude$)
+
+  field_ele_wig => pointer_to_field_ele(ele, 1)
+
+  if (ele%value(l_period$) == 0) then
+    kz_wig = 1d100
+    ky2_wig = 0
+  else
+    kz_wig = twopi / ele%value(l_period$)
+    ky2_wig = kz_wig**2 + ele%value(kx$)**2
+  endif
+
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  factor_wig = abs(rel_tracking_charge) * 0.5_rp * (c_light * ele%value(b_max$) / ele%value(p0c$))**2
+
+  if (field_ele_wig%field_calc == helical_model$) then
+    k1x_wig = -factor_wig
+    k1y_wig = -factor_wig
+    is_helical_wig = 1
+  else
+    k1x_wig =  factor_wig * (ele%value(kx$) / kz_wig)**2
+    k1y_wig = -factor_wig * ky2_wig / kz_wig**2
+    is_helical_wig = 0
+  endif
+
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+  n_step = max(nint(ele%value(l$) / ele%value(ds_step$)), 1)
+  if (ix_mag_max < 0 .and. ix_elec_max < 0) n_step = 1
+
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+  call gpu_track_wiggler_dev(mc2, ele_length, delta_ref_time, &
+                              e_tot_ele, p0c_ele_wig, &
+                              k1x_wig, k1y_wig, kz_wig, is_helical_wig, &
+                              osc_amp_wig, &
+                              n, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   did_track = .true.
 end select
 
