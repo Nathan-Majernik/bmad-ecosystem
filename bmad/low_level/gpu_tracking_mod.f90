@@ -290,6 +290,12 @@ interface
     integer(C_INT), value, intent(in) :: fringe_type, edge, time_dir, n
   end subroutine
 
+  subroutine gpu_hard_bend_edge(k1, charge_dir, is_entrance, n) bind(C, name='gpu_hard_bend_edge_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: k1, charge_dir
+    integer(C_INT), value, intent(in) :: is_entrance, n
+  end subroutine
+
   subroutine gpu_exact_bend_fringe(g_tot, beta0, edge_angle, fint_signed, hgap, &
       is_exit, n) bind(C, name='gpu_exact_bend_fringe_')
     use, intrinsic :: iso_c_binding
@@ -2115,10 +2121,12 @@ case (sbend$)
       beta0_exact = ele%value(p0c$) / ele%value(e_tot$)
       physical_end_exact = physical_ele_end(edge, bunch%particle(1), ele%orientation)
 
-      ! TODO: hard_multipole_edge_kick at entrance — requires porting the
-      ! complex polynomial kick to CUDA. Currently omitted; the exact fringe
-      ! (ptc_wedger + ptc_fringe_dipoler) is the dominant contribution.
-      ! For bends with k1, this introduces a small ~1e-6 error per fringe.
+      ! Hard multipole edge kick at entrance (before exact fringe)
+      if (physical_end_exact == entrance_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        call gpu_hard_bend_edge(ele%value(k1$), charge_dir_val, 1, np)
+      endif
 
       if (physical_end_exact == entrance_end$) then
         e_ang_exact = bunch%particle(1)%time_dir * ele%value(e1$)
@@ -2136,8 +2144,12 @@ case (sbend$)
           e_ang_exact, fint_exact, hgap_exact, &
           int(is_exit_exact, C_INT), np)
 
-      ! TODO: hard_multipole_edge_kick at exit (same as entrance TODO above)
-      ! Currently omitted.
+      ! Hard multipole edge kick at exit (after exact fringe)
+      if (physical_end_exact == exit_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        call gpu_hard_bend_edge(ele%value(k1$), charge_dir_val, 0, np)
+      endif
     end block
     return
   endif

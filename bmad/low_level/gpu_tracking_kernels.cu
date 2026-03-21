@@ -2190,6 +2190,80 @@ __global__ void exact_bend_fringe_kernel(
     vz[i] = X[4]; vpz[i] = X[5];
 }
 
+/* Hard multipole edge kick for bends (n_max=1, k1 only).
+ * Port of hard_multipole_edge_kick for sbend$ with fringe_type=full$.
+ * Uses complex polynomial: poly = (x+iy)^2, cab = charge_dir*k1/(12*rel_p) */
+__global__ void hard_bend_edge_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state, double k1, double charge_dir, int is_entrance, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+
+    double x = vx[i], y = vy[i], px = vpx[i], py = vpy[i];
+    double rel_p = 1.0 + vpz[i];
+    if (rel_p <= 0) return;
+
+    /* cab = charge_dir * k1 / (4 * (n+2) * rel_p) with n=1 -> / (12 * rel_p) */
+    double cab = charge_dir * k1 / (12.0 * rel_p);
+    if (is_entrance) cab = -cab;
+
+    /* poly = (x+iy)^2 = (x^2 - y^2) + i(2xy) */
+    double pr = x*x - y*y, pi_val = 2.0*x*y;
+
+    /* cn = (n+3)/(n+1) = 4/2 = 2 for n=1 */
+    double cn = 2.0;
+
+    /* fx = real(cab * poly * (x - cn*i*y)) */
+    /* (x - cn*i*y) = x - 2iy */
+    double xny_r = x, xny_i = -cn*y;
+    /* poly * xny = (pr + i*pi) * (xny_r + i*xny_i) */
+    double prod_r = pr*xny_r - pi_val*xny_i;
+    /* double prod_i = pr*xny_i + pi_val*xny_r;  // not needed for fx */
+    double fx = cab * prod_r;
+
+    /* fy = real(cab * poly * (y + cn*i*x)) */
+    double xny2_r = y, xny2_i = cn*x;
+    double prod2_r = pr*xny2_r - pi_val*xny2_i;
+    double fy = cab * prod2_r;
+
+    /* Derivatives for the symplectic kick */
+    /* dpoly_dx = 2*(x+iy) = 2x + 2iy */
+    double dpr_dx = 2*x, dpi_dx = 2*y;
+    double dpr_dy = -2*y, dpi_dy = 2*x;
+
+    /* dfx_dx = real(cab * (dpoly_dx * xny + poly)) */
+    double dfx_dx = cab * (dpr_dx*xny_r - dpi_dx*xny_i + pr);
+    /* dfx_dy = real(cab * (dpoly_dy * xny + poly * dxny_dy)) where dxny_dy = -cn*i */
+    double dfx_dy = cab * (dpr_dy*xny_r - dpi_dy*xny_i + pr*0.0 - pi_val*(-cn));
+    /* dfy_dx = real(cab * (dpoly_dx * xny2 + poly * dxny2_dx)) where dxny2_dx = cn*i */
+    double dfy_dx = cab * (dpr_dx*xny2_r - dpi_dx*xny2_i + pr*0.0 - pi_val*(cn));
+    /* dfy_dy = real(cab * (dpoly_dy * xny2 + poly)) */
+    double dfy_dy = cab * (dpr_dy*xny2_r - dpi_dy*xny2_i + pr);
+
+    double denom = (1.0 - dfx_dx) * (1.0 - dfy_dy) - dfx_dy * dfy_dx;
+    if (fabs(denom) < 1e-30) return;
+
+    vx[i] = x - fx;
+    vpx[i] = px + ((1.0 - dfy_dy - denom) * px + dfy_dx * py) / denom;
+    vy[i] = y - fy;
+    vpy[i] = py + (dfx_dy * px + (1.0 - dfx_dx - denom) * py) / denom;
+    vz[i] = vz[i] + (vpx[i] * fx + vpy[i] * fy) / rel_p;
+}
+
+extern "C" void gpu_hard_bend_edge_(double k1, double charge_dir, int is_entrance, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    hard_bend_edge_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, k1, charge_dir, is_entrance, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
+
 extern "C" void gpu_exact_bend_fringe_(
     double g_tot, double beta0,
     double edge_angle, double fint_signed, double hgap,
