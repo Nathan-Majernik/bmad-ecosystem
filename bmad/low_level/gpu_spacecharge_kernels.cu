@@ -1055,8 +1055,17 @@ extern "C" void gpu_csr_bin_particles_(
             sc_charge_uploaded = 0;  /* force re-upload after realloc */
         }
     }
-    CUDA_SC_CHECK(cudaMemcpy(d_sc_charge, h_charge,
-        n_particles * sizeof(double), cudaMemcpyHostToDevice));
+    /* Cache charge upload — skip if same pointer and size (charge doesn't change between sub-steps) */
+    {
+        static const double *last_csr_h_charge = NULL;
+        static int last_csr_np = 0;
+        if (h_charge != last_csr_h_charge || n_particles != last_csr_np) {
+            CUDA_SC_CHECK(cudaMemcpy(d_sc_charge, h_charge,
+                n_particles * sizeof(double), cudaMemcpyHostToDevice));
+            last_csr_h_charge = h_charge;
+            last_csr_np = n_particles;
+        }
+    }
 
     /* Zero bin arrays */
     size_t bsz = n_bin * sizeof(double);

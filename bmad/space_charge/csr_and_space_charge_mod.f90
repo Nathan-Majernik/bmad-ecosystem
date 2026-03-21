@@ -296,7 +296,7 @@ gpu_csr_active = .false.
 if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
     .not. bmad_com%spin_tracking_on .and. &
     bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
-    size(bunch%particle) >= 100000) then
+    size(bunch%particle) >= 500000) then
   gpu_csr_active = .true.
   if (.not. gpu_persist_on_device) then
     call gpu_persistent_seed(bunch, ele, force=.true.)
@@ -507,15 +507,25 @@ do ii = 1, nb_l
   csr_in%slice(ii)%z1_edge  = csr_in%slice(ii)%z0_edge + csr_in%dz_slice
 enddo
 
-! Prepare per-particle charge array (host)
-allocate(h_charge_l(np_l))
-do ii = 1, np_l
-  if (bunch_in%particle(ii)%state == alive$) then
-    h_charge_l(ii) = bunch_in%particle(ii)%charge * charge_of(bunch_in%particle(ii)%species)
-  else
-    h_charge_l(ii) = 0
+! Prepare per-particle charge array (cached — doesn't change between sub-steps)
+block
+  real(C_DOUBLE), allocatable, save :: h_charge_cached_bin(:)
+  integer, save :: h_charge_cached_bin_n = 0
+  if (np_l /= h_charge_cached_bin_n) then
+    if (allocated(h_charge_cached_bin)) deallocate(h_charge_cached_bin)
+    allocate(h_charge_cached_bin(np_l))
+    do ii = 1, np_l
+      if (bunch_in%particle(ii)%state == alive$) then
+        h_charge_cached_bin(ii) = bunch_in%particle(ii)%charge * charge_of(bunch_in%particle(ii)%species)
+      else
+        h_charge_cached_bin(ii) = 0
+      endif
+    enddo
+    h_charge_cached_bin_n = np_l
   endif
-enddo
+  allocate(h_charge_l(np_l))
+  h_charge_l = h_charge_cached_bin
+end block
 
 ! GPU binning kernel (reads vz, vx, vy, state from device; outputs bin arrays to host)
 allocate(h_bin_charge_l(nb_l), h_bin_x0_wt_l(nb_l), h_bin_y0_wt_l(nb_l), h_bin_n_particle_l(nb_l))
