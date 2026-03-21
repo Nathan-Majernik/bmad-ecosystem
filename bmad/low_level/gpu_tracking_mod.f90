@@ -1398,7 +1398,20 @@ abs_time_flag = 0
 ref_time_start_val = 0.0_rp
 if (bmad_com%absolute_time_tracking) then
   abs_time_flag = 1
-  if (bmad_com%absolute_time_ref_shift) ref_time_start_val = lord%value(ref_time_start$)
+  if (bmad_com%absolute_time_ref_shift) then
+    ! For multipass slaves, use the first-pass element's ref_time_start
+    ! (matches this_rf_phase in track_a_lcavity.f90)
+    if (lord%slave_status == multipass_slave$) then
+      block
+        type (ele_pointer_struct), allocatable :: mp_chain(:)
+        integer :: ix_pass_mp, n_links_mp
+        call multipass_chain(lord, ix_pass_mp, n_links_mp, mp_chain)
+        ref_time_start_val = mp_chain(1)%ele%value(ref_time_start$)
+      end block
+    else
+      ref_time_start_val = lord%value(ref_time_start$)
+    endif
+  endif
 endif
 
 ! Extract step data from the lord's RF step array (indices 0..n_steps+1)
@@ -2265,7 +2278,20 @@ abs_time_flag = 0
 ref_time_start_val = 0.0_rp
 if (bmad_com%absolute_time_tracking) then
   abs_time_flag = 1
-  if (bmad_com%absolute_time_ref_shift) ref_time_start_val = lord%value(ref_time_start$)
+  if (bmad_com%absolute_time_ref_shift) then
+    ! For multipass slaves, use the first-pass element's ref_time_start
+    ! (matches this_rf_phase in track_a_lcavity.f90)
+    if (lord%slave_status == multipass_slave$) then
+      block
+        type (ele_pointer_struct), allocatable :: mp_chain(:)
+        integer :: ix_pass_mp, n_links_mp
+        call multipass_chain(lord, ix_pass_mp, n_links_mp, mp_chain)
+        ref_time_start_val = mp_chain(1)%ele%value(ref_time_start$)
+      end block
+    else
+      ref_time_start_val = lord%value(ref_time_start$)
+    endif
+  endif
 endif
 
 allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
@@ -2641,7 +2667,20 @@ case (lcavity$)
   ref_time_start_val = 0.0_rp
   if (bmad_com%absolute_time_tracking) then
     abs_time_flag = 1
-    if (bmad_com%absolute_time_ref_shift) ref_time_start_val = lord%value(ref_time_start$)
+    if (bmad_com%absolute_time_ref_shift) then
+    ! For multipass slaves, use the first-pass element's ref_time_start
+    ! (matches this_rf_phase in track_a_lcavity.f90)
+    if (lord%slave_status == multipass_slave$) then
+      block
+        type (ele_pointer_struct), allocatable :: mp_chain(:)
+        integer :: ix_pass_mp, n_links_mp
+        call multipass_chain(lord, ix_pass_mp, n_links_mp, mp_chain)
+        ref_time_start_val = mp_chain(1)%ele%value(ref_time_start$)
+      end block
+    else
+      ref_time_start_val = lord%value(ref_time_start$)
+    endif
+  endif
   endif
   allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
   allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
