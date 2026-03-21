@@ -878,7 +878,7 @@ extern "C" void gpu_space_charge_3d_(
         ds_step, gamma, mc2, dct_ave,
         n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
-    CUDA_SC_CHECK(cudaDeviceSynchronize());
+    /* No sync needed -- next GPU operation on same stream serializes. */
 
     /* d_z_adj is static -- not freed here, reused across calls */
 }
@@ -1128,7 +1128,7 @@ extern "C" void gpu_csr_apply_kicks_(
         apply_csr, apply_lsc,
         n_bin, n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
-    CUDA_SC_CHECK(cudaDeviceSynchronize());
+    /* No sync -- next kernel on same stream serializes. */
 }
 
 
