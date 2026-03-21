@@ -257,6 +257,21 @@ __global__ void complex_multiply_kernel(
     cgrn[i].y = ar*bi + ai*br;
 }
 
+/* 3-operand multiply: out = a * b (reads from separate source, no in-place) */
+__global__ void complex_multiply_src_kernel(
+    const cufftDoubleComplex *a,
+    const cufftDoubleComplex *b,
+    cufftDoubleComplex *out,
+    int n_total)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_total) return;
+    double ar = a[i].x, ai = a[i].y;
+    double br = b[i].x, bi = b[i].y;
+    out[i].x = ar*br - ai*bi;
+    out[i].y = ar*bi + ai*br;
+}
+
 /* --------------------------------------------------------------------------
  * Place rho (real) into one octant of doubled complex array.
  * -------------------------------------------------------------------------- */
@@ -811,22 +826,25 @@ extern "C" void gpu_space_charge_3d_(
     int blocks_s = (stencil_size + threads - 1) / threads;
     double scale = SC_FPEI / (double)(nx2*ny2*nz2);
 
-    /* Allocate per-component Green function workspaces (cached) */
-    static cufftDoubleComplex *d_sc_cgrn_c[3] = {NULL, NULL, NULL};
-    static cufftDoubleComplex *d_sc_cgrn2_c[3] = {NULL, NULL, NULL};
+    /* Allocate per-component workspaces + Green function cache */
+    static cufftDoubleComplex *d_sc_cgrn_c[3] = {NULL, NULL, NULL};   /* Green fn scratch */
+    static cufftDoubleComplex *d_sc_cgrn2_c[3] = {NULL, NULL, NULL};  /* multiply/IFFT workspace */
+    static cufftDoubleComplex *d_sc_grn_cache[3] = {NULL, NULL, NULL}; /* cached FFT'd Green fn */
     static int grn_cached_size = 0;
     if (dbl_size > grn_cached_size) {
         size_t csz = (size_t)dbl_size * sizeof(cufftDoubleComplex);
         for (int c = 0; c < 3; c++) {
-            if (d_sc_cgrn_c[c]) { cudaFree(d_sc_cgrn_c[c]); cudaFree(d_sc_cgrn2_c[c]); }
+            if (d_sc_cgrn_c[c]) cudaFree(d_sc_cgrn_c[c]);
+            if (d_sc_cgrn2_c[c]) cudaFree(d_sc_cgrn2_c[c]);
+            if (d_sc_grn_cache[c]) cudaFree(d_sc_grn_cache[c]);
             cudaMalloc((void**)&d_sc_cgrn_c[c], csz);
             cudaMalloc((void**)&d_sc_cgrn2_c[c], csz);
+            cudaMalloc((void**)&d_sc_grn_cache[c], csz);
         }
         grn_cached_size = dbl_size;
     }
 
-    /* Launch all 3 E-field components concurrently using CUDA streams.
-     * Each component has its own workspace, FFT plan, and stream. */
+    /* CUDA streams for concurrent E-field computation */
     static cudaStream_t sc_streams[3] = {0, 0, 0};
     static cufftHandle sc_comp_plans[3] = {0, 0, 0};
     static int sc_comp_nx2 = 0, sc_comp_ny2 = 0, sc_comp_nz2 = 0;
@@ -835,7 +853,6 @@ extern "C" void gpu_space_charge_3d_(
         for (int c = 0; c < 3; c++) cudaStreamCreate(&sc_streams[c]);
         streams_created = 1;
     }
-    /* Create per-component FFT plans if mesh size changed */
     if (nx2 != sc_comp_nx2 || ny2 != sc_comp_ny2 || nz2 != sc_comp_nz2) {
         for (int c = 0; c < 3; c++) {
             if (sc_comp_plans[c]) cufftDestroy(sc_comp_plans[c]);
@@ -845,32 +862,74 @@ extern "C" void gpu_space_charge_3d_(
         sc_comp_nx2 = nx2; sc_comp_ny2 = ny2; sc_comp_nz2 = nz2;
     }
 
-    for (int icomp = 1; icomp <= 3; icomp++) {
-        int c = icomp - 1;
-        cudaMemsetAsync(d_sc_cgrn_c[c], 0, dbl_size * sizeof(cufftDoubleComplex), sc_streams[c]);
+    /* Green function caching: depends only on dx, dy, dz*gamma, mesh dims.
+     * 0.1% tolerance — within a single element's sub-steps the grid spacing
+     * barely changes, so most sub-steps are cache hits. */
+    static double grn_cache_dx = 0, grn_cache_dy = 0, grn_cache_dz_rf = 0;
+    static int grn_cache_nx2 = 0, grn_cache_ny2 = 0, grn_cache_nz2 = 0;
+    static int grn_cache_valid = 0;
 
-        green_function_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
-            d_sc_cgrn_c[c], dx, dy, dz, gamma, icomp,
-            nx2, ny2, nz2, 0.0, 0.0, 0.0);
-
-        igf_stencil_kernel<<<blocks_s, threads, 0, sc_streams[c]>>>(
-            d_sc_cgrn_c[c], d_sc_cgrn2_c[c], nx2, ny2, nz2);
-
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_FORWARD));
-
-        /* Wait for charge density FFT on default stream before multiplying */
-        cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
-        complex_multiply_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
-            d_sc_crho, d_sc_cgrn2_c[c], dbl_size);
-
-        CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
-
-        extract_field_kernel<<<blocks_m, threads, 0, sc_streams[c]>>>(
-            d_sc_cgrn2_c[c], d_sc_efield + c*mesh_size,
-            nx, ny, nz, nx2, ny2, nz2, scale);
+    double dz_rf = dz * gamma;
+    int grn_hit = 0;
+    if (grn_cache_valid &&
+        grn_cache_nx2 == nx2 && grn_cache_ny2 == ny2 && grn_cache_nz2 == nz2) {
+        double rdx = fabs(dx - grn_cache_dx) / (fabs(grn_cache_dx) + 1e-30);
+        double rdy = fabs(dy - grn_cache_dy) / (fabs(grn_cache_dy) + 1e-30);
+        double rdz = fabs(dz_rf - grn_cache_dz_rf) / (fabs(grn_cache_dz_rf) + 1e-30);
+        grn_hit = (rdx < 1e-3 && rdy < 1e-3 && rdz < 1e-3);
     }
 
-    /* Sync all 3 streams before proceeding to interpolation on default stream */
+    if (!grn_hit) {
+        /* Cache miss: compute Green function FFTs, cache, then multiply+IFFT */
+        for (int icomp = 1; icomp <= 3; icomp++) {
+            int c = icomp - 1;
+
+            green_function_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
+                d_sc_cgrn_c[c], dx, dy, dz, gamma, icomp,
+                nx2, ny2, nz2, 0.0, 0.0, 0.0);
+
+            cudaMemsetAsync(d_sc_cgrn2_c[c], 0, dbl_size * sizeof(cufftDoubleComplex), sc_streams[c]);
+
+            igf_stencil_kernel<<<blocks_s, threads, 0, sc_streams[c]>>>(
+                d_sc_cgrn_c[c], d_sc_cgrn2_c[c], nx2, ny2, nz2);
+
+            CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_FORWARD));
+
+            /* Save to cache */
+            cudaMemcpyAsync(d_sc_grn_cache[c], d_sc_cgrn2_c[c],
+                (size_t)dbl_size * sizeof(cufftDoubleComplex),
+                cudaMemcpyDeviceToDevice, sc_streams[c]);
+
+            /* Multiply with charge FFT + IFFT + extract */
+            cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
+            complex_multiply_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
+                d_sc_crho, d_sc_cgrn2_c[c], dbl_size);
+
+            CUFFT_SC_CHECK(cufftExecZ2Z(sc_comp_plans[c], d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
+
+            extract_field_kernel<<<blocks_m, threads, 0, sc_streams[c]>>>(
+                d_sc_cgrn2_c[c], d_sc_efield + c*mesh_size,
+                nx, ny, nz, nx2, ny2, nz2, scale);
+        }
+        grn_cache_dx = dx; grn_cache_dy = dy; grn_cache_dz_rf = dz_rf;
+        grn_cache_nx2 = nx2; grn_cache_ny2 = ny2; grn_cache_nz2 = nz2;
+        grn_cache_valid = 1;
+    } else {
+        /* Cache hit: skip Green fn computation. Multiply from cache + IFFT + extract.
+         * Serial on default stream (3 concurrent FFTs saturate L4 bandwidth). */
+        for (int icomp = 1; icomp <= 3; icomp++) {
+            int c = icomp - 1;
+            complex_multiply_src_kernel<<<blocks_d, threads>>>(
+                d_sc_crho, d_sc_grn_cache[c], d_sc_cgrn2_c[c], dbl_size);
+            CUFFT_SC_CHECK(cufftExecZ2Z(sc_fft_plan, d_sc_cgrn2_c[c], d_sc_cgrn2_c[c], CUFFT_INVERSE));
+            extract_field_kernel<<<blocks_m, threads>>>(
+                d_sc_cgrn2_c[c], d_sc_efield + c*mesh_size,
+                nx, ny, nz, nx2, ny2, nz2, scale);
+        }
+    }
+
+    /* Sync streams from cache-miss path */
+    if (!grn_hit) for (int c = 0; c < 3; c++) cudaStreamSynchronize(sc_streams[c]);
     for (int c = 0; c < 3; c++) cudaStreamSynchronize(sc_streams[c]);
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
