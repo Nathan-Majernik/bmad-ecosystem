@@ -315,12 +315,26 @@ call save_a_bunch_step (ele, bunch, bunch_track, s_start)
 ! GPU path: when data is on device, use GPU kernels for body tracking,
 ! binning, and kick application. The bin-level kick computation stays on CPU.
 
+! CSR sub-step timing (controlled by environment variable CSR_TIMER)
+block
+real(rp) :: csr_t0, csr_t1
+real(rp), save :: csr_dt_body = 0, csr_dt_bin = 0, csr_dt_kicks = 0, csr_dt_apply = 0
+integer, save :: csr_n_steps_total = 0
+logical, save :: csr_timer_on = .false., csr_timer_checked = .false.
+character(8) :: csr_timer_env
+if (.not. csr_timer_checked) then
+  call get_environment_variable('CSR_TIMER', csr_timer_env)
+  csr_timer_on = (csr_timer_env == '1' .or. csr_timer_env == 'Y')
+  csr_timer_checked = .true.
+endif
+
 do i_step = 0, n_step
 
   ! track through the runt
 
   if (i_step /= 0) then
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
+    if (csr_timer_on) call cpu_time(csr_t0)
     if (gpu_csr_active) then
       ! Track the runt body on GPU (data already on device).
       call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
@@ -333,6 +347,7 @@ do i_step = 0, n_step
     else
       call track1_bunch_hom (bunch, runt)
     endif
+    if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_body = csr_dt_body + (csr_t1 - csr_t0); endif
   endif
 
   s0_step = i_step * csr%ds_track_step
@@ -363,11 +378,13 @@ do i_step = 0, n_step
 
   ! Bin particles — only needed for CSR or slice SC (not for fft_3d-only)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
+    if (csr_timer_on) call cpu_time(csr_t0)
     if (gpu_csr_active) then
       call csr_bin_particles_gpu(ele, bunch, csr, err_flag)
     else
       call csr_bin_particles (ele, bunch%particle, csr, err_flag)
     endif
+    if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_bin = csr_dt_bin + (csr_t1 - csr_t0); endif
     if (err_flag) return
   endif
 
@@ -383,6 +400,7 @@ do i_step = 0, n_step
     csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
   endif
 
+  if (csr_timer_on) call cpu_time(csr_t0)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
     do ns = 0, space_charge_com%n_shield_images
       ! The factor of -1^ns accounts for the sign of the image currents
@@ -404,12 +422,18 @@ do i_step = 0, n_step
     enddo
   endif
 
+  if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_kicks = csr_dt_kicks + (csr_t1 - csr_t0); endif
+
   ! Apply kicks to particles — GPU path modifies device data directly
+  if (csr_timer_on) call cpu_time(csr_t0)
   if (gpu_csr_active) then
     call csr_apply_kicks_gpu(ele, csr, bunch)
   else
     call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
   endif
+
+  if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_apply = csr_dt_apply + (csr_t1 - csr_t0); endif
+  csr_n_steps_total = csr_n_steps_total + 1
 
   call save_a_bunch_step (ele, bunch, bunch_track, s0_step)
 
@@ -442,6 +466,16 @@ do i_step = 0, n_step
   endif
 
 enddo
+
+! Print CSR timer summary every 100 sub-steps
+if (csr_timer_on .and. mod(csr_n_steps_total, 10) == 0 .and. csr_n_steps_total > 0) then
+  print '(A,I6,A,F8.3,A,F8.3,A,F8.3,A,F8.3)', &
+    ' CSR_TIMER steps=', csr_n_steps_total, &
+    '  body=', csr_dt_body, '  bin=', csr_dt_bin, &
+    '  kicks=', csr_dt_kicks, '  apply=', csr_dt_apply
+endif
+
+end block  ! CSR timer block
 
 err = .false.
 
