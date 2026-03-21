@@ -55,6 +55,184 @@
 #define LOST_POS_Y 6  /* lost_pos_y$ */
 #define LOST_PZ   8   /* lost_pz$ */
 
+/* ==========================================================================
+ * BEND EXACT MULTIPOLE FIELD COMPUTATION
+ *
+ * Ported from bmad/code/bend_exact_multipole_field.f90.
+ * Uses the F_coef table (Pade approximant / exact log formulas) to compute
+ * the magnetic field in a curved reference frame (bend).  The curvature of
+ * the reference orbit modifies Maxwell's equations, so the standard flat-
+ * geometry multipole kick is not correct for bends.
+ *
+ * The F_coef table has 23 entries (orders 0..22).  Each entry contains
+ * coefficients for F_value (the radial function) and F_derivative (used
+ * for Bx).  Near x*g = 0, a Pade approximant is used for numerical
+ * stability; outside the cutoff region, the exact log formula is used.
+ * ========================================================================== */
+
+/* Packed structure for one F_coef entry -- all arrays laid out flat */
+struct FCoefEntry {
+    int    order;
+    double cutoff_minus, cutoff_plus;
+    int    n_exact_non;
+    double exact_non_coef[12];  /* 0..11 */
+    int    n_exact_log;
+    double exact_log_coef[11];  /* 0..10 */
+    int    n_pade_numer;
+    double pade_numer_coef[8];  /* 0..7 */
+    int    n_pade_denom;
+    double pade_denom_coef[9];  /* 0..8 */
+};
+
+/* F_coef table -- 23 entries, orders 0..22.
+ * Transcribed from bend_exact_multipole_field.f90 F_coef(0:22). */
+__constant__ struct FCoefEntry d_F_coef[23] = {
+    /* order 0 */
+    {0, 0, 0,   0, {0,0,0,0,0,0,0,0,0,0,0,0},  0, {0,0,0,0,0,0,0,0,0,0,0},
+     0, {0,0,0,0,0,0,0,0},  0, {0,0,0,0,0,0,0,0,0}},
+    /* order 1 */
+    {1, -0.01, 0.01,
+     -1, {0,0,0,0,0,0,0,0,0,0,0,0},
+     0, {1.0,0,0,0,0,0,0,0,0,0,0},
+     3, {1.0, 0.83333333333333, 0.066666666666667, -0.0055555555555556, 0,0,0,0},
+     2, {1.0, 1.3333333333333, 0.4, 0,0,0,0,0,0}},
+    /* order 2 */
+    {2, -0.0224, 0.0316,
+     1, {-0.5, 0.5, 0,0,0,0,0,0,0,0,0,0},
+     0, {-1.0, 0,0,0,0,0,0,0,0,0,0},
+     4, {1.0, 1.1666666666667, 0.28571428571429, -0.0035714285714286, 0.0005952380952381, 0,0,0},
+     2, {1.0, 1.5, 0.53571428571429, 0,0,0,0,0,0}},
+    /* order 3 */
+    {3, -0.0794, 0.1,
+     1, {1.5, -1.5, 0,0,0,0,0,0,0,0,0,0},
+     1, {1.5, 1.5, 0,0,0,0,0,0,0,0,0},
+     4, {1.0, 1.3834196891192, 0.48255613126079, 0.022366148531952, -0.0010270170244264, 0,0,0},
+     3, {1.0, 1.8834196891192, 1.0742659758204, 0.17530224525043, 0,0,0,0,0}},
+    /* order 4 */
+    {4, -0.15, 0.178,
+     2, {-1.875, 1.5, 0.375, 0,0,0,0,0,0,0,0,0},
+     1, {-1.5, -3.0, 0,0,0,0,0,0,0,0,0},
+     4, {1.0, 1.9565979090138, 1.267864573968, 0.30992013543582, 0.023174683703788, 0,0,0},
+     4, {1.0, 2.3565979090138, 1.9105037375735, 0.60999940061822, 0.060982814868093, 0,0,0,0}},
+    /* order 5 */
+    {5, -0.219, 0.251,
+     2, {2.8125, 0.0, -2.8125, 0,0,0,0,0,0,0,0,0},
+     2, {1.875, 7.5, 1.875, 0,0,0,0,0,0,0,0},
+     4, {1.0, 2.0, 1.3133394383394, 0.31333943833944, 0.019614644614645, 0,0,0},
+     5, {1.0, 2.5, 2.2061965811966, 0.80929487179487, 0.10954901579902, 0.0032253626003626, 0,0,0}},
+    /* order 6 */
+    {6, -0.282, 0.316,
+     3, {-3.125, -2.8125, 5.625, 0.3125, 0,0,0,0,0,0,0,0},
+     2, {-1.875, -11.25, -5.625, 0,0,0,0,0,0,0,0},
+     5, {1.0, 2.4187964980921, 2.1040382083956, 0.79642117021259, 0.1255086337457, 0.0062963159736057, 0,0},
+     5, {1.0, 2.8473679266635, 3.0029101769656, 1.4300620315322, 0.29569616640861, 0.019880608705292, 0,0,0}},
+    /* order 7 */
+    {7, -0.338, 0.373,
+     3, {4.0104166666667, 9.84375, -9.84375, -4.0104166666667, 0,0,0,0,0,0,0,0},
+     3, {2.1875, 19.6875, 19.6875, 2.1875, 0,0,0,0,0,0,0},
+     5, {1.0, 2.5, 2.2514276625317, 0.87714149379762, 0.13753081472819, 0.0059084917311593, 0,0},
+     6, {1.0, 3.0, 3.3903165514206, 1.7806331028413, 0.43046032864087, 0.040143777220235, 0.00082665505743365, 0,0}},
+    /* order 8 */
+    {8, -0.387, 0.422,
+     4, {-4.2838541666667, -17.5, 9.84375, 11.666666666667, 0.2734375, 0,0,0,0,0,0,0},
+     3, {-2.1875, -26.25, -39.375, -8.75, 0,0,0,0,0,0,0},
+     5, {1.0, 2.5610637208739, 2.3919099978286, 0.98937170028964, 0.17357822943969, 0.0096995892929036, 0,0},
+     6, {1.0, 3.0055081653184, 3.3943580713034, 1.7688665051567, 0.41438661668697, 0.033650020420609, 0.000050495737648433, 0,0}},
+    /* order 9 */
+    {9, -0.43, 0.464,
+     4, {5.126953125, 32.8125, 0.0, -32.8125, -5.126953125, 0,0,0,0,0,0,0},
+     4, {2.4609375, 39.375, 88.59375, 39.375, 2.4609375, 0,0,0,0,0,0},
+     6, {1.0, 2.733043364401, 2.7718291902232, 1.2772433471491, 0.25997188487676, 0.018326394926351, 0.00013278743887644, 0},
+     6, {1.0, 3.233043364401, 4.0247145087873, 2.4094030144879, 0.70373582351232, 0.088893885031519, 0.0033132610003509, 0,0}},
+    /* order 10 */
+    {10, -0.468, 0.501,
+     5, {-5.373046875, -47.16796875, -24.609375, 57.421875, 19.482421875, 0.24609375, 0,0,0,0,0,0},
+     4, {-2.4609375, -49.21875, -147.65625, -98.4375, -12.3046875, 0,0,0,0,0,0},
+     6, {1.0, 2.8752528324977, 3.1372522022764, 1.6195427416905, 0.40170620422812, 0.04303954725897, 0.0014669363563495, 0},
+     6, {1.0, 3.3297982870431, 4.309887787296, 2.7231444177806, 0.86124668679305, 0.12371395040216, 0.0058577600405354, 0,0}},
+    /* order 11 */
+    {11, -0.501, 0.534,
+     5, {6.1810546875, 73.3154296875, 90.234375, -90.234375, -73.3154296875, -6.1810546875, 0,0,0,0,0,0},
+     5, {2.70703125, 67.67578125, 270.703125, 270.703125, 67.67578125, 2.70703125, 0,0,0,0,0},
+     6, {1.0, 2.7333931468221, 2.7730902668328, 1.2786959487213, 0.26066077963333, 0.018454839938474, 0.00013857880170088, 0},
+     6, {1.0, 3.2333931468221, 4.0244022248592, 2.407541872889, 0.70200770652817, 0.088320424888959, 0.0032543708103201, 0,0}},
+    /* order 12 */
+    {12, -0.531, 0.562,
+     6, {-6.406640625, -96.099609375, -186.1083984375, 90.234375, 169.189453125, 28.965234375, 0.2255859375, 0,0,0,0,0},
+     5, {-2.70703125, -81.2109375, -406.0546875, -541.40625, -203.02734375, -16.2421875, 0,0,0,0,0},
+     6, {1.0, 3.0448349228732, 3.5652325648319, 2.0107624226303, 0.5581463905672, 0.068912599775289, 0.0027503351125044, 0},
+     7, {1.0, 3.5063733844117, 4.8374048960989, 3.3142815877642, 1.1661040072182, 0.19412177384366, 0.011475769024855, 0.000014175308484462, 0}},
+    /* order 13 */
+    {13, -0.557, 0.588,
+     6, {7.184912109375, 135.4869140625, 384.90600585937, 0.0, -384.90600585937, -135.4869140625, -7.184912109375, 0,0,0,0,0},
+     6, {2.9326171875, 105.57421875, 659.8388671875, 1173.046875, 659.8388671875, 105.57421875, 2.9326171875, 0,0,0,0},
+     6, {1.0, 3.0, 3.4398700386372, 1.8797400772743, 0.49529660107961, 0.055426562442451, 0.0017537166619788, 0},
+     7, {1.0, 3.5, 4.8232033719705, 3.3080084299262, 1.1727046776928, 0.20104858661291, 0.013546152700783, 0.00019859291244789, 0}},
+    /* order 14 */
+    {14, -0.518, 0.611,
+     7, {-7.394384765625, -168.3322265625, -631.24584960937, -256.60400390625, 641.51000976562, 381.8267578125, 40.030224609375, 0.20947265625, 0,0,0,0},
+     6, {-2.9326171875, -123.169921875, -923.7744140625, -2052.83203125, -1539.6240234375, -369.509765625, -20.5283203125, 0,0,0,0},
+     6, {1.0, 3.034629705342, 3.5369070660493, 1.9813638048949, 0.54414752125926, 0.065935628026009, 0.0025331166641352, 0},
+     7, {1.0, 3.5012963720087, 4.8208453729867, 3.2938732095366, 1.154415151606, 0.19109330453762, 0.011210062927602, 0.000016581712694799, 0}},
+    /* order 15 */
+    {15, -0.541, 0.631,
+     7, {8.1469900948661, 223.24548339844, 1085.4349365234, 962.26501464844, -962.26501464844, -1085.4349365234, -223.24548339844, -8.1469900948661, 0,0,0,0},
+     7, {3.14208984375, 153.96240234375, 1385.6616210938, 3849.0600585937, 3849.0600585937, 1385.6616210938, 153.96240234375, 3.14208984375, 0,0,0},
+     6, {1.0, 3.0, 3.4400585392107, 1.8801170784215, 0.49556813038953, 0.055509591178792, 0.0017626354878635, 0},
+     7, {1.0, 3.5, 4.8224114803872, 3.306028700968, 1.1709157214433, 0.20034488119687, 0.013433848489043, 0.00019373407731112, 0}},
+    /* order 16 */
+    {16, -0.562, 0.649,
+     8, {-8.3433707101004, -267.7060546875, -1601.208984375, -2155.4736328125, 962.26501464844, 2278.6435546875, 739.01953125, 52.607561383929, 0.19638061523438, 0,0,0},
+     7, {-3.14208984375, -175.95703125, -1847.548828125, -6158.49609375, -7698.1201171875, -3695.09765625, -615.849609375, -25.13671875, 0,0,0},
+     6, {1.0, 3.0267474784445, 3.5150700003594, 1.9587569664169, 0.53342251019288, 0.063667813336172, 0.0023691677567435, 0},
+     7, {1.0, 3.4973357137386, 4.8079338656481, 3.2779819701702, 1.1453369246616, 0.18875391331486, 0.011008376720253, 0.000018907401960289, 0}},
+    /* order 17 */
+    {17, -0.582, 0.666,
+     8, {9.0734857831682, 340.33321707589, 2486.4927978516, 4711.2495117188, 0.0, -4711.2495117188, -2486.4927978516, -340.33321707589, -9.0734857831682, 0,0,0},
+     8, {3.3384704589844, 213.662109375, 2617.3608398437, 10469.443359375, 16358.505249023, 10469.443359375, 2617.3608398437, 213.662109375, 3.3384704589844, 0,0},
+     6, {1.0, 3.2157192672142, 4.0246058913212, 2.4656382544766, 0.7600290519396, 0.10732582666566, 0.0050545105774104, 0},
+     8, {1.0, 3.7157192672142, 5.5140444722967, 4.1563428658619, 1.6699262094031, 0.34103513472824, 0.02989625911893, 0.00066188011699055, -3.8321173171098e-6}},
+    /* order 18 */
+    {18, -0.599, 0.681,
+     9, {-9.2589563642229, -397.89798627581, -3437.2891845703, -8375.5546875, -2944.5309448242, 7655.780456543, 6150.7979736328, 1291.1296037946, 66.638254983085, 0.18547058105469, 0,0},
+     8, {-3.3384704589844, -240.36987304687, -3365.1782226562, -15704.165039063, -29445.309448242, -23556.247558594, -7852.0825195312, -961.4794921875, -30.046234130859, 0,0},
+     7, {1.0, 3.5306836929127, 4.9787705805848, 3.5748288749893, 1.3787221678681, 0.27591307847442, 0.025151905086668, 0.00074062043812306},
+     8, {1.0, 4.004367903439, 6.5203132716875, 5.5340270154316, 2.6041300484626, 0.66504710948496, 0.082751975852322, 0.0037091269405145, 4.1162181059434e-6}},
+    /* order 19 */
+    {19, -0.616, 0.695,
+     9, {9.9691173311264, 490.34381021772, 4991.1087210519, 15333.372253418, 11189.217590332, -11189.217590332, -15333.372253418, -4991.1087210519, -490.34381021772, -9.9691173311264, 0,0},
+     9, {3.5239410400391, 285.43922424316, 4567.0275878906, 24864.927978516, 55946.08795166, 55946.08795166, 24864.927978516, 4567.0275878906, 285.43922424316, 3.5239410400391, 0},
+     7, {1.0, 3.5, 4.8775459718386, 3.4438649295966, 1.294825988365, 0.24837405295099, 0.020877112471247, 0.00050504506367791},
+     8, {1.0, 4.0, 6.508498352791, 5.525495058373, 2.6074910509159, 0.67249033787685, 0.086419935430204, 0.0044239428872841, 0.000049085206240032}},
+    /* order 20 */
+    {20, -0.631, 0.708,
+     10, {-10.145314383128, -562.44616099766, -6595.6849316188, -24442.055053711, -26418.985977173, 11189.217590332, 30563.140640259, 14099.791521345, 2094.9200207847, 82.071468111068, 0.17619705200195, 0},
+     9, {-3.5239410400391, -317.15469360352, -5708.7844848633, -35521.325683594, -93243.479919434, -111892.17590332, -62162.319946289, -15223.425292969, -1427.1961212158, -35.239410400391, 0},
+     7, {1.0, 3.5251396690978, 4.9605987099841, 3.5514756331536, 1.3638765739909, 0.27108740107008, 0.024413032466054, 0.00070074454442973},
+     8, {1.0, 4.0013301452883, 6.5088511601214, 5.5169131419853, 2.5913408457078, 0.66008942597404, 0.081834003934574, 0.0036501401808332, 4.5632350175799e-6}},
+    /* order 21 */
+    {21, -0.645, 0.72,
+     10, {10.837587006887, 676.74351056417, 9125.1352000237, 40468.938903809, 59831.232948303, 0.0, -59831.232948303, -40468.938903809, -9125.1352000237, -676.74351056417, -10.837587006887, 0},
+     10, {3.700138092041, 370.0138092041, 7492.7796363831, 53281.988525391, 163176.08985901, 234973.56939697, 163176.08985901, 53281.988525391, 7492.7796363831, 370.0138092041, 3.700138092041},
+     7, {1.0, 3.5, 4.877620852413, 3.4440521310325, 1.2950082042224, 0.24846017530121, 0.020896613402104, 0.00050668185193194},
+     8, {1.0, 4.0, 6.5080556350217, 5.524166905065, 2.6059624003339, 0.67164662555942, 0.0861932030478, 0.004397707778928, 0.000048223327017921}},
+    /* order 22 */
+    {22, -0.658, 0.731,
+     11, {-11.00577510198, -764.76862112681, -11661.712009907, -60223.711881638, -112336.19247437, -35898.739768982, 95729.972717285, 92973.898429871, 28879.908177853, 3213.3203204473, 98.862697569529, 0.16818809509277},
+     10, {-3.700138092041, -407.01519012451, -9157.8417778015, -73262.734222412, -256419.56977844, -430784.87722778, -358987.39768982, -146525.46844482, -27473.525333405, -2035.0759506226, -40.701519012451},
+     7, {1.0, 3.5205293526005, 4.9455011102732, 3.5320978036904, 1.3515804842329, 0.26710119359406, 0.023805221453277, 0.00066816326407054},
+     8, {1.0, 3.9987902221657, 6.4992703469612, 5.5026175638515, 2.5806701431507, 0.65596147985212, 0.081072889433702, 0.0036018948868731, 4.9980796385363e-6}}
+};
+
+/* Factorial table for orders 0..22 */
+__constant__ double d_factorial[23] = {
+    1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0,
+    3628800.0, 39916800.0, 479001600.0, 6227020800.0, 87178291200.0,
+    1307674368000.0, 20922789888000.0, 355687428096000.0,
+    6402373705728000.0, 121645100408832000.0, 2432902008176640000.0,
+    51090942171709440000.0, 1124000727777607680000.0
+};
+
 /* --------------------------------------------------------------------------
  * Cached device buffers
  * -------------------------------------------------------------------------- */
@@ -72,6 +250,10 @@ static double *d_b2  = NULL;
 static double *d_ea2 = NULL;
 static double *d_eb2 = NULL;
 static double *d_cm  = NULL;
+
+/* Cached device buffers for exact bend multipole arrays */
+static double *d_exact_an = NULL;
+static double *d_exact_bn = NULL;
 
 /* --------------------------------------------------------------------------
  * ensure_buffers -- (re-)allocate device arrays when size changes
@@ -254,6 +436,153 @@ __device__ __forceinline__ double ipow(double x, int p)
     double r = 1.0;
     for (int k = 0; k < p; k++) r *= x;
     return r;
+}
+
+/* --------------------------------------------------------------------------
+ * F_value_dev -- evaluate the radial F-function at xg for a given order j.
+ * Matches F_value in bend_exact_multipole_field.f90.
+ * -------------------------------------------------------------------------- */
+__device__ double F_value_dev(int j, double xg)
+{
+    const struct FCoefEntry *c = &d_F_coef[j];
+    if (c->order == 0) return 1.0;
+
+    double value;
+    if (xg < c->cutoff_minus || xg > c->cutoff_plus) {
+        /* Exact log formula */
+        double r = 1.0 + xg;
+        value = 0.0;
+        for (int i = 0; i <= c->n_exact_log; i++)
+            value += c->exact_log_coef[i] * ipow(r, 2*i);
+        value *= log(r);
+        for (int i = 0; i <= c->n_exact_non; i++)
+            value += c->exact_non_coef[i] * ipow(r, 2*i);
+    } else {
+        /* Pade approximant */
+        double numer = 0.0;
+        for (int i = 0; i <= c->n_pade_numer; i++)
+            numer += c->pade_numer_coef[i] * ipow(xg, i + c->order);
+        double denom = 0.0;
+        for (int i = 0; i <= c->n_pade_denom; i++)
+            denom += c->pade_denom_coef[i] * ipow(xg, i);
+        value = numer / denom;
+    }
+    return value;
+}
+
+/* --------------------------------------------------------------------------
+ * F_derivative_dev -- evaluate dF/d(xg) for a given order j.
+ * Matches F_derivative in bend_exact_multipole_field.f90.
+ * -------------------------------------------------------------------------- */
+__device__ double F_derivative_dev(int j, double xg)
+{
+    const struct FCoefEntry *c = &d_F_coef[j];
+    if (c->order == 0) return 0.0;
+
+    double value;
+    if (xg < c->cutoff_minus || xg > c->cutoff_plus) {
+        double r = 1.0 + xg;
+        double v0 = 0.0;
+        value = 0.0;
+        for (int i = 0; i <= c->n_exact_log; i++) {
+            double f = c->exact_log_coef[i] * ipow(r, 2*i - 1);
+            v0    += f;
+            value += 2.0 * i * f;
+        }
+        value = value * log(r) + v0;
+        for (int i = 1; i <= c->n_exact_non; i++)
+            value += 2.0 * i * c->exact_non_coef[i] * ipow(r, 2*i - 1);
+    } else {
+        double numer = 0.0, d_numer = 0.0;
+        for (int i = 0; i <= c->n_pade_numer; i++) {
+            numer += c->pade_numer_coef[i] * ipow(xg, i + c->order);
+            if (i + c->order >= 1)
+                d_numer += (i + c->order) * c->pade_numer_coef[i] * ipow(xg, i - 1 + c->order);
+        }
+        double denom = 0.0, d_denom = 0.0;
+        for (int i = 0; i <= c->n_pade_denom; i++) {
+            denom += c->pade_denom_coef[i] * ipow(xg, i);
+            if (i > 0)
+                d_denom += i * c->pade_denom_coef[i] * ipow(xg, i - 1);
+        }
+        value = (denom * d_numer - numer * d_denom) / (denom * denom);
+    }
+    return value;
+}
+
+/* --------------------------------------------------------------------------
+ * bend_exact_multipole_field_dev -- compute exact Bx, By for a bend.
+ *
+ * Ported from bend_exact_multipole_field.f90.  The raw multipole arrays
+ * (a_pole, b_pole) must already be in the vertically_pure basis (converted
+ * on CPU if the element uses horizontally_pure).
+ *
+ * Input:
+ *   a_pole, b_pole: raw multipole arrays (0..ix_mag_max)
+ *   ix_mag_max: maximum multipole order
+ *   g:   bend curvature (1/rho)
+ *   rho: bend radius (1/g)
+ *   x, y: particle position
+ *   f_scale: p0c / (c_light * charge * L) -- element-level scaling
+ *
+ * Output:
+ *   Bx, By: field components (scaled by f_scale)
+ * -------------------------------------------------------------------------- */
+__device__ void bend_exact_multipole_field_dev(
+    const double *a_pole, const double *b_pole, int ix_mag_max,
+    double g, double rho, double x, double y, double f_scale,
+    double *Bx_out, double *By_out)
+{
+    double xg = x * g;
+    double yg = y * g;
+
+    /* Precompute yg^n for n = 0..ix_mag_max+1 */
+    double yg_n[24];  /* enough for ix_mag_max up to 22 */
+    yg_n[0] = 1.0;
+    for (int n = 0; n <= ix_mag_max; n++)
+        yg_n[n+1] = yg_n[n] * yg;
+
+    double Bx = 0.0, By = 0.0;
+    double rho_n = 1.0;
+
+    for (int n = 0; n <= ix_mag_max; n++) {
+        if (n > 0) rho_n *= rho;
+        double fact_n = d_factorial[n];
+
+        /* Process b_pole[n] (non-skew): j goes from n down to 0 in steps of 2 */
+        if (b_pole[n] != 0.0) {
+            int sgn = 1;
+            for (int j = n; j >= 0; j -= 2) {
+                double crs = b_pole[n] * fact_n * rho_n * sgn;
+                double pc_val = crs * yg_n[n+1-j] / (d_factorial[j] * d_factorial[n+1-j]);
+                double pc_der = crs * yg_n[n-j] / (d_factorial[j] * d_factorial[n-j]);
+
+                if (pc_val != 0.0) Bx += F_derivative_dev(j, xg) * pc_val;
+                if (pc_der != 0.0) By += F_value_dev(j, xg) * pc_der;
+
+                sgn = -sgn;
+            }
+        }
+
+        /* Process a_pole[n] (skew): j goes from n+1 down to 0 in steps of 2 */
+        if (a_pole[n] != 0.0) {
+            int sgn = 1;
+            for (int j = n+1; j >= 0; j -= 2) {
+                double crs = a_pole[n] * fact_n * rho_n * sgn;
+                double pc_val = crs * yg_n[n+1-j] / (d_factorial[j] * d_factorial[n+1-j]);
+                double pc_der = (n-j >= 0) ?
+                    crs * yg_n[n-j] / (d_factorial[j] * d_factorial[n-j]) : 0.0;
+
+                if (pc_val != 0.0) Bx += F_derivative_dev(j, xg) * pc_val;
+                if (pc_der != 0.0) By += F_value_dev(j, xg) * pc_der;
+
+                sgn = -sgn;
+            }
+        }
+    }
+
+    *Bx_out = Bx * f_scale;
+    *By_out = By * f_scale;
 }
 
 /* --------------------------------------------------------------------------
@@ -639,6 +968,21 @@ static int upload_multipole_data(
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * upload_exact_multipole_data -- H→D transfer of exact bend multipole arrays
+ * -------------------------------------------------------------------------- */
+static int upload_exact_multipole_data(
+    double *h_exact_an, double *h_exact_bn, int ix_exact_mag_max)
+{
+    if (ix_exact_mag_max < 0) return 0;
+    size_t multi_sz = N_MULTI * sizeof(double);
+    if (!d_exact_an) { CUDA_CHECK(cudaMalloc((void**)&d_exact_an, multi_sz)); }
+    if (!d_exact_bn) { CUDA_CHECK(cudaMalloc((void**)&d_exact_bn, multi_sz)); }
+    CUDA_CHECK(cudaMemcpy(d_exact_an, h_exact_an, multi_sz, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_exact_bn, h_exact_bn, multi_sz, cudaMemcpyHostToDevice));
+    return 0;
+}
+
 /* =========================================================================
  * HOST WRAPPER: gpu_track_drift
  *
@@ -767,7 +1111,12 @@ __global__ void bend_kernel(
     const double *d_a2, const double *d_b2, const double *d_cm,
     int ix_mag_max, int n_step,
     /* Electric multipole parameters */
-    const double *d_ea2, const double *d_eb2, int ix_elec_max)
+    const double *d_ea2, const double *d_eb2, int ix_elec_max,
+    /* Exact multipoles parameters (when is_exact != 0) */
+    int is_exact,
+    const double *d_exact_an, const double *d_exact_bn,
+    int ix_exact_mag_max,
+    double rho, double c_dir, double exact_f_scale)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_particles) return;
@@ -775,6 +1124,7 @@ __global__ void bend_kernel(
 
     int has_mag = (ix_mag_max >= 0);
     int has_elec = (ix_elec_max >= 0);
+    int has_exact_mag = (is_exact && ix_exact_mag_max >= 0);
     double step_len = ele_length / (double)n_step;
     double angle = g * step_len;
     double z_start = vz[i];
@@ -784,7 +1134,16 @@ __global__ void bend_kernel(
     double beta_ref = p0c_ele / e_tot_ele;
 
     /* Entrance half magnetic multipole kick */
-    if (has_mag) {
+    if (has_exact_mag) {
+        /* Exact multipole field in curved geometry */
+        double Bx, By;
+        bend_exact_multipole_field_dev(d_exact_an, d_exact_bn, ix_exact_mag_max,
+                                       g, rho, vx[i], vy[i], exact_f_scale, &Bx, &By);
+        double f_coef = 0.5 * c_dir * (1.0 + g * vx[i]) * C_LIGHT / p0c_arr[i];
+        f_coef *= step_len;
+        vpx[i] -= f_coef * By;
+        vpy[i] += f_coef * Bx;
+    } else if (has_mag) {
         double kx, ky;
         multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
                            vx[i], vy[i], &kx, &ky);
@@ -968,7 +1327,16 @@ __global__ void bend_kernel(
         }
 
         /* Multipole kick after each step */
-        if (has_mag) {
+        if (has_exact_mag) {
+            double Bx, By;
+            bend_exact_multipole_field_dev(d_exact_an, d_exact_bn, ix_exact_mag_max,
+                                           g, rho, vx[i], vy[i], exact_f_scale, &Bx, &By);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            double f_coef = scl * c_dir * (1.0 + g * vx[i]) * C_LIGHT / p0c_arr[i];
+            f_coef *= step_len;
+            vpx[i] -= f_coef * By;
+            vpy[i] += f_coef * Bx;
+        } else if (has_mag) {
             double kx, ky;
             multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
                                vx[i], vy[i], &kx, &ky);
@@ -1011,7 +1379,11 @@ extern "C" void gpu_track_bend_(
     int n_particles,
     double *h_a2, double *h_b2, double *h_cm,
     int ix_mag_max, int n_step,
-    double *h_ea2, double *h_eb2, int ix_elec_max)
+    double *h_ea2, double *h_eb2, int ix_elec_max,
+    int is_exact,
+    double *h_exact_an, double *h_exact_bn,
+    int ix_exact_mag_max,
+    double rho, double c_dir, double exact_f_scale)
 {
     if (ensure_buffers(n_particles) != 0) return;
 
@@ -1020,6 +1392,9 @@ extern "C" void gpu_track_bend_(
                              h_state, h_beta, h_p0c, h_t) != 0) return;
     if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
                               ix_mag_max, ix_elec_max) != 0) return;
+    if (is_exact) {
+        if (upload_exact_multipole_data(h_exact_an, h_exact_bn, ix_exact_mag_max) != 0) return;
+    }
 
     /* Launch kernel */
     int threads = 256;
@@ -1030,7 +1405,9 @@ extern "C" void gpu_track_bend_(
         mc2, g, g_tot, dg, b1, ele_length, delta_ref_time, e_tot_ele,
         rel_charge_dir, p0c_ele,
         n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
-        d_ea2, d_eb2, ix_elec_max);
+        d_ea2, d_eb2, ix_elec_max,
+        is_exact, d_exact_an, d_exact_bn, ix_exact_mag_max,
+        rho, c_dir, exact_f_scale);
     CUDA_CHECK_VOID(cudaGetLastError());
     CUDA_CHECK_VOID(cudaDeviceSynchronize());
 
@@ -1394,6 +1771,604 @@ extern "C" void gpu_track_lcavity_(
                                h_state, h_beta, h_p0c, h_t, 1, 1) != 0) return;
 }
 
+/* =========================================================================
+ * SOLENOID KERNEL
+ * Replicates the body of solenoid_track_and_mat (tracking only, no matrix).
+ *
+ * The solenoid body applies a 4x4 rotation in (x, px, y, py) space plus
+ * longitudinal (z) and time updates.  For a pure solenoid (b1=0) or when
+ * ele%key == solenoid$, the CPU code calls solenoid_track_and_mat.
+ *
+ * Parameters:
+ *   ks0     -- solenoid strength: rel_tracking_charge * bs_field * charge * c_light / p0c
+ *              (pre-computed on host, same for all particles at given p0c)
+ *   length  -- step length (signed, includes time_dir)
+ *   ref_beta -- reference beta = p0c / e_tot
+ *
+ * This kernel handles the n_step loop and multipole kicks, matching
+ * track_a_sol_quad for the solenoid$ branch.
+ * ========================================================================= */
+
+__global__ void solenoid_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state, double *beta_arr, double *p0c_arr, double *t_arr,
+    double mc2, double ks0, double ele_length,
+    double delta_ref_time, double e_tot_ele,
+    int n_particles, int n_step,
+    /* Multipole parameters */
+    const double *d_a2, const double *d_b2, const double *d_cm,
+    int ix_mag_max,
+    const double *d_ea2, const double *d_eb2, int ix_elec_max)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_particles) return;
+    if (state[i] != ALIVE_ST) return;
+
+    int has_mag = (ix_mag_max >= 0);
+    int has_elec = (ix_elec_max >= 0);
+    double step_len = ele_length / (double)n_step;
+    double z_start = vz[i];
+    double t_start = t_arr[i];
+    double beta_val = beta_arr[i];
+    double p0c_val = p0c_arr[i];
+    double beta_ref = p0c_val / e_tot_ele;
+
+    /* Entrance half magnetic multipole kick */
+    if (has_mag) {
+        double kx, ky;
+        multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                           vx[i], vy[i], &kx, &ky);
+        vpx[i] += 0.5 * kx;
+        vpy[i] += 0.5 * ky;
+    }
+
+    /* Entrance half electric multipole kick */
+    if (has_elec) {
+        double kx, ky;
+        multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                           vx[i], vy[i], &kx, &ky);
+        if (apply_electric_kick_dev(0.5 * kx / beta_val, 0.5 * ky / beta_val,
+                &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+    }
+
+    /* Body: n_step solenoid sub-steps */
+    for (int istep = 1; istep <= n_step; istep++) {
+        double vec0_x  = vx[i];
+        double vec0_px = vpx[i];
+        double vec0_y  = vy[i];
+        double vec0_py = vpy[i];
+
+        double rel_p = 1.0 + vpz[i];
+        double kss0 = ks0 / 2.0;
+
+        double xp = vec0_px + kss0 * vec0_y;
+        double yp = vec0_py - kss0 * vec0_x;
+        double ff = rel_p * rel_p - xp * xp - yp * yp;
+        if (ff <= 0.0) {
+            state[i] = LOST_PZ;
+            return;
+        }
+        double pz = sqrt(ff);
+
+        /* z update */
+        double dir_beta_ratio = beta_val / beta_ref;
+        vz[i] += step_len * (dir_beta_ratio - rel_p / pz);
+
+        double ks_rel = ks0 / pz;
+        double kss = ks_rel / 2.0;
+        double kssl = kss * step_len;
+
+        double c, s, c2, s2, cs;
+        double mat4_11, mat4_12, mat4_13, mat4_14;
+        double mat4_21, mat4_22, mat4_23, mat4_24;
+        double mat4_31, mat4_32, mat4_33, mat4_34;
+        double mat4_41, mat4_42, mat4_43, mat4_44;
+
+        if (fabs(step_len * kss) < 1e-10) {
+            double ll = step_len;
+            double kssl2 = kssl * kssl;
+
+            mat4_11 = 1.0;          mat4_12 = ll / pz;
+            mat4_13 = kssl;         mat4_14 = kssl * ll / pz;
+            mat4_21 = -kssl * kss0; mat4_22 = 1.0;
+            mat4_23 = -kssl2 * kss0; mat4_24 = kssl;
+            mat4_31 = -kssl;        mat4_32 = -kssl * ll / pz;
+            mat4_33 = 1.0;          mat4_34 = ll / pz;
+            mat4_41 = kssl2 * kss0; mat4_42 = -kssl;
+            mat4_43 = -kssl * kss0; mat4_44 = 1.0;
+        } else {
+            c = cos(kssl);
+            s = sin(kssl);
+            c2 = c * c;
+            s2 = s * s;
+            cs = c * s;
+
+            mat4_11 = c2;           mat4_12 = cs / kss0;
+            mat4_13 = cs;           mat4_14 = s2 / kss0;
+            mat4_21 = -kss0 * cs;   mat4_22 = c2;
+            mat4_23 = -kss0 * s2;   mat4_24 = cs;
+            mat4_31 = -cs;          mat4_32 = -s2 / kss0;
+            mat4_33 = c2;           mat4_34 = cs / kss0;
+            mat4_41 = kss0 * s2;    mat4_42 = -cs;
+            mat4_43 = -kss0 * cs;   mat4_44 = c2;
+        }
+
+        /* Apply 4x4 rotation matrix */
+        vx[i]  = mat4_11 * vec0_x + mat4_12 * vec0_px + mat4_13 * vec0_y + mat4_14 * vec0_py;
+        vpx[i] = mat4_21 * vec0_x + mat4_22 * vec0_px + mat4_23 * vec0_y + mat4_24 * vec0_py;
+        vy[i]  = mat4_31 * vec0_x + mat4_32 * vec0_px + mat4_33 * vec0_y + mat4_34 * vec0_py;
+        vpy[i] = mat4_41 * vec0_x + mat4_42 * vec0_px + mat4_43 * vec0_y + mat4_44 * vec0_py;
+
+        /* Time update for this sub-step */
+        t_arr[i] += step_len * rel_p / (pz * beta_val * C_LIGHT);
+
+        /* s update within sub-step */
+        /* (s is updated at the end by the caller, not per sub-step) */
+
+        /* Magnetic multipole kick (half at last step, full otherwise) */
+        if (has_mag) {
+            double kx, ky;
+            multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                               vx[i], vy[i], &kx, &ky);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            vpx[i] += scl * kx;
+            vpy[i] += scl * ky;
+        }
+
+        /* Electric multipole kick (half at last step, full otherwise) */
+        if (has_elec) {
+            double kx, ky;
+            multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                               vx[i], vy[i], &kx, &ky);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            if (apply_electric_kick_dev(scl * kx / beta_val, scl * ky / beta_val,
+                    &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                    &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+        }
+    }
+
+    /* Final time: override sub-step accumulation with the standard formula
+     * to exactly match CPU:  t = t_start + dir*time_dir*delta_ref_time + (z_start - z) / (beta * c_light)
+     * Since we only do forward tracking (dir=1, time_dir=1), this is: */
+    t_arr[i] = t_start + delta_ref_time + (z_start - vz[i]) / (beta_val * C_LIGHT);
+}
+
+/* =========================================================================
+ * SOL_QUAD KERNEL
+ * Replicates the body of sol_quad_mat6_calc (tracking only, no matrix).
+ *
+ * For a combined solenoid + quadrupole element.  The CPU routine computes
+ * a 4x4 transfer matrix in (x, x', y, y') coordinates using eigenvalue
+ * decomposition involving alpha, beta, trig/hyp functions of alpha*L and
+ * beta*L, then converts back to (x, px, y, py) coordinates.
+ *
+ * Parameters:
+ *   ks_in  -- solenoid strength: rel_tracking_charge * ele%value(ks$)
+ *   k1_in  -- quad strength: charge_dir * b1 / ele%value(l$)
+ *   length -- step length
+ * ========================================================================= */
+
+__global__ void sol_quad_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state, double *beta_arr, double *p0c_arr, double *t_arr,
+    double mc2, double ks_in, double k1_in, double ele_length,
+    double delta_ref_time, double e_tot_ele,
+    int n_particles, int n_step,
+    /* Multipole parameters */
+    const double *d_a2, const double *d_b2, const double *d_cm,
+    int ix_mag_max,
+    const double *d_ea2, const double *d_eb2, int ix_elec_max)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_particles) return;
+    if (state[i] != ALIVE_ST) return;
+
+    int has_mag = (ix_mag_max >= 0);
+    int has_elec = (ix_elec_max >= 0);
+    double step_len = ele_length / (double)n_step;
+    double z_start = vz[i];
+    double t_start = t_arr[i];
+    double beta_val = beta_arr[i];
+    double p0c_val = p0c_arr[i];
+    double beta_ref = p0c_val / e_tot_ele;
+
+    /* Entrance half magnetic multipole kick */
+    if (has_mag) {
+        double kx, ky;
+        multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                           vx[i], vy[i], &kx, &ky);
+        vpx[i] += 0.5 * kx;
+        vpy[i] += 0.5 * ky;
+    }
+
+    /* Entrance half electric multipole kick */
+    if (has_elec) {
+        double kx, ky;
+        multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                           vx[i], vy[i], &kx, &ky);
+        if (apply_electric_kick_dev(0.5 * kx / beta_val, 0.5 * ky / beta_val,
+                &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+    }
+
+    /* Body: n_step sol_quad sub-steps */
+    for (int istep = 1; istep <= n_step; istep++) {
+
+        double rel_p = 1.0 + vpz[i];
+
+        /* Convert (x, px, y, py) to (x, x', y, y') for the matrix */
+        double orb_x  = vx[i];
+        double orb_xp = vpx[i] / rel_p;
+        double orb_y  = vy[i];
+        double orb_yp = vpy[i] / rel_p;
+
+        double k1  = k1_in / rel_p;
+        double ks  = ks_in / rel_p;
+        double k1_2 = k1 * k1;
+        double ks2 = ks * ks;
+        double ks3 = ks2 * ks;
+        double ks4 = ks2 * ks2;
+        double f = sqrt(ks4 + 4.0 * k1_2);
+        double ug = 1.0 / (4.0 * f);
+        double alpha2 = (f + ks2) / 2.0;
+        double alpha = sqrt(alpha2);
+
+        double beta2, beta_sq;
+        if (fabs(k1) < 1e-2 * f) {
+            double rk = (k1 / ks2) * (k1 / ks2);
+            beta2 = ks2 * (rk - rk * rk + 2.0 * rk * rk * rk);
+        } else {
+            beta2 = (f - ks2) / 2.0;
+        }
+        beta_sq = sqrt(beta2);
+
+        double S   = sin(alpha * step_len);
+        double C   = cos(alpha * step_len);
+        double Snh = sinh(beta_sq * step_len);
+        double Csh = cosh(beta_sq * step_len);
+        double q   = 2.0 * beta2  + 2.0 * k1;
+        double r   = 2.0 * alpha2 - 2.0 * k1;
+        double a   = 2.0 * alpha2 + 2.0 * k1;
+        double b   = 2.0 * beta2  - 2.0 * k1;
+        double fp  = f + 2.0 * k1;
+        double fm  = f - 2.0 * k1;
+
+        double S1 = S * alpha;
+        double S2 = S / alpha;
+        double Snh1 = Snh * beta_sq;
+        double Snh2 = (fabs(beta_sq) < 1e-10) ? step_len : Snh / beta_sq;
+
+        double coef1 = ks2 * r + 4.0 * k1 * a;
+        double coef2 = ks2 * q + 4.0 * k1 * b;
+
+        /* m0 is the transfer matrix in (x, x', y, y') space */
+        double m0_11 = 2.0 * ug * (fp * C + fm * Csh);
+        double m0_12 = (2.0 * ug / k1) * (q * S1 - r * Snh1);
+        double m0_13 = (ks * ug / k1) * (-b * S1 + a * Snh1);
+        double m0_14 = 4.0 * ug * ks * (-C + Csh);
+
+        double m0_21 = -(ug / 2.0) * (coef1 * S2 + coef2 * Snh2);
+        double m0_22 = m0_11;
+        double m0_23 = ug * ks3 * (C - Csh);
+        double m0_24 = ug * ks * (a * S2 + b * Snh2);
+
+        double m0_31 = -m0_24;
+        double m0_32 = -m0_14;
+        double m0_33 = 2.0 * ug * (fm * C + fp * Csh);
+        double m0_34 = 2.0 * ug * (r * S2 + q * Snh2);
+
+        double m0_41 = -m0_23;
+        double m0_42 = -m0_13;
+        double m0_43 = (ug / (2.0 * k1)) * (-coef2 * S1 + coef1 * Snh1);
+        double m0_44 = m0_33;
+
+        /* Compute t4: derivative of m0 w.r.t. energy, dm/dE at pz=0.
+         * This is needed for the z-correction bilinear form.
+         * ts is built from t4, NOT from m0. */
+        double df = -2.0 * (ks4 + 2.0 * k1_2) / f;
+        double dalpha2 = df / 2.0 - ks2;
+        double dalpha = (df / 2.0 - ks2) / (2.0 * alpha);
+        double dbeta_v;
+        if (k1_2 < 1e-5 * ks4) {
+            dbeta_v = fabs(k1 * k1 * k1 / (ks3 * ks2)) * (-1.0 + 3.5 * k1_2 / ks4);
+        } else {
+            dbeta_v = (ks2 + df / 2.0) / (2.0 * beta_sq);
+        }
+        double dbeta2v = 2.0 * beta_sq * dbeta_v;
+        double darg  = step_len * dalpha;
+        double darg1 = step_len * dbeta_v;
+        double dC   = -darg * S;
+        double dCsh =  darg1 * Snh;
+        double dS   =  darg * C;
+        double dSnh =  darg1 * Csh;
+        double dq   = -2.0 * k1 + 2.0 * dbeta2v;
+        double dr   =  2.0 * k1 + 2.0 * dalpha2;
+        double da   = -2.0 * k1 + 2.0 * dalpha2;
+        double db   =  2.0 * k1 + 2.0 * dbeta2v;
+        double dfp  = df - 2.0 * k1;
+        double dfm  = df + 2.0 * k1;
+        double df_f = -df / f;
+
+        double dS1   = dS * alpha + S * dalpha;
+        double dS2   = dS / alpha - S * dalpha / alpha2;
+        double dSnh1 = dSnh * beta_sq + Snh * dbeta_v;
+        double dSnh2;
+        if (k1_2 < 1e-5 * ks4) {
+            double L3 = step_len * step_len * step_len;
+            dSnh2 = k1_2 * k1_2 * L3 * (-1.0/3.0 + (40.0 - ks2 * L3 / step_len) * k1_2 / (30.0 * ks4)) / (ks3 * ks3);
+        } else {
+            dSnh2 = dSnh / beta_sq - Snh * dbeta_v / beta2;
+        }
+
+        double dcoef1 = -2.0*ks2*r + ks2*dr - 4.0*k1*a + 4.0*k1*da;
+        double dcoef2 = -2.0*ks2*q + ks2*dq - 4.0*k1*b + 4.0*k1*db;
+
+        /* t4 matrix (derivative of m0 w.r.t. energy) */
+        double t4_11 = m0_11*df_f + 2.0*ug*(fp*dC + C*dfp + fm*dCsh + Csh*dfm);
+        double t4_12 = m0_12*df_f + (2.0*ug/k1) * (dq*S1 + q*dS1 - dr*Snh1 - r*dSnh1);
+        double t4_13 = m0_13*df_f + (ks*ug/k1)*(-db*S1 - b*dS1 + da*Snh1 + a*dSnh1);
+        double t4_14 = m0_14*(df_f - 2.0) + 4.0*ks*ug*(-dC + dCsh);
+
+        double t4_21 = m0_21*(df_f + 1.0) - (ug/2.0)*(dcoef1*S2 + coef1*dS2 + dcoef2*Snh2 + coef2*dSnh2);
+        double t4_22 = t4_11;
+        double t4_23 = m0_23*(df_f - 2.0) + ks3*ug*(dC - dCsh);
+        double t4_24 = m0_24*(df_f - 1.0) + ug*ks*(da*S2 + a*dS2 + db*Snh2 + b*dSnh2);
+
+        double t4_31 = -t4_24;
+        double t4_32 = -t4_14;
+        double t4_33 = m0_33*df_f + 2.0*ug*(fm*dC + C*dfm + fp*dCsh + Csh*dfp);
+        double t4_34 = m0_34*(df_f - 1.0) + 2.0*ug*(dr*S2 + r*dS2 + dq*Snh2 + q*dSnh2);
+
+        double t4_41 = -t4_23;
+        double t4_42 = -t4_13;
+        double t4_43 = m0_43*(df_f + 2.0) + (ug/(2.0*k1))*(-dcoef2*S1 - coef2*dS1 + dcoef1*Snh1 + coef1*dSnh1);
+        double t4_44 = t4_33;
+
+        /* ts is constructed from t4 (NOT m0):
+         * ts(1:4,1) = -t4(2,1:4)   ->  ts row1 = -t4_21, -t4_22, -t4_23, -t4_24
+         * ts(1:4,2) =  t4(1,1:4)   ->  ts row2 =  t4_11,  t4_12,  t4_13,  t4_14
+         * ts(1:4,3) = -t4(4,1:4)   ->  ts row3 = -t4_41, -t4_42, -t4_43, -t4_44
+         * ts(1:4,4) =  t4(3,1:4)   ->  ts row4 =  t4_31,  t4_32,  t4_33,  t4_34
+         *
+         * Note: Fortran ts(i,j) with column-major => ts(1:4,1) sets column 1.
+         * ts(1,1) = -t4(2,1), ts(2,1) = -t4(2,2), ts(3,1) = -t4(2,3), ts(4,1) = -t4(2,4)
+         * i.e. ts column 1 = -t4 row 2 transposed as a column.
+         *
+         * In row-major (C) terms:
+         * ts_row_1 = [ts(1,1), ts(1,2), ts(1,3), ts(1,4)] = [-t4_21, t4_11, -t4_41, t4_31]
+         * ts_row_2 = [ts(2,1), ts(2,2), ts(2,3), ts(2,4)] = [-t4_22, t4_12, -t4_42, t4_32]
+         * ts_row_3 = [ts(3,1), ts(3,2), ts(3,3), ts(3,4)] = [-t4_23, t4_13, -t4_43, t4_33]
+         * ts_row_4 = [ts(4,1), ts(4,2), ts(4,3), ts(4,4)] = [-t4_24, t4_14, -t4_44, t4_34]
+         */
+        double ts_11 = -t4_21, ts_12 = t4_11, ts_13 = -t4_41, ts_14 = t4_31;
+        double ts_21 = -t4_22, ts_22 = t4_12, ts_23 = -t4_42, ts_24 = t4_32;
+        double ts_31 = -t4_23, ts_32 = t4_13, ts_33 = -t4_43, ts_34 = t4_33;
+        double ts_41 = -t4_24, ts_42 = t4_14, ts_43 = -t4_44, ts_44 = t4_34;
+
+        /* Compute tsm = ts * m0 */
+        double tsm_11 = ts_11*m0_11 + ts_12*m0_21 + ts_13*m0_31 + ts_14*m0_41;
+        double tsm_12 = ts_11*m0_12 + ts_12*m0_22 + ts_13*m0_32 + ts_14*m0_42;
+        double tsm_13 = ts_11*m0_13 + ts_12*m0_23 + ts_13*m0_33 + ts_14*m0_43;
+        double tsm_14 = ts_11*m0_14 + ts_12*m0_24 + ts_13*m0_34 + ts_14*m0_44;
+
+        double tsm_21 = ts_21*m0_11 + ts_22*m0_21 + ts_23*m0_31 + ts_24*m0_41;
+        double tsm_22 = ts_21*m0_12 + ts_22*m0_22 + ts_23*m0_32 + ts_24*m0_42;
+        double tsm_23 = ts_21*m0_13 + ts_22*m0_23 + ts_23*m0_33 + ts_24*m0_43;
+        double tsm_24 = ts_21*m0_14 + ts_22*m0_24 + ts_23*m0_34 + ts_24*m0_44;
+
+        double tsm_31 = ts_31*m0_11 + ts_32*m0_21 + ts_33*m0_31 + ts_34*m0_41;
+        double tsm_32 = ts_31*m0_12 + ts_32*m0_22 + ts_33*m0_32 + ts_34*m0_42;
+        double tsm_33 = ts_31*m0_13 + ts_32*m0_23 + ts_33*m0_33 + ts_34*m0_43;
+        double tsm_34 = ts_31*m0_14 + ts_32*m0_24 + ts_33*m0_34 + ts_34*m0_44;
+
+        double tsm_41 = ts_41*m0_11 + ts_42*m0_21 + ts_43*m0_31 + ts_44*m0_41;
+        double tsm_42 = ts_41*m0_12 + ts_42*m0_22 + ts_43*m0_32 + ts_44*m0_42;
+        double tsm_43 = ts_41*m0_13 + ts_42*m0_23 + ts_43*m0_33 + ts_44*m0_43;
+        double tsm_44 = ts_41*m0_14 + ts_42*m0_24 + ts_43*m0_34 + ts_44*m0_44;
+
+        /* Compute dz = sum_ij dz_coef(i,j) * orbit(i) * orbit(j)
+         * where orbit = (x, px, y, py) in the original momentum coordinates.
+         * dz_coef = (ts * m0) / 2, with rel_p corrections on rows/cols 2,4 (1-indexed). */
+        double rp2 = rel_p * rel_p;
+        double dz_x = vx[i], dz_px = vpx[i], dz_y = vy[i], dz_py = vpy[i];
+
+        double dz_val = 0.5 * (
+            tsm_11 * dz_x * dz_x +
+            tsm_13 * dz_x * dz_y +
+            tsm_31 * dz_y * dz_x +
+            tsm_33 * dz_y * dz_y +
+            (tsm_12 * dz_x * dz_px +
+             tsm_21 * dz_px * dz_x +
+             tsm_14 * dz_x * dz_py +
+             tsm_41 * dz_py * dz_x +
+             tsm_32 * dz_y * dz_px +
+             tsm_23 * dz_px * dz_y +
+             tsm_34 * dz_y * dz_py +
+             tsm_43 * dz_py * dz_y) / rel_p +
+            (tsm_22 * dz_px * dz_px +
+             tsm_24 * dz_px * dz_py +
+             tsm_42 * dz_py * dz_px +
+             tsm_44 * dz_py * dz_py) / rp2
+        );
+
+        /* low_energy_z_correction */
+        dz_val += low_energy_z_correction_dev(vpz[i], step_len, beta_val, beta_ref, mc2, e_tot_ele);
+
+        vz[i] += dz_val;
+
+        /* Convert m0 to kmat (px/py coordinates): multiply/divide appropriate rows/cols by rel_p */
+        /* kmat(1,2) = m0(1,2)/rel_p, kmat(1,4) = m0(1,4)/rel_p
+         * kmat(2,1) = m0(2,1)*rel_p, kmat(2,3) = m0(2,3)*rel_p
+         * kmat(3,2) = m0(3,2)/rel_p, kmat(3,4) = m0(3,4)/rel_p
+         * kmat(4,1) = m0(4,1)*rel_p, kmat(4,3) = m0(4,3)*rel_p
+         * kmat(i,j) = m0(i,j) otherwise for i,j in {1,3} or {2,4} same row/col */
+        double km_11 = m0_11;          double km_12 = m0_12 / rel_p;
+        double km_13 = m0_13;          double km_14 = m0_14 / rel_p;
+        double km_21 = m0_21 * rel_p;  double km_22 = m0_22;
+        double km_23 = m0_23 * rel_p;  double km_24 = m0_24;
+        double km_31 = m0_31;          double km_32 = m0_32 / rel_p;
+        double km_33 = m0_33;          double km_34 = m0_34 / rel_p;
+        double km_41 = m0_41 * rel_p;  double km_42 = m0_42;
+        double km_43 = m0_43 * rel_p;  double km_44 = m0_44;
+
+        /* Apply kmat to orbit (x, px, y, py) -- note input is in px/py coords */
+        double ox = vx[i], opx = vpx[i], oy = vy[i], opy = vpy[i];
+        vx[i]  = km_11*ox + km_12*opx + km_13*oy + km_14*opy;
+        vpx[i] = km_21*ox + km_22*opx + km_23*oy + km_24*opy;
+        vy[i]  = km_31*ox + km_32*opx + km_33*oy + km_34*opy;
+        vpy[i] = km_41*ox + km_42*opx + km_43*oy + km_44*opy;
+
+        /* Magnetic multipole kick (half at last step, full otherwise) */
+        if (has_mag) {
+            double kx, ky;
+            multipole_kick_dev(d_a2, d_b2, ix_mag_max, d_cm,
+                               vx[i], vy[i], &kx, &ky);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            vpx[i] += scl * kx;
+            vpy[i] += scl * ky;
+        }
+
+        /* Electric multipole kick (half at last step, full otherwise) */
+        if (has_elec) {
+            double kx, ky;
+            multipole_kick_dev(d_ea2, d_eb2, ix_elec_max, d_cm,
+                               vx[i], vy[i], &kx, &ky);
+            double scl = (istep == n_step) ? 0.5 : 1.0;
+            if (apply_electric_kick_dev(scl * kx / beta_val, scl * ky / beta_val,
+                    &vpx[i], &vpy[i], &vpz[i], &vz[i],
+                    &beta_val, &beta_arr[i], mc2, p0c_val, &state[i])) return;
+        }
+    }
+
+    /* Time update: match CPU formula exactly */
+    t_arr[i] = t_start + delta_ref_time + (z_start - vz[i]) / (beta_val * C_LIGHT);
+}
+
+/* =========================================================================
+ * HOST WRAPPER: gpu_track_solenoid  (combined upload + body + download)
+ * ========================================================================= */
+extern "C" void gpu_track_solenoid_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t,
+    double mc2, double ks0, double ele_length,
+    double delta_ref_time, double e_tot_ele,
+    int n_particles, int n_step,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (ensure_buffers(n_particles) != 0) return;
+
+    if (upload_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                             h_state, h_beta, h_p0c, h_t) != 0) return;
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    solenoid_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ks0, ele_length, delta_ref_time, e_tot_ele,
+        n_particles, n_step,
+        d_a2, d_b2, d_cm, ix_mag_max,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    if (download_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                               h_state, h_beta, h_p0c, h_t,
+                               (ix_elec_max >= 0), 0) != 0) return;
+}
+
+/* Solenoid body-only: data already on device */
+extern "C" void gpu_track_solenoid_dev_(
+    double mc2, double ks0, double ele_length,
+    double delta_ref_time, double e_tot_ele,
+    int n_particles, int n_step,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    solenoid_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ks0, ele_length, delta_ref_time, e_tot_ele,
+        n_particles, n_step,
+        d_a2, d_b2, d_cm, ix_mag_max,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
+/* =========================================================================
+ * HOST WRAPPER: gpu_track_sol_quad  (combined upload + body + download)
+ * ========================================================================= */
+extern "C" void gpu_track_sol_quad_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t,
+    double mc2, double ks_in, double k1_in, double ele_length,
+    double delta_ref_time, double e_tot_ele,
+    int n_particles, int n_step,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (ensure_buffers(n_particles) != 0) return;
+
+    if (upload_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                             h_state, h_beta, h_p0c, h_t) != 0) return;
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    sol_quad_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ks_in, k1_in, ele_length, delta_ref_time, e_tot_ele,
+        n_particles, n_step,
+        d_a2, d_b2, d_cm, ix_mag_max,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    if (download_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                               h_state, h_beta, h_p0c, h_t,
+                               (ix_elec_max >= 0), 0) != 0) return;
+}
+
+/* Sol_quad body-only: data already on device */
+extern "C" void gpu_track_sol_quad_dev_(
+    double mc2, double ks_in, double k1_in, double ele_length,
+    double delta_ref_time, double e_tot_ele,
+    int n_particles, int n_step,
+    double *h_a2, double *h_b2, double *h_cm,
+    int ix_mag_max,
+    double *h_ea2, double *h_eb2, int ix_elec_max)
+{
+    if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
+                              ix_mag_max, ix_elec_max) != 0) return;
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    sol_quad_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        mc2, ks_in, k1_in, ele_length, delta_ref_time, e_tot_ele,
+        n_particles, n_step,
+        d_a2, d_b2, d_cm, ix_mag_max,
+        d_ea2, d_eb2, ix_elec_max);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
 /* ==========================================================================
  * CURAND RNG STATE MANAGEMENT
  * ========================================================================== */
@@ -1702,10 +2677,17 @@ extern "C" void gpu_track_bend_dev_(
     int n_particles,
     double *h_a2, double *h_b2, double *h_cm,
     int ix_mag_max, int n_step,
-    double *h_ea2, double *h_eb2, int ix_elec_max)
+    double *h_ea2, double *h_eb2, int ix_elec_max,
+    int is_exact,
+    double *h_exact_an, double *h_exact_bn,
+    int ix_exact_mag_max,
+    double rho, double c_dir, double exact_f_scale)
 {
     if (upload_multipole_data(h_a2, h_b2, h_cm, h_ea2, h_eb2,
                               ix_mag_max, ix_elec_max) != 0) return;
+    if (is_exact) {
+        if (upload_exact_multipole_data(h_exact_an, h_exact_bn, ix_exact_mag_max) != 0) return;
+    }
 
     int threads = 256;
     int blocks = (n_particles + threads - 1) / threads;
@@ -1715,7 +2697,9 @@ extern "C" void gpu_track_bend_dev_(
         mc2, g, g_tot, dg, b1, ele_length, delta_ref_time, e_tot_ele,
         rel_charge_dir, p0c_ele,
         n_particles, d_a2, d_b2, d_cm, ix_mag_max, n_step,
-        d_ea2, d_eb2, ix_elec_max);
+        d_ea2, d_eb2, ix_elec_max,
+        is_exact, d_exact_an, d_exact_bn, ix_exact_mag_max,
+        rho, c_dir, exact_f_scale);
     CUDA_CHECK_VOID(cudaGetLastError());
     /* sync removed -- persistent path launches next kernel on same stream */
 }

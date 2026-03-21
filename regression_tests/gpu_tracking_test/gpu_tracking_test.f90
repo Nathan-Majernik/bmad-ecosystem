@@ -386,6 +386,36 @@ call bmad_parser('lat_bend_soft_edge.bmad', lat)
 call run_comparison_test('Test 43: Bend soft_edge_only fringe', lat, 1d-6, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 44: Plain solenoid
+! ======================================================================
+call bmad_parser('lat_solenoid_only.bmad', lat)
+call run_comparison_test('Test 44: Plain solenoid', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 45: Solenoid with misalignment
+! ======================================================================
+call bmad_parser('lat_solenoid_misalign.bmad', lat)
+call run_comparison_test('Test 45: Solenoid with misalignment', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 46: Plain sol_quad
+! ======================================================================
+call bmad_parser('lat_sol_quad_only.bmad', lat)
+call run_comparison_test('Test 46: Plain sol_quad', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 47: Sol_quad with misalignment
+! ======================================================================
+call bmad_parser('lat_sol_quad_misalign.bmad', lat)
+call run_comparison_test('Test 47: Sol_quad with misalignment', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 48: Bend with exact_multipoles
+! ======================================================================
+call bmad_parser('lat_bend_exact_multipole.bmad', lat)
+call run_comparison_test('Test 48: Bend exact_multipoles', lat, 1d-6, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *

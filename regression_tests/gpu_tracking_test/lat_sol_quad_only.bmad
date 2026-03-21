@@ -1,0 +1,10 @@
+no_digested
+parameter[lattice] = "GPU tracking plain sol_quad"
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+parameter[geometry] = open
+sq1: sol_quad, L = 0.5, ks = 0.8, k1 = 1.2
+lat: line = (sq1)
+use, lat

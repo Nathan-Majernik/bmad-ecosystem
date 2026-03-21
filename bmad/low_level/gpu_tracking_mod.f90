@@ -15,6 +15,8 @@ public :: track_bunch_thru_quad_gpu
 public :: track_bunch_thru_sextupole_gpu
 public :: track_bunch_thru_bend_gpu
 public :: track_bunch_thru_lcavity_gpu
+public :: track_bunch_thru_solenoid_gpu
+public :: track_bunch_thru_sol_quad_gpu
 public :: track_bunch_thru_pipe_gpu
 public :: check_entrance_aperture_for_gpu
 public :: gpu_rad_eligible
@@ -83,7 +85,10 @@ interface
                             p0c_ele, n_particles, &
                             a2_arr, b2_arr, cm_arr, &
                             ix_mag_max, n_step, &
-                            ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_bend_')
+                            ea2_arr, eb2_arr, ix_elec_max, &
+                            is_exact, exact_an, exact_bn, &
+                            ix_exact_mag_max, rho_val, c_dir_val, &
+                            exact_f_scale) bind(C, name='gpu_track_bend_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
     integer(C_INT), intent(inout) :: state(*)
@@ -96,6 +101,10 @@ interface
     integer(C_INT), value, intent(in) :: ix_mag_max, n_step
     real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
     integer(C_INT), value, intent(in) :: ix_elec_max
+    integer(C_INT), value, intent(in) :: is_exact
+    real(C_DOUBLE), intent(in) :: exact_an(*), exact_bn(*)
+    integer(C_INT), value, intent(in) :: ix_exact_mag_max
+    real(C_DOUBLE), value, intent(in) :: rho_val, c_dir_val, exact_f_scale
   end subroutine
 
   subroutine gpu_track_lcavity(vx, vpx, vy, vpy, vz, vpz, &
@@ -235,12 +244,89 @@ interface
     integer(C_INT), value, intent(in) :: ix_elec_max
   end subroutine
 
+  subroutine gpu_track_solenoid(vx, vpx, vy, vpy, vz, vpz, &
+                            state, beta, p0c, t_time, &
+                            mc2, ks0, ele_length, &
+                            delta_ref_time, e_tot_ele, &
+                            n_particles, n_step, &
+                            a2_arr, b2_arr, cm_arr, &
+                            ix_mag_max, &
+                            ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_solenoid_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(inout) :: state(*)
+    real(C_DOUBLE), intent(inout) :: beta(*), p0c(*), t_time(*)
+    real(C_DOUBLE), value, intent(in) :: mc2, ks0, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele
+    integer(C_INT), value, intent(in) :: n_particles, n_step
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_solenoid_dev(mc2, ks0, ele_length, &
+                                 delta_ref_time, e_tot_ele, &
+                                 n_particles, n_step, &
+                                 a2_arr, b2_arr, cm_arr, &
+                                 ix_mag_max, &
+                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_solenoid_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, ks0, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele
+    integer(C_INT), value, intent(in) :: n_particles, n_step
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_sol_quad(vx, vpx, vy, vpy, vz, vpz, &
+                            state, beta, p0c, t_time, &
+                            mc2, ks_in, k1_in, ele_length, &
+                            delta_ref_time, e_tot_ele, &
+                            n_particles, n_step, &
+                            a2_arr, b2_arr, cm_arr, &
+                            ix_mag_max, &
+                            ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_sol_quad_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(inout) :: state(*)
+    real(C_DOUBLE), intent(inout) :: beta(*), p0c(*), t_time(*)
+    real(C_DOUBLE), value, intent(in) :: mc2, ks_in, k1_in, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele
+    integer(C_INT), value, intent(in) :: n_particles, n_step
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
+  subroutine gpu_track_sol_quad_dev(mc2, ks_in, k1_in, ele_length, &
+                                 delta_ref_time, e_tot_ele, &
+                                 n_particles, n_step, &
+                                 a2_arr, b2_arr, cm_arr, &
+                                 ix_mag_max, &
+                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_sol_quad_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: mc2, ks_in, k1_in, ele_length
+    real(C_DOUBLE), value, intent(in) :: delta_ref_time, e_tot_ele
+    integer(C_INT), value, intent(in) :: n_particles, n_step
+    real(C_DOUBLE), intent(in) :: a2_arr(*), b2_arr(*), cm_arr(*)
+    integer(C_INT), value, intent(in) :: ix_mag_max
+    real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
+    integer(C_INT), value, intent(in) :: ix_elec_max
+  end subroutine
+
   subroutine gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
                                  ele_length, delta_ref_time, e_tot_ele, &
                                  rel_charge_dir, p0c_ele, n_particles, &
                                  a2_arr, b2_arr, cm_arr, &
                                  ix_mag_max, n_step, &
-                                 ea2_arr, eb2_arr, ix_elec_max) bind(C, name='gpu_track_bend_dev_')
+                                 ea2_arr, eb2_arr, ix_elec_max, &
+                                 is_exact, exact_an, exact_bn, &
+                                 ix_exact_mag_max, rho_val, c_dir_val, &
+                                 exact_f_scale) bind(C, name='gpu_track_bend_dev_')
     use, intrinsic :: iso_c_binding
     real(C_DOUBLE), value, intent(in) :: mc2, g, g_tot, dg, b1
     real(C_DOUBLE), value, intent(in) :: ele_length, delta_ref_time, e_tot_ele
@@ -250,6 +336,10 @@ interface
     integer(C_INT), value, intent(in) :: ix_mag_max, n_step
     real(C_DOUBLE), intent(in) :: ea2_arr(*), eb2_arr(*)
     integer(C_INT), value, intent(in) :: ix_elec_max
+    integer(C_INT), value, intent(in) :: is_exact
+    real(C_DOUBLE), intent(in) :: exact_an(*), exact_bn(*)
+    integer(C_INT), value, intent(in) :: ix_exact_mag_max
+    real(C_DOUBLE), value, intent(in) :: rho_val, c_dir_val, exact_f_scale
   end subroutine
 
   subroutine gpu_track_lcavity_dev(mc2, &
@@ -518,7 +608,7 @@ if (.not. ele%is_on) return
 ! Check supported element types
 select case (ele%key)
 case (drift$, quadrupole$, sextupole$, sbend$, lcavity$, pipe$, monitor$, instrument$, &
-      kicker$, hkicker$, vkicker$, marker$)
+      kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$)
   eligible = .true.
 end select
 
@@ -775,6 +865,35 @@ do j = 1, n
 enddo
 
 end subroutine apply_fringe_to_bunch
+
+!------------------------------------------------------------------------
+! apply_sol_fringe_to_bunch — apply fringe with apply_sol_fringe = .false.
+!
+! For solenoid/sol_quad elements, the solenoid fringe is embedded in
+! the body tracking, so the edge kick must NOT apply the solenoid fringe
+! separately.
+!------------------------------------------------------------------------
+subroutine apply_sol_fringe_to_bunch(bunch, ele, param, n, fringe_info, particle_at)
+
+type (bunch_struct),              intent(inout) :: bunch
+type (ele_struct),                intent(in)    :: ele
+type (lat_param_struct),          intent(in)    :: param
+integer,                          intent(in)    :: n
+type (fringe_field_info_struct),  intent(inout) :: fringe_info
+integer,                          intent(in)    :: particle_at
+
+integer :: j
+
+fringe_info%particle_at = particle_at
+do j = 1, n
+  if (bunch%particle(j)%state == alive$) then
+    call apply_element_edge_kick(bunch%particle(j), fringe_info, ele, param, .false., &
+                                  apply_sol_fringe = .false.)
+    if (bunch%particle(j)%state /= alive$) cycle
+  endif
+enddo
+
+end subroutine apply_sol_fringe_to_bunch
 
 !------------------------------------------------------------------------
 ! gpu_tracking_pre — common entrance sequence for GPU element tracking
@@ -1218,18 +1337,21 @@ logical,                 intent(out)   :: did_track
 #ifdef USE_GPU_TRACKING
 integer, parameter :: n_multi = n_pole_maxx + 1
 integer(C_INT) :: n
-integer :: ix_mag_max, ix_elec_max, n_step
+integer :: ix_mag_max, ix_elec_max, n_step, ix_exact_mag_max
 real(rp) :: ele_length, mc2, b1, delta_ref_time, e_tot_ele, p0c_ele
-real(rp) :: g, g_tot, dg, rel_charge_dir
+real(rp) :: g, g_tot, dg, rel_charge_dir, c_dir_val, rho_val, exact_f_scale_val
 real(rp) :: r_step, length, step_len_val
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+real(rp) :: exact_an(0:n_pole_maxx), exact_bn(0:n_pole_maxx)
 type (fringe_field_info_struct) :: fringe_info
 logical :: has_misalign, has_mag_multipoles, has_elec_multipoles, apply_rad
+integer(C_INT) :: is_exact
 
 real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+real(C_DOUBLE) :: exact_an_arr(0:n_pole_maxx), exact_bn_arr(0:n_pole_maxx)
 
 real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
 real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:)
@@ -1252,20 +1374,48 @@ delta_ref_time = ele%value(delta_ref_time$)
 e_tot_ele = ele%value(e_tot$)
 p0c_ele = ele%value(p0c$)
 
-! Bail if exact_multipoles is on — too complex for GPU
-if (nint(ele%value(exact_multipoles$)) /= off$) return
-
 has_misalign = ele%bookkeeping_state%has_misalign
 
 ! Compute charge/direction factors
 rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
                  rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
-! Get multipoles
-call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
-b1 = b1 * rel_charge_dir
-if (abs(b1) < 1d-10) then
-  bn(1) = b1
+c_dir_val = ele%orientation * bunch%particle(1)%direction * charge_of(bunch%particle(1)%species)
+
+! Determine if exact multipoles are in use
+is_exact = 0
+ix_exact_mag_max = -1
+rho_val = 0
+exact_f_scale_val = 0
+exact_an_arr = 0
+exact_bn_arr = 0
+
+if (nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
+  is_exact = 1
+  ! For exact multipoles: b1 is folded into the multipole arrays
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
   b1 = 0
+
+  ! Prepare exact multipole arrays (convert to vertically_pure if horizontally_pure)
+  call multipole_ele_to_ab(ele, .false., ix_exact_mag_max, exact_an, exact_bn, magnetic$, include_kicks$)
+  if (nint(ele%value(exact_multipoles$)) == horizontally_pure$ .and. ix_exact_mag_max /= -1) then
+    call convert_bend_exact_multipole(ele%value(g$), vertically_pure$, exact_an, exact_bn)
+    ix_exact_mag_max = n_pole_maxx
+  endif
+  exact_an_arr = exact_an
+  exact_bn_arr = exact_bn
+
+  rho_val = ele%value(rho$)
+  if (ele%value(l$) /= 0) then
+    exact_f_scale_val = ele%value(p0c$) / (c_light * charge_of(param%particle) * ele%value(l$))
+  endif
+else
+  ! Standard: extract b1 separately
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  b1 = b1 * rel_charge_dir
+  if (abs(b1) < 1d-10) then
+    bn(1) = b1
+    b1 = 0
+  endif
 endif
 
 call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
@@ -1319,7 +1469,11 @@ if (apply_rad .and. associated(ele%rad_map)) then
                           rel_charge_dir, p0c_ele, n, &
                           a2_arr, b2_arr, cm_arr, &
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT), &
+                          is_exact, exact_an_arr, exact_bn_arr, &
+                          int(ix_exact_mag_max, C_INT), &
+                          real(rho_val, C_DOUBLE), real(c_dir_val, C_DOUBLE), &
+                          real(exact_f_scale_val, C_DOUBLE))
   call call_gpu_rad_kick(n, ele%rad_map%rm1)
   call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
                               state_a, beta_a, p0c_a, t_a, &
@@ -1333,7 +1487,11 @@ else
                       rel_charge_dir, p0c_ele, n, &
                       a2_arr, b2_arr, cm_arr, &
                       int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                      ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+                      ea2_arr, eb2_arr, int(ix_elec_max, C_INT), &
+                      is_exact, exact_an_arr, exact_bn_arr, &
+                      int(ix_exact_mag_max, C_INT), &
+                      real(rho_val, C_DOUBLE), real(c_dir_val, C_DOUBLE), &
+                      real(exact_f_scale_val, C_DOUBLE))
 endif
 
 ! Exit: SoA→AoS, deallocate, fringe, misalignment, update s
@@ -1538,6 +1696,305 @@ deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_tim
 #endif
 
 end subroutine track_bunch_thru_lcavity_gpu
+
+!------------------------------------------------------------------------
+! track_bunch_thru_solenoid_gpu
+!
+! GPU batch tracking through a solenoid element.
+! Body tracking uses the solenoid kernel (4x4 rotation matrix).
+! Misalignment and fringe are handled on CPU (fringe with
+! apply_sol_fringe=.false. since the solenoid effect is in the body).
+!------------------------------------------------------------------------
+subroutine track_bunch_thru_solenoid_gpu (bunch, ele, param, did_track)
+
+use multipole_mod, only: ab_multipole_kicks
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer, parameter :: n_multi = n_pole_maxx + 1
+integer(C_INT) :: n
+integer :: ix_mag_max, ix_elec_max, n_step, j
+real(rp) :: ele_length, mc2, b1, delta_ref_time, e_tot_ele
+real(rp) :: rel_tracking_charge, length, ks0, r_step, step_len
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+type (fringe_field_info_struct) :: fringe_info
+logical :: has_misalign, apply_rad
+
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+
+real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:)
+integer(C_INT), allocatable :: state_a(:)
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+n = size(bunch%particle)
+if (n == 0) return
+ele_length = ele%value(l$)
+if (ele_length == 0) then
+  did_track = .true.
+  return
+endif
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+has_misalign = ele%bookkeeping_state%has_misalign
+call init_fringe_info(fringe_info, ele)
+
+! Compute ks0 = rel_tracking_charge * bs_field * charge * c_light / p0c
+! This matches what solenoid_track_and_mat does.
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+ks0 = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+
+! Get multipoles
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) call ensure_rad_map(ele)
+
+! Entrance: misalignment + fringe on CPU (with apply_sol_fringe = .false.)
+allocate(vx(n), vpx(n), vy(n), vpy(n), vz(n), vpz(n))
+allocate(state_a(n), beta_a(n), p0c_a(n), t_a(n))
+
+if (has_misalign) call apply_misalign_to_bunch(bunch, ele, n, set$)
+if (fringe_info%has_fringe) then
+  call apply_sol_fringe_to_bunch(bunch, ele, param, n, fringe_info, first_track_edge$)
+endif
+
+call bunch_to_soa(bunch, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+
+! Precompute multipole arrays
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+did_track = .true.
+
+if (apply_rad .and. associated(ele%rad_map)) then
+  call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                            state_a, beta_a, p0c_a, t_a, n)
+  call call_gpu_rad_kick(n, ele%rad_map%rm0)
+  call gpu_track_solenoid_dev(mc2, ks0, ele_length, delta_ref_time, &
+                              e_tot_ele, n, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  call call_gpu_rad_kick(n, ele%rad_map%rm1)
+  call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, &
+                              n, merge(1, 0, ix_elec_max >= 0), 0)
+else
+  call gpu_track_solenoid(vx, vpx, vy, vpy, vz, vpz, &
+                      state_a, beta_a, p0c_a, t_a, &
+                      mc2, ks0, ele_length, delta_ref_time, &
+                      e_tot_ele, n, int(n_step, C_INT), &
+                      a2_arr, b2_arr, cm_arr, &
+                      int(ix_mag_max, C_INT), &
+                      ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+endif
+
+! Exit: SoA→AoS, fringe, misalignment
+call soa_to_bunch(bunch, ele, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, &
+                   .false., .false.)
+deallocate(vx, vpx, vy, vpy, vz, vpz)
+deallocate(state_a, beta_a, p0c_a, t_a)
+
+if (fringe_info%has_fringe) then
+  call apply_sol_fringe_to_bunch(bunch, ele, param, n, fringe_info, second_track_edge$)
+endif
+if (has_misalign) call apply_misalign_to_bunch(bunch, ele, n, unset$)
+
+do j = 1, n
+  if (bunch%particle(j)%state == alive$) then
+    bunch%particle(j)%s = ele%s
+  endif
+enddo
+#endif
+
+end subroutine track_bunch_thru_solenoid_gpu
+
+!------------------------------------------------------------------------
+! track_bunch_thru_sol_quad_gpu
+!
+! GPU batch tracking through a sol_quad element (combined solenoid +
+! quadrupole).  When b1==0 uses the solenoid kernel, otherwise uses
+! the sol_quad kernel.
+!------------------------------------------------------------------------
+subroutine track_bunch_thru_sol_quad_gpu (bunch, ele, param, did_track)
+
+use multipole_mod, only: ab_multipole_kicks
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer, parameter :: n_multi = n_pole_maxx + 1
+integer(C_INT) :: n
+integer :: ix_mag_max, ix_elec_max, n_step, j
+real(rp) :: ele_length, mc2, b1, delta_ref_time, e_tot_ele
+real(rp) :: rel_tracking_charge, charge_dir, length
+real(rp) :: ks0, ks_val, k1_val, r_step, step_len
+real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
+real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
+type (fringe_field_info_struct) :: fringe_info
+logical :: has_misalign, apply_rad
+
+real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
+real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
+
+real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:)
+integer(C_INT), allocatable :: state_a(:)
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+n = size(bunch%particle)
+if (n == 0) return
+ele_length = ele%value(l$)
+if (ele_length == 0) then
+  did_track = .true.
+  return
+endif
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+has_misalign = ele%bookkeeping_state%has_misalign
+call init_fringe_info(fringe_info, ele)
+
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction
+
+! Get multipoles
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+apply_rad = gpu_rad_eligible(ele)
+if (apply_rad) call ensure_rad_map(ele)
+
+! Entrance: misalignment + fringe on CPU (with apply_sol_fringe = .false.)
+allocate(vx(n), vpx(n), vy(n), vpy(n), vz(n), vpz(n))
+allocate(state_a(n), beta_a(n), p0c_a(n), t_a(n))
+
+if (has_misalign) call apply_misalign_to_bunch(bunch, ele, n, set$)
+if (fringe_info%has_fringe) then
+  call apply_sol_fringe_to_bunch(bunch, ele, param, n, fringe_info, first_track_edge$)
+endif
+
+call bunch_to_soa(bunch, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+
+! Precompute multipole arrays
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+did_track = .true.
+
+! Choose kernel: solenoid (b1==0) or sol_quad (b1 /= 0)
+if (b1 == 0) then
+  ! Pure solenoid tracking (solenoid$ or sol_quad with no quad gradient)
+  ks0 = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+
+  if (apply_rad .and. associated(ele%rad_map)) then
+    call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, n)
+    call call_gpu_rad_kick(n, ele%rad_map%rm0)
+    call gpu_track_solenoid_dev(mc2, ks0, ele_length, delta_ref_time, &
+                                e_tot_ele, n, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+    call call_gpu_rad_kick(n, ele%rad_map%rm1)
+    call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                                state_a, beta_a, p0c_a, t_a, &
+                                n, merge(1, 0, ix_elec_max >= 0), 0)
+  else
+    call gpu_track_solenoid(vx, vpx, vy, vpy, vz, vpz, &
+                        state_a, beta_a, p0c_a, t_a, &
+                        mc2, ks0, ele_length, delta_ref_time, &
+                        e_tot_ele, n, int(n_step, C_INT), &
+                        a2_arr, b2_arr, cm_arr, &
+                        int(ix_mag_max, C_INT), &
+                        ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  endif
+else
+  ! Sol_quad kernel with combined solenoid + quadrupole
+  ks_val = rel_tracking_charge * ele%value(ks$)
+  k1_val = charge_dir * b1 / ele_length
+
+  if (apply_rad .and. associated(ele%rad_map)) then
+    call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, &
+                              state_a, beta_a, p0c_a, t_a, n)
+    call call_gpu_rad_kick(n, ele%rad_map%rm0)
+    call gpu_track_sol_quad_dev(mc2, ks_val, k1_val, ele_length, delta_ref_time, &
+                                e_tot_ele, n, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+    call call_gpu_rad_kick(n, ele%rad_map%rm1)
+    call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, &
+                                state_a, beta_a, p0c_a, t_a, &
+                                n, merge(1, 0, ix_elec_max >= 0), 0)
+  else
+    call gpu_track_sol_quad(vx, vpx, vy, vpy, vz, vpz, &
+                        state_a, beta_a, p0c_a, t_a, &
+                        mc2, ks_val, k1_val, ele_length, delta_ref_time, &
+                        e_tot_ele, n, int(n_step, C_INT), &
+                        a2_arr, b2_arr, cm_arr, &
+                        int(ix_mag_max, C_INT), &
+                        ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  endif
+endif
+
+! Exit: SoA→AoS, fringe, misalignment
+call soa_to_bunch(bunch, ele, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, &
+                   .false., .false.)
+deallocate(vx, vpx, vy, vpy, vz, vpz)
+deallocate(state_a, beta_a, p0c_a, t_a)
+
+if (fringe_info%has_fringe) then
+  call apply_sol_fringe_to_bunch(bunch, ele, param, n, fringe_info, second_track_edge$)
+endif
+if (has_misalign) call apply_misalign_to_bunch(bunch, ele, n, unset$)
+
+do j = 1, n
+  if (bunch%particle(j)%state == alive$) then
+    bunch%particle(j)%s = ele%s
+  endif
+enddo
+#endif
+
+end subroutine track_bunch_thru_sol_quad_gpu
 
 !------------------------------------------------------------------------
 ! track_bunch_thru_pipe_gpu
@@ -1796,6 +2253,11 @@ case (sbend$)
       has_fringe_needs_cpu = .true.
     end select
   endif
+case (solenoid$, sol_quad$)
+  ! Solenoid/sol_quad fringe requires apply_sol_fringe=.false. which needs CPU dispatch.
+  ! For persistent on-device path, these always fall through to per-element tracking.
+  call init_fringe_info(fringe_info, ele)
+  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
 end select
 if (has_fringe_needs_cpu) return
 
@@ -1871,6 +2333,12 @@ integer :: abs_time_flag
 real(C_DOUBLE), allocatable :: h_step_s0(:), h_step_s(:)
 real(C_DOUBLE), allocatable :: h_step_p0c(:), h_step_p1c(:)
 real(C_DOUBLE), allocatable :: h_step_scale(:), h_step_time(:)
+! Exact bend multipole scratch (elements_gpu)
+integer :: ix_exact_mag_max
+integer(C_INT) :: is_exact
+real(rp) :: c_dir_val, rho_val, exact_f_scale_val
+real(rp) :: exact_an(0:n_pole_maxx), exact_bn(0:n_pole_maxx)
+real(C_DOUBLE) :: exact_an_arr(0:n_pole_maxx), exact_bn_arr(0:n_pole_maxx)
 #endif
 
 did_track_to = ix_start - 1
@@ -2018,6 +2486,10 @@ do ie = ix_start, ix_end
       call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
     case (pipe$, monitor$, instrument$)
       call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, did_track)
+    case (solenoid$)
+      call track_bunch_thru_solenoid_gpu(bunch, ele, branch%param, did_track)
+    case (sol_quad$)
+      call track_bunch_thru_sol_quad_gpu(bunch, ele, branch%param, did_track)
     end select
 
     if (.not. did_track) exit
@@ -2384,6 +2856,10 @@ case (sbend$)
   call dispatch_bend_body(ele, param, np)
 case (lcavity$)
   call dispatch_lcavity_body(ele, param, np)
+case (solenoid$)
+  call dispatch_solenoid_body(ele, param, np)
+case (sol_quad$)
+  call dispatch_sol_quad_body(ele, param, np)
 end select
 
 end subroutine dispatch_body_kernel_on_device
@@ -2455,45 +2931,54 @@ delta_ref_time = ele%value(delta_ref_time$)
 e_tot_ele = ele%value(e_tot$)
 p0c_ele = ele%value(p0c$)
 
-if (nint(ele%value(exact_multipoles$)) /= off$) return
-
 rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
                  rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+c_dir_val = ele%orientation * bunch%particle(1)%direction * charge_of(bunch%particle(1)%species)
 
-call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
-b1 = b1 * rel_charge_dir
-if (abs(b1) < 1d-10) then
-  bn(1) = b1
+is_exact = 0; ix_exact_mag_max = -1; rho_val = 0; exact_f_scale_val = 0
+exact_an_arr = 0; exact_bn_arr = 0
+
+if (nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
+  is_exact = 1
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
   b1 = 0
+  call multipole_ele_to_ab(ele, .false., ix_exact_mag_max, exact_an, exact_bn, magnetic$, include_kicks$)
+  if (nint(ele%value(exact_multipoles$)) == horizontally_pure$ .and. ix_exact_mag_max /= -1) then
+    call convert_bend_exact_multipole(ele%value(g$), vertically_pure$, exact_an, exact_bn)
+    ix_exact_mag_max = n_pole_maxx
+  endif
+  exact_an_arr = exact_an; exact_bn_arr = exact_bn
+  rho_val = ele%value(rho$)
+  if (ele%value(l$) /= 0) exact_f_scale_val = ele%value(p0c$) / (c_light * charge_of(param%particle) * ele%value(l$))
+else
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  b1 = b1 * rel_charge_dir
+  if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
 endif
-call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
 
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
 g = ele%value(g$)
 length = bunch%particle(1)%time_dir * ele_length
-if (length == 0) then
-  dg = 0
-else
-  dg = bn(0) / ele_length
-  bn(0) = 0
-endif
+if (length == 0) then; dg = 0; else; dg = bn(0)/ele_length; bn(0) = 0; endif
 g_tot = (g + dg) * rel_charge_dir
-
 has_mag_multipoles = (ix_mag_max > -1)
 has_elec_multipoles = (ix_elec_max > -1)
 n_step = 1
 if (has_mag_multipoles .or. has_elec_multipoles) &
   n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
-
 call precompute_multipole_arrays(bunch%particle(1), ele, &
     ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
     ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
-
 call gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
                         ele_length, delta_ref_time, e_tot_ele, &
                         rel_charge_dir, p0c_ele, np, &
                         a2_arr, b2_arr, cm_arr, &
                         int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                        ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+                        ea2_arr, eb2_arr, int(ix_elec_max, C_INT), &
+                        is_exact, exact_an_arr, exact_bn_arr, &
+                        int(ix_exact_mag_max, C_INT), &
+                        real(rho_val, C_DOUBLE), real(c_dir_val, C_DOUBLE), &
+                        real(exact_f_scale_val, C_DOUBLE))
 end subroutine dispatch_bend_body
 
 !------------------------------------------------------------------------
@@ -2581,6 +3066,91 @@ call gpu_track_lcavity_dev(mc2, &
 deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
 end subroutine dispatch_lcavity_body
 
+!------------------------------------------------------------------------
+subroutine dispatch_solenoid_body(ele, param, np)
+type (ele_struct), intent(in) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+real(rp) :: ks0_val
+
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+ks0_val = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+call gpu_track_solenoid_dev(mc2, ks0_val, ele_length, delta_ref_time, &
+                            e_tot_ele, np, int(n_step, C_INT), &
+                            a2_arr, b2_arr, cm_arr, &
+                            int(ix_mag_max, C_INT), &
+                            ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+end subroutine dispatch_solenoid_body
+
+!------------------------------------------------------------------------
+subroutine dispatch_sol_quad_body(ele, param, np)
+type (ele_struct), intent(in) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+real(rp) :: ks0_val, ks_val, k1_val
+
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+if (b1 == 0) then
+  ! Pure solenoid tracking
+  ks0_val = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+  call gpu_track_solenoid_dev(mc2, ks0_val, ele_length, delta_ref_time, &
+                              e_tot_ele, np, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+else
+  ! Sol_quad tracking
+  ks_val = rel_tracking_charge * ele%value(ks$)
+  k1_val = charge_dir * b1 / ele_length
+  call gpu_track_sol_quad_dev(mc2, ks_val, k1_val, ele_length, delta_ref_time, &
+                              e_tot_ele, np, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+endif
+end subroutine dispatch_sol_quad_body
+
 end subroutine track_bunch_thru_elements_gpu
 
 !------------------------------------------------------------------------
@@ -2640,6 +3210,7 @@ integer :: ix_mag_max, ix_elec_max, n_steps, n_step, i_fringe_at, abs_time_flag
 real(rp) :: mc2, ele_length, b1, delta_ref_time, e_tot_ele, p0c_ele
 real(rp) :: charge_dir, rel_tracking_charge, length, g, g_tot, dg, rel_charge_dir
 real(rp) :: phi0_total, phi0_no_multi, charge_ratio_val, ref_time_start_val
+real(rp) :: ks0, ks_val, k1_val
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
@@ -2652,6 +3223,12 @@ type (fringe_field_info_struct) :: fringe_info
 real(C_DOUBLE), allocatable :: h_step_s0(:), h_step_s(:)
 real(C_DOUBLE), allocatable :: h_step_p0c(:), h_step_p1c(:)
 real(C_DOUBLE), allocatable :: h_step_scale(:), h_step_time(:)
+! Exact bend multipole scratch (persistent)
+integer :: ix_exact_mag_max_p
+integer(C_INT) :: is_exact_p
+real(rp) :: c_dir_val_p, rho_val_p, exact_f_scale_val_p
+real(rp) :: exact_an_p(0:n_pole_maxx), exact_bn_p(0:n_pole_maxx)
+real(C_DOUBLE) :: exact_an_arr_p(0:n_pole_maxx), exact_bn_arr_p(0:n_pole_maxx)
 #endif
 
 did_track = .false.
@@ -2887,12 +3464,28 @@ case (sbend$)
   delta_ref_time = ele%value(delta_ref_time$)
   e_tot_ele = ele%value(e_tot$)
   p0c_ele = ele%value(p0c$)
-  if (nint(ele%value(exact_multipoles$)) /= off$) return
   rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
                    rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
-  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
-  b1 = b1 * rel_charge_dir
-  if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+  c_dir_val_p = ele%orientation * bunch%particle(1)%direction * charge_of(bunch%particle(1)%species)
+  is_exact_p = 0; ix_exact_mag_max_p = -1; rho_val_p = 0; exact_f_scale_val_p = 0
+  exact_an_arr_p = 0; exact_bn_arr_p = 0
+  if (nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
+    is_exact_p = 1
+    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+    b1 = 0
+    call multipole_ele_to_ab(ele, .false., ix_exact_mag_max_p, exact_an_p, exact_bn_p, magnetic$, include_kicks$)
+    if (nint(ele%value(exact_multipoles$)) == horizontally_pure$ .and. ix_exact_mag_max_p /= -1) then
+      call convert_bend_exact_multipole(ele%value(g$), vertically_pure$, exact_an_p, exact_bn_p)
+      ix_exact_mag_max_p = n_pole_maxx
+    endif
+    exact_an_arr_p = exact_an_p; exact_bn_arr_p = exact_bn_p
+    rho_val_p = ele%value(rho$)
+    if (ele%value(l$) /= 0) exact_f_scale_val_p = ele%value(p0c$) / (c_light * charge_of(param%particle) * ele%value(l$))
+  else
+    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+    b1 = b1 * rel_charge_dir
+    if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+  endif
   call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
   g = ele%value(g$)
   length = bunch%particle(1)%time_dir * ele_length
@@ -2911,7 +3504,11 @@ case (sbend$)
                           rel_charge_dir, p0c_ele, np, &
                           a2_arr, b2_arr, cm_arr, &
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT), &
+                          is_exact_p, exact_an_arr_p, exact_bn_arr_p, &
+                          int(ix_exact_mag_max_p, C_INT), &
+                          real(rho_val_p, C_DOUBLE), real(c_dir_val_p, C_DOUBLE), &
+                          real(exact_f_scale_val_p, C_DOUBLE))
 
 case (lcavity$)
   if (ele%value(l$) == 0) return
@@ -2977,6 +3574,63 @@ case (lcavity$)
                              int(np, C_INT), int(abs_time_flag, C_INT), phi0_no_multi, &
                              ref_time_start_val)
   deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
+
+case (solenoid$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  ks0 = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_solenoid_dev(mc2, ks0, ele_length, delta_ref_time, &
+                              e_tot_ele, np, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+
+case (sol_quad$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) return
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  if (b1 == 0) then
+    ks0 = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+    call gpu_track_solenoid_dev(mc2, ks0, ele_length, delta_ref_time, &
+                                e_tot_ele, np, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  else
+    ks_val = rel_tracking_charge * ele%value(ks$)
+    k1_val = charge_dir * b1 / ele_length
+    call gpu_track_sol_quad_dev(mc2, ks_val, k1_val, ele_length, delta_ref_time, &
+                                e_tot_ele, np, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  endif
 end select
 end subroutine
 
@@ -3075,12 +3729,19 @@ integer(C_INT) :: n
 integer :: ix_mag_max, ix_elec_max, n_step
 real(rp) :: mc2, ele_length, b1, delta_ref_time, e_tot_ele, p0c_ele
 real(rp) :: charge_dir, rel_tracking_charge, length, g, g_tot, dg, rel_charge_dir
+real(rp) :: ks0_body, ks_val_body, k1_val_body
 real(rp) :: an(0:n_pole_maxx), bn(0:n_pole_maxx)
 real(rp) :: an_elec(0:n_pole_maxx), bn_elec(0:n_pole_maxx)
 real(C_DOUBLE) :: a2_arr(0:n_pole_maxx), b2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: ea2_arr(0:n_pole_maxx), eb2_arr(0:n_pole_maxx)
 real(C_DOUBLE) :: cm_arr(0:n_pole_maxx, 0:n_pole_maxx)
 logical :: has_mag_multipoles, has_elec_multipoles
+! Exact bend multipole scratch
+integer :: ix_exact_mag_max
+integer(C_INT) :: is_exact
+real(rp) :: c_dir_val, rho_val, exact_f_scale_val
+real(rp) :: exact_an(0:n_pole_maxx), exact_bn(0:n_pole_maxx)
+real(C_DOUBLE) :: exact_an_arr(0:n_pole_maxx), exact_bn_arr(0:n_pole_maxx)
 #endif
 
 did_track = .false.
@@ -3154,12 +3815,28 @@ case (sbend$)
   delta_ref_time = ele%value(delta_ref_time$)
   e_tot_ele = ele%value(e_tot$)
   p0c_ele = ele%value(p0c$)
-  if (nint(ele%value(exact_multipoles$)) /= off$) return
   rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
                    rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
-  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
-  b1 = b1 * rel_charge_dir
-  if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+  c_dir_val = ele%orientation * bunch%particle(1)%direction * charge_of(bunch%particle(1)%species)
+  is_exact = 0; ix_exact_mag_max = -1; rho_val = 0; exact_f_scale_val = 0
+  exact_an_arr = 0; exact_bn_arr = 0
+  if (nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
+    is_exact = 1
+    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+    b1 = 0
+    call multipole_ele_to_ab(ele, .false., ix_exact_mag_max, exact_an, exact_bn, magnetic$, include_kicks$)
+    if (nint(ele%value(exact_multipoles$)) == horizontally_pure$ .and. ix_exact_mag_max /= -1) then
+      call convert_bend_exact_multipole(ele%value(g$), vertically_pure$, exact_an, exact_bn)
+      ix_exact_mag_max = n_pole_maxx
+    endif
+    exact_an_arr = exact_an; exact_bn_arr = exact_bn
+    rho_val = ele%value(rho$)
+    if (ele%value(l$) /= 0) exact_f_scale_val = ele%value(p0c$) / (c_light * charge_of(param%particle) * ele%value(l$))
+  else
+    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+    b1 = b1 * rel_charge_dir
+    if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+  endif
   call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
   g = ele%value(g$)
   length = bunch%particle(1)%time_dir * ele_length
@@ -3178,7 +3855,70 @@ case (sbend$)
                           rel_charge_dir, p0c_ele, n, &
                           a2_arr, b2_arr, cm_arr, &
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT), &
+                          is_exact, exact_an_arr, exact_bn_arr, &
+                          int(ix_exact_mag_max, C_INT), &
+                          real(rho_val, C_DOUBLE), real(c_dir_val, C_DOUBLE), &
+                          real(exact_f_scale_val, C_DOUBLE))
+  did_track = .true.
+
+case (solenoid$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  ks0_body = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  call gpu_track_solenoid_dev(mc2, ks0_body, ele_length, delta_ref_time, &
+                              e_tot_ele, n, int(n_step, C_INT), &
+                              a2_arr, b2_arr, cm_arr, &
+                              int(ix_mag_max, C_INT), &
+                              ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  did_track = .true.
+
+case (sol_quad$)
+  ele_length = ele%value(l$)
+  if (ele_length == 0) then; did_track = .true.; return; endif
+  mc2 = mass_of(bunch%particle(1)%species)
+  delta_ref_time = ele%value(delta_ref_time$)
+  e_tot_ele = ele%value(e_tot$)
+  rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+  charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+  call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+  length = bunch%particle(1)%time_dir * ele_length
+  n_step = 1
+  if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+  call precompute_multipole_arrays(bunch%particle(1), ele, &
+      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+  if (b1 == 0) then
+    ks0_body = rel_tracking_charge * ele%value(bs_field$) * charge_of(bunch%particle(1)%species) * c_light / bunch%particle(1)%p0c
+    call gpu_track_solenoid_dev(mc2, ks0_body, ele_length, delta_ref_time, &
+                                e_tot_ele, n, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  else
+    ks_val_body = rel_tracking_charge * ele%value(ks$)
+    k1_val_body = charge_dir * b1 / ele_length
+    call gpu_track_sol_quad_dev(mc2, ks_val_body, k1_val_body, ele_length, delta_ref_time, &
+                                e_tot_ele, n, int(n_step, C_INT), &
+                                a2_arr, b2_arr, cm_arr, &
+                                int(ix_mag_max, C_INT), &
+                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+  endif
   did_track = .true.
 end select
 

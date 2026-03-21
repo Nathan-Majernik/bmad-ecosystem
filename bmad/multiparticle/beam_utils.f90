@@ -103,6 +103,10 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
         call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, gpu_did_track)
       case (pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
         call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (solenoid$)
+        call track_bunch_thru_solenoid_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (sol_quad$)
+        call track_bunch_thru_sol_quad_gpu(bunch, ele, branch%param, gpu_did_track)
       case (marker$)
         gpu_did_track = .true.  ! Zero-length, no tracking needed
       end select

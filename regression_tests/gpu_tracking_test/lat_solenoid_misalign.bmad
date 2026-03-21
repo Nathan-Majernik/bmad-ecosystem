@@ -1,0 +1,10 @@
+no_digested
+parameter[lattice] = "GPU tracking solenoid with misalignment"
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+parameter[geometry] = open
+sol1: solenoid, L = 0.5, ks = 0.8, x_offset = 1e-3, y_offset = -0.5e-3, tilt = 0.01
+lat: line = (sol1)
+use, lat
