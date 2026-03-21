@@ -58,9 +58,9 @@ beam_init%random_sigma_cutoff = 3
 
 ! Space charge settings
 space_charge_com%ds_track_step = 0.1_rp
-space_charge_com%n_bin = 40
+space_charge_com%n_bin = 2000
 space_charge_com%particle_bin_span = 2
-space_charge_com%space_charge_mesh_size = [16, 16, 32]
+space_charge_com%space_charge_mesh_size = [64, 64, 128]
 
 n_pass = 3
 
