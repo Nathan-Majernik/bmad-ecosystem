@@ -176,9 +176,7 @@ endif
 
 if (resize) then
   min = [minval(xa), minval(ya), minval(za)]
-  max = [maxval(xa), maxval(ya), maxval(za)]
-  ! Guard against NaN from dead/corrupted particles
-  if (any(min /= min) .or. any(max /= max)) return 
+  max = [maxval(xa), maxval(ya), maxval(za)] 
   delta =(max(:) - min(:) ) / (mesh3d%nhi(:) - mesh3d%nlo(:) )
   
   ! Small padding to protect against indexing errors
@@ -215,13 +213,12 @@ endif
 
 if (.not. allocated(mesh3d%rho)) then
   nlo = mesh3d%nlo
-  nhi = mesh3d%nhi
-  ! Allocate with +1 padding in each dimension for trilinear deposition
-  ! (deposit_particles accesses ip+1, jp+1, kp+1 at mesh boundaries)
-  allocate(mesh3d%rho(nlo(1):nhi(1)+1,nlo(2):nhi(2)+1, nlo(3):nhi(3)+1))
-  allocate(mesh3d%phi(nlo(1):nhi(1)+1,nlo(2):nhi(2)+1, nlo(3):nhi(3)+1))
-  allocate(mesh3d%efield(nlo(1):nhi(1)+1,nlo(2):nhi(2)+1, nlo(3):nhi(3)+1, 3))
-  allocate(mesh3d%bfield(nlo(1):nhi(1)+1,nlo(2):nhi(2)+1, nlo(3):nhi(3)+1, 3))
+  nhi = mesh3d%nhi 
+  !print *, 'Allocating new meshes, nlo, nhi: ', nlo, nhi
+  allocate(mesh3d%rho(nlo(1):nhi(1),nlo(2):nhi(2), nlo(3):nhi(3)))
+  allocate(mesh3d%phi(nlo(1):nhi(1),nlo(2):nhi(2), nlo(3):nhi(3)))
+  allocate(mesh3d%efield(nlo(1):nhi(1),nlo(2):nhi(2), nlo(3):nhi(3), 3))
+  allocate(mesh3d%bfield(nlo(1):nhi(1),nlo(2):nhi(2), nlo(3):nhi(3), 3))
 endif
 
 
@@ -266,11 +263,10 @@ endif
 mesh3d%rho(ilo:ihi,jlo:jhi,klo:khi) = 0
 
 do n=1, n_particles
-  ip=floor((xa(n)-xmin)*dxi+1)
+  !if(lostflag(n).ne.0.d0)cycle
+  ip=floor((xa(n)-xmin)*dxi+1) !this is 1-based; use ilogbl for the general case
   jp=floor((ya(n)-ymin)*dyi+1)
   kp=floor((za(n)-zmin)*dzi+1)
-  ! Bounds check: skip particles outside mesh or with NaN coordinates
-  if (ip < ilo .or. ip >= ihi .or. jp < jlo .or. jp >= jhi .or. kp < klo .or. kp >= khi) cycle
   ab=((xmin-xa(n))+ip*dx)*dxi
   de=((ymin-ya(n))+jp*dy)*dyi
   gh=((zmin-za(n))+kp*dz)*dzi
