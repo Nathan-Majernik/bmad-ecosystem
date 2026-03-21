@@ -290,6 +290,13 @@ interface
     integer(C_INT), value, intent(in) :: fringe_type, edge, time_dir, n
   end subroutine
 
+  subroutine gpu_exact_bend_fringe(g_tot, beta0, edge_angle, fint_signed, hgap, &
+      is_exit, n) bind(C, name='gpu_exact_bend_fringe_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), value, intent(in) :: g_tot, beta0, edge_angle, fint_signed, hgap
+    integer(C_INT), value, intent(in) :: is_exit, n
+  end subroutine
+
   subroutine gpu_bend_fringe(g_tot, e_angle, fint_gap, k1, &
       entering, time_dir, n) bind(C, name='gpu_bend_fringe_')
     use, intrinsic :: iso_c_binding
@@ -1748,7 +1755,9 @@ case (sbend$)
   if (fringe_info%has_fringe) then
     select case (nint(ele%value(fringe_type$)))
     case (basic_bend$, hard_edge_only$)
-      ! Handled by gpu_bend_fringe kernel
+      ! Handled by gpu_bend_fringe kernel (Hwang)
+    case (full$)
+      ! Handled by gpu_exact_bend_fringe kernel (PTC-style)
     case default
       has_fringe_needs_cpu = .true.
     end select
@@ -2092,6 +2101,58 @@ case (quadrupole$)
 case (sbend$)
   fringe_type_val = nint(ele%value(fringe_type$))
   if (fringe_type_val == none$) return
+  ! Full (PTC-style) fringe
+  if (fringe_type_val == full$) then
+    block
+      real(rp) :: g_tot_exact, beta0_exact, e_ang_exact, fint_exact, hgap_exact
+      integer :: is_exit_exact, physical_end_exact
+
+      if (ele%is_on) then
+        g_tot_exact = ele%value(g$) + ele%value(dg$)  ! NO charge_dir for exact fringe
+      else
+        g_tot_exact = 0
+      endif
+      beta0_exact = ele%value(p0c$) / ele%value(e_tot$)
+      physical_end_exact = physical_ele_end(edge, bunch%particle(1), ele%orientation)
+
+      ! Hard multipole edge kick at entrance (before exact fringe)
+      if (physical_end_exact == entrance_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        call gpu_quad_fringe(ele%value(k1$), 0.0_rp, 0.0_rp, charge_dir_val, &
+                             int(hard_edge_only$, C_INT), int(edge, C_INT), &
+                             int(bunch%particle(1)%time_dir, C_INT), np)
+      endif
+
+      if (physical_end_exact == entrance_end$) then
+        e_ang_exact = bunch%particle(1)%time_dir * ele%value(e1$)
+        fint_exact = bunch%particle(1)%time_dir * ele%value(fint$)
+        hgap_exact = ele%value(hgap$)
+        is_exit_exact = 0
+      else
+        e_ang_exact = bunch%particle(1)%time_dir * ele%value(e2$)
+        fint_exact = bunch%particle(1)%time_dir * ele%value(fintx$)
+        hgap_exact = ele%value(hgapx$)
+        is_exit_exact = 1
+      endif
+
+      call gpu_exact_bend_fringe(g_tot_exact, beta0_exact, &
+          e_ang_exact, fint_exact, hgap_exact, &
+          int(is_exit_exact, C_INT), np)
+
+      ! Hard multipole edge kick at exit (after exact fringe)
+      if (physical_end_exact == exit_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        call gpu_quad_fringe(ele%value(k1$), 0.0_rp, 0.0_rp, charge_dir_val, &
+                             int(hard_edge_only$, C_INT), int(edge, C_INT), &
+                             int(bunch%particle(1)%time_dir, C_INT), np)
+      endif
+    end block
+    return
+  endif
+
+  ! Basic/hard_edge fringe (Hwang)
   if (fringe_type_val /= basic_bend$ .and. fringe_type_val /= hard_edge_only$) return
 
   charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &

@@ -2074,6 +2074,137 @@ extern "C" void gpu_bend_fringe_(
 }
 
 
+/* ==========================================================================
+ * EXACT BEND FRINGE (PTC-style) -- GPU port of exact_bend_edge_kick
+ * Tracking only (no transfer matrix).
+ * ========================================================================== */
+
+__device__ void vec_bmad_to_ptc_dev(double *v, double beta0) {
+    double pz = v[5], z = v[4];
+    double ib = 1.0/beta0;
+    double ptc5 = (pz*pz + 2*pz) / (ib + sqrt(ib*ib + pz*pz + 2*pz));
+    v[4] = ptc5;
+    v[5] = -z * (ib + ptc5) / (1.0 + pz);
+}
+
+__device__ int vec_ptc_to_bmad_dev(double *v, double beta0) {
+    double ptc5 = v[4], ptc6 = v[5];
+    double pz = sqrt(1.0 + ptc5*(2.0/beta0 + ptc5)) - 1.0;
+    double z = -ptc6 * (1.0 + pz) / (1.0/beta0 + ptc5);
+    v[4] = z;
+    v[5] = pz;
+    return 0;
+}
+
+__device__ int ptc_rot_xz_dev(double a, double *X, double beta0) {
+    double ib = 1.0/beta0;
+    double arg = 1.0 + 2.0*X[4]*ib + X[4]*X[4] - X[1]*X[1] - X[3]*X[3];
+    if (arg < 0) return 1;
+    double pz = sqrt(arg);
+    double pt = 1.0 - X[1]*tan(a)/pz;
+    double x1 = X[0];
+    X[0] = x1 / (cos(a) * pt);
+    X[1] = X[1]*cos(a) + sin(a)*pz;
+    X[2] = X[2] + X[3]*x1*tan(a)/(pz*pt);
+    X[5] = X[5] + x1*tan(a)/(pz*pt) * (ib + X[4]);
+    return 0;
+}
+
+__device__ int ptc_wedger_dev(double a, double g_tot, double beta0, double *X) {
+    if (g_tot == 0.0) return ptc_rot_xz_dev(a, X, beta0);
+    double ib = 1.0/beta0;
+    double b1 = g_tot;
+    double fac = 1.0 + 2.0*X[4]*ib + X[4]*X[4] - X[1]*X[1] - X[3]*X[3];
+    if (fac < 0) return 1;
+    double radix = 1.0 + 2.0*X[4]*ib + X[4]*X[4] - X[3]*X[3];
+    if (radix < 1e-10) return 1;
+    double pz = sqrt(fac), pt = sqrt(radix);
+    double Xn2 = X[1]*cos(a) + (pz - b1*X[0])*sin(a);
+    radix = 1.0 + 2.0*X[4]*ib + X[4]*X[4] - Xn2*Xn2 - X[3]*X[3];
+    if (radix < 1e-10) return 1;
+    double pzs = sqrt(radix);
+    double denom = pzs + pz*cos(a) - X[1]*sin(a);
+    double Xn1 = X[0]*cos(a) + (X[0]*X[1]*sin(2.0*a) +
+        sin(a)*sin(a)*(2.0*X[0]*pz - b1*X[0]*X[0])) / denom;
+    double Xn3_delta = (a + asin(X[1]/pt) - asin(Xn2/pt)) / b1;
+    X[5] = X[5] + Xn3_delta*(ib + X[4]);
+    X[2] = X[2] + X[3]*Xn3_delta;
+    X[0] = Xn1; X[1] = Xn2;
+    return 0;
+}
+
+__device__ int ptc_fringe_dipoler_dev(double *X, double g_tot, double beta0,
+    double fint_signed, double hgap, int is_exit) {
+    double B = is_exit ? -g_tot : g_tot;
+    double ib = 1.0/beta0;
+    double fac = 1.0 + 2.0*X[4]*ib + X[4]*X[4] - X[1]*X[1] - X[3]*X[3];
+    if (fac <= 0) return 1;
+    double pz = sqrt(fac);
+    double xp = X[1]/pz, yp = X[3]/pz;
+    double d12 = xp*yp/pz, d22 = (1.0+yp*yp)/pz, d32 = -yp;
+    double d11 = (1.0+xp*xp)/pz, d21 = xp*yp/pz, d31 = -xp;
+    double time_fac = ib + X[4];
+    double d13 = -time_fac*xp/(pz*pz), d23 = -time_fac*yp/(pz*pz), d33 = time_fac/pz;
+    double fi0 = atan(xp/(1.0+yp*yp)) - B*fint_signed*hgap*2.0*(1.0+xp*xp*(2.0+yp*yp))*pz;
+    double co2 = B / (cos(fi0)*cos(fi0));
+    double co1 = co2 / (1.0 + (xp/(1.0+yp*yp))*(xp/(1.0+yp*yp)));
+    double fi1 = co1/(1.0+yp*yp) - co2*B*fint_signed*hgap*2.0*(2.0*xp*(2.0+yp*yp)*pz);
+    double fi2 = -co1*2.0*xp*yp/((1.0+yp*yp)*(1.0+yp*yp)) - co2*B*fint_signed*hgap*2.0*(2.0*xp*xp*yp)*pz;
+    double fi3 = -co2*B*fint_signed*hgap*2.0*(1.0+xp*xp*(2.0+yp*yp));
+    double fi0t = B*tan(fi0);
+    double bb = fi1*d12 + fi2*d22 + fi3*d32;
+    fac = 1.0 - 2.0*bb*X[2];
+    if (fac < 0) return 1;
+    X[2] = 2.0*X[2] / (1.0 + sqrt(fac));
+    X[3] = X[3] - fi0t*X[2];
+    bb = fi1*d11 + fi2*d21 + fi3*d31;
+    X[0] = X[0] + 0.5*bb*X[2]*X[2];
+    bb = fi1*d13 + fi2*d23 + fi3*d33;
+    X[5] = X[5] - 0.5*bb*X[2]*X[2];
+    return 0;
+}
+
+__global__ void exact_bend_fringe_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state,
+    double g_tot, double beta0,
+    double edge_angle, double fint_signed, double hgap,
+    int is_exit, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+    double X[6] = {vx[i], vpx[i], vy[i], vpy[i], vz[i], vpz[i]};
+    vec_bmad_to_ptc_dev(X, beta0);
+    if (!is_exit) {
+        if (ptc_wedger_dev(edge_angle, 0.0, beta0, X)) { state[i] = LOST_PZ; return; }
+        if (ptc_fringe_dipoler_dev(X, g_tot, beta0, fint_signed, hgap, 0)) { state[i] = LOST_PZ; return; }
+        if (ptc_wedger_dev(-edge_angle, g_tot, beta0, X)) { state[i] = LOST_PZ; return; }
+    } else {
+        if (ptc_wedger_dev(-edge_angle, g_tot, beta0, X)) { state[i] = LOST_PZ; return; }
+        if (ptc_fringe_dipoler_dev(X, g_tot, beta0, fint_signed, hgap, 1)) { state[i] = LOST_PZ; return; }
+        if (ptc_wedger_dev(edge_angle, 0.0, beta0, X)) { state[i] = LOST_PZ; return; }
+    }
+    if (vec_ptc_to_bmad_dev(X, beta0)) { state[i] = LOST_PZ; return; }
+    vx[i] = X[0]; vpx[i] = X[1]; vy[i] = X[2]; vpy[i] = X[3];
+    vz[i] = X[4]; vpz[i] = X[5];
+}
+
+extern "C" void gpu_exact_bend_fringe_(
+    double g_tot, double beta0,
+    double edge_angle, double fint_signed, double hgap,
+    int is_exit, int n)
+{
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    exact_bend_fringe_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5], d_state,
+        g_tot, beta0, edge_angle, fint_signed, hgap, is_exit, n);
+    CUDA_CHECK_VOID(cudaGetLastError());
+}
+
+
 extern "C" void gpu_misalign_(
     double x_off, double y_off, double tilt,
     int set_flag, int n)
