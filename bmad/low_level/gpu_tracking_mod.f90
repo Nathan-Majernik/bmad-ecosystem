@@ -1414,20 +1414,30 @@ if (bmad_com%absolute_time_tracking) then
   endif
 endif
 
-! Extract step data from the lord's RF step array (indices 0..n_steps+1)
-allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
-allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
-allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
+! Extract step data from the lord's RF step array (indices 0..n_steps+1).
+! For step_time, use the MULTIPASS LORD's values when the lord is a
+! multipass slave (matches this_rf_phase which uses mlord%rf%steps%time).
+! Other step fields (s0, s, p0c, p1c, scale) use the actual element's
+! values since they encode the correct reference energy for this pass.
+block
+  type (ele_struct), pointer :: mlord
+  mlord => lord
+  if (lord%slave_status == multipass_slave$) mlord => pointer_to_lord(lord, 1)
 
-do j = 0, n_steps + 1
-  step => lord%rf%steps(j)
-  h_step_s0(j+1)    = step%s0
-  h_step_s(j+1)     = step%s
-  h_step_p0c(j+1)   = step%p0c
-  h_step_p1c(j+1)   = step%p1c
-  h_step_scale(j+1) = step%scale
-  h_step_time(j+1)  = step%time
-enddo
+  allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
+  allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
+  allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
+
+  do j = 0, n_steps + 1
+    step => lord%rf%steps(j)
+    h_step_s0(j+1)    = step%s0
+    h_step_s(j+1)     = step%s
+    h_step_p0c(j+1)   = step%p0c
+    h_step_p1c(j+1)   = step%p1c
+    h_step_scale(j+1) = step%scale
+    h_step_time(j+1)  = mlord%rf%steps(j)%time  ! Use multipass lord's step time
+  enddo
+end block
 
 ! Check if radiation should be applied
 apply_rad = gpu_rad_eligible(ele)
@@ -2294,19 +2304,23 @@ if (bmad_com%absolute_time_tracking) then
   endif
 endif
 
-allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
-allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
-allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
-
-do j = 0, n_steps + 1
-  step => lord%rf%steps(j)
-  h_step_s0(j+1)    = step%s0
-  h_step_s(j+1)     = step%s
-  h_step_p0c(j+1)   = step%p0c
-  h_step_p1c(j+1)   = step%p1c
-  h_step_scale(j+1) = step%scale
-  h_step_time(j+1)  = step%time
-enddo
+block
+  type (ele_struct), pointer :: mlord2
+  mlord2 => lord
+  if (lord%slave_status == multipass_slave$) mlord2 => pointer_to_lord(lord, 1)
+  allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
+  allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
+  allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
+  do j = 0, n_steps + 1
+    step => lord%rf%steps(j)
+    h_step_s0(j+1)    = step%s0
+    h_step_s(j+1)     = step%s
+    h_step_p0c(j+1)   = step%p0c
+    h_step_p1c(j+1)   = step%p1c
+    h_step_scale(j+1) = step%scale
+    h_step_time(j+1)  = mlord2%rf%steps(j)%time
+  enddo
+end block
 
 call gpu_track_lcavity_dev(mc2, &
                            h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
@@ -2685,12 +2699,17 @@ case (lcavity$)
   allocate(h_step_s0(n_steps+2), h_step_s(n_steps+2))
   allocate(h_step_p0c(n_steps+2), h_step_p1c(n_steps+2))
   allocate(h_step_scale(n_steps+2), h_step_time(n_steps+2))
-  do j = 0, n_steps + 1
-    step => lord%rf%steps(j)
-    h_step_s0(j+1) = step%s0; h_step_s(j+1) = step%s
-    h_step_p0c(j+1) = step%p0c; h_step_p1c(j+1) = step%p1c
-    h_step_scale(j+1) = step%scale; h_step_time(j+1) = step%time
-  enddo
+  block
+    type (ele_struct), pointer :: mlord3
+    mlord3 => lord
+    if (lord%slave_status == multipass_slave$) mlord3 => pointer_to_lord(lord, 1)
+    do j = 0, n_steps + 1
+      step => lord%rf%steps(j)
+      h_step_s0(j+1) = step%s0; h_step_s(j+1) = step%s
+      h_step_p0c(j+1) = step%p0c; h_step_p1c(j+1) = step%p1c
+      h_step_scale(j+1) = step%scale; h_step_time(j+1) = mlord3%rf%steps(j)%time
+    enddo
+  end block
   call gpu_track_lcavity_dev(mc2, h_step_s0, h_step_s, h_step_p0c, h_step_p1c, &
                              h_step_scale, h_step_time, int(n_steps, C_INT), &
                              lord%value(voltage$), lord%value(voltage_err$), &
