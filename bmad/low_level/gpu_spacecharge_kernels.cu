@@ -1161,13 +1161,77 @@ extern "C" void gpu_csr_bin_particles_(
         n_bin, particle_bin_span,
         n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
-    CUDA_SC_CHECK(cudaDeviceSynchronize());
+    /* No explicit sync needed — cudaMemcpy DtoH on default stream waits for prior work */
 
     /* Download results */
     CUDA_SC_CHECK(cudaMemcpy(h_bin_charge, d_csr_bin_charge, bsz, cudaMemcpyDeviceToHost));
     CUDA_SC_CHECK(cudaMemcpy(h_bin_x0_wt, d_csr_bin_x0_wt, bsz, cudaMemcpyDeviceToHost));
     CUDA_SC_CHECK(cudaMemcpy(h_bin_y0_wt, d_csr_bin_y0_wt, bsz, cudaMemcpyDeviceToHost));
     CUDA_SC_CHECK(cudaMemcpy(h_bin_n_particle, d_csr_bin_n_particle, bsz, cudaMemcpyDeviceToHost));
+}
+
+
+/* --------------------------------------------------------------------------
+ * gpu_csr_kick_convolve -- GPU-accelerated CSR kick convolution
+ *
+ * Computes kick_csr[i] = coef * sum(j=1..i) I_int_csr[i-j+1] * edge_dcharge_density_dz[j]
+ * This is the O(n_bin^2) convolution that dominates csr_bin_kicks time.
+ * The root-finding (I_csr computation) stays on CPU; only the convolution moves to GPU.
+ * -------------------------------------------------------------------------- */
+__global__ void csr_kick_convolve_kernel(
+    const double *I_int_csr,         /* n_bin+1 elements, I_int_csr[0..n_bin] */
+    const double *edge_dcharge_dz,   /* n_bin elements, edge_dcharge_density_dz[1..n_bin] */
+    double *kick_csr,                /* n_bin output elements */
+    double coef,
+    int n_bin)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  /* bin index 0..n_bin-1 (maps to Fortran 1..n_bin) */
+    if (i >= n_bin) return;
+
+    /* kick[i+1] = coef * sum(j=1..i+1) I_int_csr[i+1-j+1] * edge_dcharge_dz[j]
+     *           = coef * sum(j=0..i) I_int_csr[i-j+1] * edge_dcharge_dz[j+1]
+     * In 0-indexed: sum(j=0..i) I_int[i-j+1] * dcharge[j] */
+    double sum = 0.0;
+    int count = i + 1;
+    for (int j = 0; j < count; j++) {
+        sum += I_int_csr[i - j + 1] * edge_dcharge_dz[j];
+    }
+    kick_csr[i] = coef * sum;
+}
+
+static double *d_csr_I_int = NULL, *d_csr_edge_dcdz = NULL, *d_csr_kick_conv = NULL;
+static int d_csr_conv_cap = 0;
+
+extern "C" void gpu_csr_kick_convolve_(
+    double *h_I_int_csr,        /* n_bin+1 elements (Fortran 0:n_bin) */
+    double *h_edge_dcharge_dz,  /* n_bin elements */
+    double *h_kick_csr,         /* n_bin output elements */
+    double coef, int n_bin)
+{
+    if (n_bin <= 0) return;
+
+    /* Ensure device buffers */
+    if (n_bin > d_csr_conv_cap) {
+        if (d_csr_I_int) { cudaFree(d_csr_I_int); cudaFree(d_csr_edge_dcdz); cudaFree(d_csr_kick_conv); }
+        cudaMalloc((void**)&d_csr_I_int, (n_bin + 1) * sizeof(double));
+        cudaMalloc((void**)&d_csr_edge_dcdz, n_bin * sizeof(double));
+        cudaMalloc((void**)&d_csr_kick_conv, n_bin * sizeof(double));
+        d_csr_conv_cap = n_bin;
+    }
+
+    /* Upload */
+    cudaMemcpy(d_csr_I_int, h_I_int_csr, (n_bin + 1) * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csr_edge_dcdz, h_edge_dcharge_dz, n_bin * sizeof(double), cudaMemcpyHostToDevice);
+
+    /* Launch convolution */
+    int threads = 256;
+    int blocks = (n_bin + threads - 1) / threads;
+    csr_kick_convolve_kernel<<<blocks, threads>>>(
+        d_csr_I_int, d_csr_edge_dcdz, d_csr_kick_conv, coef, n_bin);
+    CUDA_SC_CHECK(cudaGetLastError());
+
+    /* Download results */
+    cudaMemcpy(h_kick_csr, d_csr_kick_conv, n_bin * sizeof(double), cudaMemcpyDeviceToHost);
 }
 
 

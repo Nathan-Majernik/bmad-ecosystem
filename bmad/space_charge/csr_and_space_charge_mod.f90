@@ -539,7 +539,13 @@ if (allocated(csr_in%slice)) then
 endif
 if (.not. allocated(csr_in%slice)) &
     allocate (csr_in%slice(nb_l), csr_in%kick1(-nb_l:nb_l))
-csr_in%slice(:) = csr_bunch_slice_struct()
+! Only zero the fields that are accumulated (charge, x0, y0, n_particle, edge_dcharge_density_dz).
+! Full struct zeroing every sub-step is expensive for n_bin=2000.
+do ii = 1, nb_l
+  csr_in%slice(ii)%charge = 0; csr_in%slice(ii)%x0 = 0; csr_in%slice(ii)%y0 = 0
+  csr_in%slice(ii)%n_particle = 0; csr_in%slice(ii)%edge_dcharge_density_dz = 0
+  csr_in%slice(ii)%kick_csr = 0; csr_in%slice(ii)%kick_lsc = 0
+enddo
 
 ! Fill in z geometry
 do ii = 1, nb_l
@@ -551,7 +557,8 @@ enddo
 ! Prepare per-particle charge array (cached — doesn't change between sub-steps)
 block
   real(C_DOUBLE), allocatable, save :: h_charge_cached_bin(:)
-  integer, save :: h_charge_cached_bin_n = 0
+  real(C_DOUBLE), allocatable, save :: h_bin_ch_s(:), h_bin_x0_s(:), h_bin_y0_s(:), h_bin_np_s(:)
+  integer, save :: h_charge_cached_bin_n = 0, h_bin_s_n = 0
   if (np_l /= h_charge_cached_bin_n) then
     if (allocated(h_charge_cached_bin)) deallocate(h_charge_cached_bin)
     allocate(h_charge_cached_bin(np_l))
@@ -564,34 +571,33 @@ block
     enddo
     h_charge_cached_bin_n = np_l
   endif
-  allocate(h_charge_l(np_l))
-  h_charge_l = h_charge_cached_bin
+  ! Cache bin output arrays (reuse across sub-steps)
+  if (nb_l > h_bin_s_n) then
+    if (allocated(h_bin_ch_s)) deallocate(h_bin_ch_s, h_bin_x0_s, h_bin_y0_s, h_bin_np_s)
+    allocate(h_bin_ch_s(nb_l), h_bin_x0_s(nb_l), h_bin_y0_s(nb_l), h_bin_np_s(nb_l))
+    h_bin_s_n = nb_l
+  endif
+
+  ! GPU binning kernel (reads vz, vx, vy, state from device; outputs bin arrays to host)
+  call gpu_csr_bin_particles(h_charge_cached_bin, int(np_l, C_INT), &
+      h_bin_ch_s, h_bin_x0_s, h_bin_y0_s, h_bin_np_s, &
+      z_min_l, csr_in%dz_slice, dz_particle_l, &
+      int(nb_l, C_INT), int(space_charge_com%particle_bin_span, C_INT))
+
+  ! Copy results into csr%slice and compute edge_dcharge_density_dz
+  do ii = 1, nb_l
+    csr_in%slice(ii)%charge = h_bin_ch_s(ii)
+    if (h_bin_np_s(ii) > 0 .and. h_bin_ch_s(ii) /= 0) then
+      csr_in%slice(ii)%x0 = h_bin_x0_s(ii) / h_bin_ch_s(ii)
+      csr_in%slice(ii)%y0 = h_bin_y0_s(ii) / h_bin_ch_s(ii)
+    endif
+    csr_in%slice(ii)%n_particle = h_bin_np_s(ii)
+    if (ii > 1) then
+      csr_in%slice(ii)%edge_dcharge_density_dz = &
+        (csr_in%slice(ii)%charge - csr_in%slice(ii-1)%charge) / csr_in%dz_slice**2
+    endif
+  enddo
 end block
-
-! GPU binning kernel (reads vz, vx, vy, state from device; outputs bin arrays to host)
-allocate(h_bin_charge_l(nb_l), h_bin_x0_wt_l(nb_l), h_bin_y0_wt_l(nb_l), h_bin_n_particle_l(nb_l))
-call gpu_csr_bin_particles(h_charge_l, int(np_l, C_INT), &
-    h_bin_charge_l, h_bin_x0_wt_l, h_bin_y0_wt_l, h_bin_n_particle_l, &
-    z_min_l, csr_in%dz_slice, dz_particle_l, &
-    int(nb_l, C_INT), int(space_charge_com%particle_bin_span, C_INT))
-
-! Copy results into csr%slice and compute edge_dcharge_density_dz
-do ii = 1, nb_l
-  csr_in%slice(ii)%charge = h_bin_charge_l(ii)
-  if (h_bin_n_particle_l(ii) > 0 .and. h_bin_charge_l(ii) /= 0) then
-    csr_in%slice(ii)%x0 = h_bin_x0_wt_l(ii) / h_bin_charge_l(ii)
-    csr_in%slice(ii)%y0 = h_bin_y0_wt_l(ii) / h_bin_charge_l(ii)
-  endif
-  csr_in%slice(ii)%n_particle = h_bin_n_particle_l(ii)
-  ! Compute charge density gradient (needed by csr_bin_kicks for CSR kick calculation)
-  if (ii > 1) then
-    csr_in%slice(ii)%edge_dcharge_density_dz = &
-      (csr_in%slice(ii)%charge - csr_in%slice(ii-1)%charge) / csr_in%dz_slice**2
-  endif
-enddo
-
-
-deallocate(h_charge_l, h_bin_charge_l, h_bin_x0_wt_l, h_bin_y0_wt_l, h_bin_n_particle_l)
 
 end subroutine csr_bin_particles_gpu
 
@@ -1090,9 +1096,37 @@ n_bin = space_charge_com%n_bin
 
 if (csr%y_source == 0) then
   if (ele%csr_method == one_dim$) then
-    do i = 1, n_bin
-      csr%slice(i)%kick_csr = coef * dot_product(csr%kick1(i:1:-1)%I_int_csr, csr%slice(1:i)%edge_dcharge_density_dz)
-    enddo
+    ! GPU-accelerated convolution when GPU is active (O(n_bin^2) → parallel on GPU)
+    if (bmad_com%gpu_tracking_on) then
+      block
+        use, intrinsic :: iso_c_binding
+        real(C_DOUBLE) :: h_I_int(0:n_bin), h_edge_dcdz(n_bin), h_kick(n_bin)
+        interface
+          subroutine gpu_csr_kick_convolve(h_I_int, h_edge_dcdz, h_kick, coef_in, nb) &
+              bind(C, name='gpu_csr_kick_convolve_')
+            use, intrinsic :: iso_c_binding
+            real(C_DOUBLE), intent(in) :: h_I_int(*), h_edge_dcdz(*)
+            real(C_DOUBLE), intent(out) :: h_kick(*)
+            real(C_DOUBLE), value, intent(in) :: coef_in
+            integer(C_INT), value, intent(in) :: nb
+          end subroutine
+        end interface
+        do i = 0, n_bin
+          h_I_int(i) = csr%kick1(i)%I_int_csr
+        enddo
+        do i = 1, n_bin
+          h_edge_dcdz(i) = csr%slice(i)%edge_dcharge_density_dz
+        enddo
+        call gpu_csr_kick_convolve(h_I_int, h_edge_dcdz, h_kick, real(coef, C_DOUBLE), int(n_bin, C_INT))
+        do i = 1, n_bin
+          csr%slice(i)%kick_csr = h_kick(i)
+        enddo
+      end block
+    else
+      do i = 1, n_bin
+        csr%slice(i)%kick_csr = coef * dot_product(csr%kick1(i:1:-1)%I_int_csr, csr%slice(1:i)%edge_dcharge_density_dz)
+      enddo
+    endif
   endif
 
 else  ! Image charge

@@ -4385,55 +4385,87 @@ case (sextupole$, octupole$, thick_multipole$)
 case (sbend$)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
-  mc2 = mass_of(bunch%particle(1)%species)
-  delta_ref_time = ele%value(delta_ref_time$)
-  e_tot_ele = ele%value(e_tot$)
-  p0c_ele = ele%value(p0c$)
-  rel_charge_dir = ele%orientation * bunch%particle(1)%direction * &
+  ! Cache multipole setup across CSR sub-steps for the same element.
+  ! Only ele_length changes between sub-steps; all coefficients are the same.
+  block
+    integer, save :: cached_bend_ix = -1
+    real(rp), save :: cached_mc2, cached_drt, cached_etot, cached_p0c
+    real(rp), save :: cached_rcd, cached_g, cached_g_tot, cached_dg, cached_b1
+    real(rp), save :: cached_c_dir, cached_rho, cached_efs
+    integer(C_INT), save :: cached_is_exact, cached_ix_emm
+    integer, save :: cached_ix_mm, cached_ix_em
+    real(C_DOUBLE), save :: ca2(0:n_pole_maxx), cb2(0:n_pole_maxx)
+    real(C_DOUBLE), save :: cea2(0:n_pole_maxx), ceb2(0:n_pole_maxx)
+    real(C_DOUBLE), save :: ccm(0:n_pole_maxx, 0:n_pole_maxx)
+    real(C_DOUBLE), save :: cexa(0:n_pole_maxx), cexb(0:n_pole_maxx)
+    logical, save :: cached_has_mag, cached_has_elec
+
+    if (ele%ix_ele /= cached_bend_ix) then
+      ! Cache miss: recompute everything
+      cached_bend_ix = ele%ix_ele
+      cached_mc2 = mass_of(bunch%particle(1)%species)
+      cached_drt = ele%value(delta_ref_time$)
+      cached_etot = ele%value(e_tot$)
+      cached_p0c = ele%value(p0c$)
+      cached_rcd = ele%orientation * bunch%particle(1)%direction * &
                    rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
-  c_dir_val = ele%orientation * bunch%particle(1)%direction * charge_of(bunch%particle(1)%species)
-  is_exact = 0; ix_exact_mag_max = -1; rho_val = 0; exact_f_scale_val = 0
-  exact_an_arr = 0; exact_bn_arr = 0
-  if (nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
-    is_exact = 1
-    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
-    b1 = 0
-    call multipole_ele_to_ab(ele, .false., ix_exact_mag_max, exact_an, exact_bn, magnetic$, include_kicks$)
-    if (nint(ele%value(exact_multipoles$)) == horizontally_pure$ .and. ix_exact_mag_max /= -1) then
-      call convert_bend_exact_multipole(ele%value(g$), vertically_pure$, exact_an, exact_bn)
-      ix_exact_mag_max = n_pole_maxx
+      cached_c_dir = ele%orientation * bunch%particle(1)%direction * charge_of(bunch%particle(1)%species)
+      cached_is_exact = 0; cached_ix_emm = -1; cached_rho = 0; cached_efs = 0
+      cexa = 0; cexb = 0
+      if (nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
+        cached_is_exact = 1
+        call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$)
+        b1 = 0
+        call multipole_ele_to_ab(ele, .false., ix_exact_mag_max, exact_an, exact_bn, magnetic$, include_kicks$)
+        if (nint(ele%value(exact_multipoles$)) == horizontally_pure$ .and. ix_exact_mag_max /= -1) then
+          call convert_bend_exact_multipole(ele%value(g$), vertically_pure$, exact_an, exact_bn)
+          ix_exact_mag_max = n_pole_maxx
+        endif
+        cexa = exact_an; cexb = exact_bn
+        cached_rho = ele%value(rho$)
+        if (ele%value(l$) /= 0) cached_efs = ele%value(p0c$) / (c_light * charge_of(param%particle) * ele%value(l$))
+        cached_ix_emm = ix_exact_mag_max
+      else
+        call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+        b1 = b1 * cached_rcd
+        if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
+      endif
+      call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+      cached_g = ele%value(g$)
+      length = bunch%particle(1)%time_dir * ele_length
+      if (length == 0) then; dg = 0; else; dg = bn(0)/ele_length; bn(0) = 0; endif
+      cached_g_tot = (cached_g + dg) * cached_rcd
+      cached_dg = dg
+      cached_b1 = b1
+      cached_has_mag = (ix_mag_max > -1)
+      cached_has_elec = (ix_elec_max > -1)
+      cached_ix_mm = ix_mag_max
+      cached_ix_em = ix_elec_max
+      n_step = 1
+      if (cached_has_mag .or. cached_has_elec) &
+        n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+      call precompute_multipole_arrays(bunch%particle(1), ele, &
+          ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+          ele_length, n_step, ca2, cb2, cea2, ceb2, ccm)
+    else
+      ! Cache hit: only recompute n_step for the new element length
+      length = bunch%particle(1)%time_dir * ele_length
+      n_step = 1
+      if (cached_has_mag .or. cached_has_elec) &
+        n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
     endif
-    exact_an_arr = exact_an; exact_bn_arr = exact_bn
-    rho_val = ele%value(rho$)
-    if (ele%value(l$) /= 0) exact_f_scale_val = ele%value(p0c$) / (c_light * charge_of(param%particle) * ele%value(l$))
-  else
-    call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
-    b1 = b1 * rel_charge_dir
-    if (abs(b1) < 1d-10) then; bn(1) = b1; b1 = 0; endif
-  endif
-  call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
-  g = ele%value(g$)
-  length = bunch%particle(1)%time_dir * ele_length
-  if (length == 0) then; dg = 0; else; dg = bn(0)/ele_length; bn(0) = 0; endif
-  g_tot = (g + dg) * rel_charge_dir
-  has_mag_multipoles = (ix_mag_max > -1)
-  has_elec_multipoles = (ix_elec_max > -1)
-  n_step = 1
-  if (has_mag_multipoles .or. has_elec_multipoles) &
-    n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
-  call precompute_multipole_arrays(bunch%particle(1), ele, &
-      ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
-      ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
-  call gpu_track_bend_dev(mc2, g, g_tot, dg, b1, &
-                          ele_length, delta_ref_time, e_tot_ele, &
-                          rel_charge_dir, p0c_ele, n, &
-                          a2_arr, b2_arr, cm_arr, &
-                          int(ix_mag_max, C_INT), int(n_step, C_INT), &
-                          ea2_arr, eb2_arr, int(ix_elec_max, C_INT), &
-                          is_exact, exact_an_arr, exact_bn_arr, &
-                          int(ix_exact_mag_max, C_INT), &
-                          real(rho_val, C_DOUBLE), real(c_dir_val, C_DOUBLE), &
-                          real(exact_f_scale_val, C_DOUBLE))
+
+    call gpu_track_bend_dev(cached_mc2, cached_g, cached_g_tot, cached_dg, cached_b1, &
+                            ele_length, cached_drt, cached_etot, &
+                            cached_rcd, cached_p0c, n, &
+                            ca2, cb2, ccm, &
+                            int(cached_ix_mm, C_INT), int(n_step, C_INT), &
+                            cea2, ceb2, int(cached_ix_em, C_INT), &
+                            cached_is_exact, cexa, cexb, &
+                            int(cached_ix_emm, C_INT), &
+                            real(cached_rho, C_DOUBLE), real(cached_c_dir, C_DOUBLE), &
+                            real(cached_efs, C_DOUBLE))
+  end block
   did_track = .true.
 
 case (solenoid$)
