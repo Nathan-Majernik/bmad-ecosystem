@@ -183,14 +183,46 @@ __global__ void sc_reduce_minmax_kernel(
 }
 
 /* --------------------------------------------------------------------------
- * sc_compute_z_adj_dev -- like sc_compute_z_adj but reads dct_ave from device.
+ * sc_z_adj_minmax_kernel -- fused z_adj computation + block min/max reduction.
+ * Computes z_adj = z - dct_ave*beta inline and reduces to per-block min/max,
+ * eliminating the intermediate d_z_adj buffer and one kernel launch.
  * -------------------------------------------------------------------------- */
-__global__ void sc_compute_z_adj_dev(const double *z, const double *beta,
-    double *z_adj, const double *dct_results, int dct_offset, int n)
+__global__ void sc_z_adj_minmax_kernel(
+    const double *z, const double *beta, const int *state,
+    const double *dct_results, int dct_offset,
+    double *block_min, double *block_max, int n)
 {
+    extern __shared__ double sdata[];
+    double *smin = sdata;
+    double *smax = sdata + blockDim.x;
+
+    int tid = threadIdx.x;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    z_adj[i] = z[i] - dct_results[dct_offset] * beta[i];
+
+    double dct_ave = dct_results[dct_offset];
+
+    double local_min = 1e30, local_max = -1e30;
+    if (i < n && state[i] == SC_ALIVE_ST) {
+        double z_adj = z[i] - dct_ave * beta[i];
+        local_min = z_adj;
+        local_max = z_adj;
+    }
+    smin[tid] = local_min;
+    smax[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (smin[tid + s] < smin[tid]) smin[tid] = smin[tid + s];
+            if (smax[tid + s] > smax[tid]) smax[tid] = smax[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_min[blockIdx.x] = smin[0];
+        block_max[blockIdx.x] = smax[0];
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -827,14 +859,6 @@ extern "C" void gpu_space_charge_3d_(
     }
     if (!d_sc_results) cudaMalloc((void**)&d_sc_results, 17*sizeof(double));
 
-    static double *d_z_adj = NULL;
-    static int d_z_adj_size = 0;
-    if (n_particles > d_z_adj_size) {
-        if (d_z_adj) cudaFree(d_z_adj);
-        cudaMalloc((void**)&d_z_adj, n_particles * sizeof(double));
-        d_z_adj_size = n_particles;
-    }
-
     int need_dct = (dct_ave > 1e30 || dct_ave < -1e30 || dct_ave != dct_ave);
 
     /* Pass 1: fused dct_ave + x/y bounds (1 kernel, reads all particles once) */
@@ -860,9 +884,10 @@ extern "C" void gpu_space_charge_3d_(
         cudaMemcpy(d_sc_results + 4, &dct_ave, sizeof(double), cudaMemcpyHostToDevice);
     }
 
-    /* Pass 2: z_adj + z bounds (reads dct_ave from d_sc_results[4] on device) */
-    sc_compute_z_adj_dev<<<n_blocks, threads>>>(dvec[4], dbeta, d_z_adj, d_sc_results, 4, n_particles);
-    z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(d_z_adj, dstate, d_bmin_z, d_bmax_z, n_particles);
+    /* Pass 2: fused z_adj + z bounds (reads dct_ave from d_sc_results[4] on device,
+     * computes z_adj inline, reduces to per-block min/max — no intermediate buffer) */
+    sc_z_adj_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(
+        dvec[4], dbeta, dstate, d_sc_results, 4, d_bmin_z, d_bmax_z, n_particles);
 
     /* GPU reduce pass 2: n_blocks → single zmin/zmax in d_sc_results[5..6] */
     sc_reduce_minmax_kernel<<<1, 256>>>(d_bmin_z, d_bmax_z, d_sc_results, 5, n_blocks);
@@ -1081,7 +1106,6 @@ extern "C" void gpu_space_charge_3d_(
         n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
 
-    /* d_z_adj is static -- not freed here, reused across calls */
 }
 
 /* --------------------------------------------------------------------------
