@@ -1111,7 +1111,14 @@ real(rp) :: r_ratio, r_step, step_len_val, f_charge, f_elec
 
 a2_arr = 0; b2_arr = 0; ea2_arr = 0; eb2_arr = 0; cm_arr = 0
 
-r_ratio = ele%value(p0c$) / particle1%p0c
+! C4 fix: when data is on device (gpu_persist_on_device), host particle p0c
+! is stale after lcavities. Use r_ratio=1 since element bookkeeping ensures
+! ele%value(p0c$) matches the beam's reference p0c at each element.
+if (gpu_persist_on_device) then
+  r_ratio = 1.0_rp
+else
+  r_ratio = ele%value(p0c$) / particle1%p0c
+endif
 r_step = 1.0_rp / n_step
 step_len_val = ele_length / n_step
 
@@ -1380,6 +1387,7 @@ if (ele_length == 0) return
 mc2 = mass_of(bunch%particle(1)%species)
 delta_ref_time = ele%value(delta_ref_time$)
 e_tot_ele = ele%value(e_tot$)
+has_misalign = ele%bookkeeping_state%has_misalign  ! C1 fix: was uninitialized
 
 ! Extract multipole coefficients
 call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1_dummy)
@@ -3160,6 +3168,8 @@ case (solenoid$)
   call dispatch_solenoid_body(ele, param, np)
 case (sol_quad$)
   call dispatch_sol_quad_body(ele, param, np)
+case (sextupole$, octupole$, thick_multipole$, elseparator$)
+  call dispatch_sextupole_body(ele, param, np)
 case (wiggler$, undulator$)
   call dispatch_wiggler_body(ele, param, np)
 end select
@@ -3218,6 +3228,41 @@ call gpu_track_quad_dev(mc2, b1, ele_length, delta_ref_time, &
                         int(ix_mag_max, C_INT), int(n_step, C_INT), &
                         ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 end subroutine dispatch_quad_body
+
+!------------------------------------------------------------------------
+subroutine dispatch_sextupole_body(ele, param, np)
+type (ele_struct), intent(in) :: ele
+type (lat_param_struct), intent(in) :: param
+integer(C_INT), intent(in) :: np
+
+ele_length = ele%value(l$)
+if (ele_length == 0) return
+
+mc2 = mass_of(bunch%particle(1)%species)
+delta_ref_time = ele%value(delta_ref_time$)
+e_tot_ele = ele%value(e_tot$)
+
+call multipole_ele_to_ab(ele, .false., ix_mag_max, an, bn, magnetic$, include_kicks$, b1)
+call multipole_ele_to_ab(ele, .false., ix_elec_max, an_elec, bn_elec, electric$)
+
+length = bunch%particle(1)%time_dir * ele_length
+n_step = 1
+if (ix_mag_max > -1 .or. ix_elec_max > -1) &
+  n_step = max(nint(abs(length) / ele%value(ds_step$)), 1)
+
+rel_tracking_charge = rel_tracking_charge_to_mass(bunch%particle(1), param%particle)
+charge_dir = rel_tracking_charge * ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+
+call precompute_multipole_arrays(bunch%particle(1), ele, &
+    ix_mag_max, an, bn, ix_elec_max, an_elec, bn_elec, &
+    ele_length, n_step, a2_arr, b2_arr, ea2_arr, eb2_arr, cm_arr)
+
+call gpu_track_sextupole_dev(mc2, ele_length, delta_ref_time, &
+                             e_tot_ele, charge_dir, np, &
+                             a2_arr, b2_arr, cm_arr, &
+                             int(ix_mag_max, C_INT), int(n_step, C_INT), &
+                             ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
+end subroutine dispatch_sextupole_body
 
 !------------------------------------------------------------------------
 subroutine dispatch_bend_body(ele, param, np)

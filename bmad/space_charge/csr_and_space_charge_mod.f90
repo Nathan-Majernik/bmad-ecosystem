@@ -344,7 +344,7 @@ do i_step = 0, n_step
     ! GPU body tracking for ALL elements in CSR loop (including bends).
     ! Apply misalignment + fringe at element edges, matching CPU's
     ! offset_particle(set$) → fringe → body → fringe → offset_particle(unset$).
-    if (gpu_csr_active .and. ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
+    if (gpu_csr_active .and. ele%key /= sbend$ .and. ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
       block
         use, intrinsic :: iso_c_binding
         integer(C_INT) :: np_csr
@@ -685,7 +685,7 @@ else
   allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
   do ii = 1, nb_l
     h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
-    h_kick_lsc_l(ii) = 0
+    h_kick_lsc_l(ii) = csr_in%slice(ii)%kick_lsc
   enddo
 
   apply_csr_l = 0; apply_lsc_l = 0
