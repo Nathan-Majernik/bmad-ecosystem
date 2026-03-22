@@ -2611,18 +2611,15 @@ if (bmad_com%csr_and_space_charge_on .and. .not. logic_option(.false., from_csr_
   if (ele%csr_method /= off$ .or. ele%space_charge_method /= off$) return
 endif
 
-! Pipe, monitor, instrument, kicker elements can have multipoles that require
-! the pipe GPU path (quad kernel with b1=0). Without multipoles, they're
-! simple drifts and can stay on device. Markers are always zero-length no-ops.
-if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$ .or. &
-    ele%key == kicker$ .or. ele%key == hkicker$ .or. ele%key == vkicker$) then
+! Pipe, monitor, instrument with multipoles need CPU dispatch (drift kernel
+! can't handle kicks). Kickers always use sextupole kernel which handles kicks.
+if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$) then
   if (allocated(ele%multipole_cache)) then
     if (ele%multipole_cache%ix_pole_mag_max > -1 .or. &
         ele%multipole_cache%ix_kick_mag_max > -1 .or. &
         ele%multipole_cache%ix_pole_elec_max > -1 .or. &
         ele%multipole_cache%ix_kick_elec_max > -1) return
   endif
-  ! No multipoles: can stay on device as drift
 endif
 
 ! All misalignment types handled on GPU:
@@ -2948,9 +2945,9 @@ do ie = ix_start, ix_end
       call track_bunch_thru_bend_gpu(bunch, ele, branch%param, did_track)
     case (lcavity$)
       call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
-    case (pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
+    case (pipe$, monitor$, instrument$)
       call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, did_track)
-    case (sextupole$, octupole$, thick_multipole$, elseparator$)
+    case (sextupole$, octupole$, thick_multipole$, elseparator$, kicker$, hkicker$, vkicker$)
       call track_bunch_thru_sextupole_gpu(bunch, ele, branch%param, did_track)
     case (solenoid$)
       call track_bunch_thru_solenoid_gpu(bunch, ele, branch%param, did_track)
@@ -3320,7 +3317,7 @@ type (lat_param_struct), intent(in) :: param
 integer(C_INT), intent(in) :: np
 
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
+case (drift$, pipe$, monitor$, instrument$)
   call dispatch_drift_body(ele, np)
 case (quadrupole$)
   call dispatch_quad_body(ele, param, np)
@@ -3332,7 +3329,7 @@ case (solenoid$)
   call dispatch_solenoid_body(ele, param, np)
 case (sol_quad$)
   call dispatch_sol_quad_body(ele, param, np)
-case (sextupole$, octupole$, thick_multipole$, elseparator$)
+case (sextupole$, octupole$, thick_multipole$, elseparator$, kicker$, hkicker$, vkicker$)
   call dispatch_sextupole_body(ele, param, np)
 case (wiggler$, undulator$)
   call dispatch_wiggler_body(ele, param, np)
@@ -4030,7 +4027,7 @@ type (lat_param_struct), intent(in) :: param
 integer(C_INT), intent(in) :: np
 
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
+case (drift$, pipe$, monitor$, instrument$)
   mc2 = mass_of(bunch%particle(1)%species)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
@@ -4060,7 +4057,7 @@ case (quadrupole$)
                           int(ix_mag_max, C_INT), int(n_step, C_INT), &
                           ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 
-case (sextupole$, octupole$, thick_multipole$, elseparator$)
+case (sextupole$, octupole$, thick_multipole$, elseparator$, kicker$, hkicker$, vkicker$)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
   mc2 = mass_of(bunch%particle(1)%species)
@@ -4646,7 +4643,7 @@ n = size(bunch%particle)
 if (n == 0) return
 
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
+case (drift$, pipe$, monitor$, instrument$)
   mc2 = mass_of(bunch%particle(1)%species)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
@@ -4677,7 +4674,7 @@ case (quadrupole$)
                           ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   did_track = .true.
 
-case (sextupole$, octupole$, thick_multipole$, elseparator$)
+case (sextupole$, octupole$, thick_multipole$, elseparator$, kicker$, hkicker$, vkicker$)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
   mc2 = mass_of(bunch%particle(1)%species)
