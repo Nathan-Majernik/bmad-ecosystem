@@ -1,0 +1,21 @@
+no_digested
+
+parameter[lattice] = "GPU benchmark: Mixed elements"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 1e9
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+d1: drift, L = 1.0
+q1: quadrupole, L = 0.3, k1 = 0.8
+s1: sextupole, L = 0.2, k2 = 20.0
+b1: sbend, L = 0.5, g = 0.2, fringe_type = basic_bend
+sol1: solenoid, L = 0.3, ks = 0.5
+p1: patch, x_offset = 0.001, y_pitch = 0.005
+
+lat: line = (d1, q1, s1, b1, d1, sol1, p1)
+
+use, lat

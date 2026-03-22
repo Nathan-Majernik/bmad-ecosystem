@@ -29,7 +29,7 @@ end interface
 
 integer(C_INT) :: rc
 
-integer, parameter :: n_lats = 8
+integer, parameter :: n_lats = 13
 integer, parameter :: n_sizes = 3
 integer, parameter :: sizes(n_sizes) = [10000, 100000, 1000000]
 
@@ -58,6 +58,11 @@ lat_files(5) = 'lat_quad_misalign.bmad';        lat_names(5) = 'Quad + misalignm
 lat_files(6) = 'lat_quad_fringe_misalign.bmad'; lat_names(6) = 'Quad + fringe + misalign + tilt'
 lat_files(7) = 'lat_quad_multi_multipole.bmad'; lat_names(7) = 'Quad + sext+oct+skew+misalign+fringe'
 lat_files(8) = 'lat_quad_elec_combo.bmad';      lat_names(8) = 'Quad + elec+mag+fringe+misalign'
+lat_files(9)  = 'lat_bend.bmad';                 lat_names(9)  = 'SBend (basic_bend fringe)'
+lat_files(10) = 'lat_lcavity.bmad';              lat_names(10) = 'Lcavity (1 GHz, 100 kV/m)'
+lat_files(11) = 'lat_sextupole.bmad';            lat_names(11) = 'Sextupole (k2=50)'
+lat_files(12) = 'lat_solenoid.bmad';             lat_names(12) = 'Solenoid (ks=0.8)'
+lat_files(13) = 'lat_mixed.bmad';                lat_names(13) = 'Mixed (bend+sext+sol+patch)'
 
 ! Parse all lattices
 do ilat = 1, n_lats
