@@ -717,6 +717,10 @@ case (drift$, quadrupole$, sextupole$, octupole$, thick_multipole$, elseparator$
   eligible = .true.
 end select
 
+! M3 fix: rf_bend GPU tracking only handles DC bending, not RF fields.
+! Fall back to CPU for nonzero voltage (actual RF deflection).
+if (ele%key == rf_bend$ .and. ele%value(voltage$) /= 0) eligible = .false.
+
 end function ele_gpu_eligible
 
 !------------------------------------------------------------------------
@@ -2691,14 +2695,14 @@ do ie = ix_start, ix_end
     ! For others, use simple 2D offset+tilt kernel.
     has_misalign = ele%bookkeeping_state%has_misalign
     if (has_misalign) then
-      if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+      if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                                    .or. ele%value(roll$) /= 0)) then
         call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
              ele%value(l$) * 0.5_rp, ele%value(angle$), &
              ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
              ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
              ele%value(x_pitch$), ele%value(y_pitch$), 1, n)
-      elseif (ele%key == sbend$) then
+      elseif (ele%key == sbend$ .or. ele%key == rf_bend$) then
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(ref_tilt_tot$), 1, n)
       elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
@@ -2738,14 +2742,14 @@ do ie = ix_start, ix_end
 
     ! Remove misalignment
     if (has_misalign) then
-      if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+      if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                                    .or. ele%value(roll$) /= 0)) then
         call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
              ele%value(l$) * 0.5_rp, ele%value(angle$), &
              ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
              ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
              ele%value(x_pitch$), ele%value(y_pitch$), -1, n)
-      elseif (ele%key == sbend$) then
+      elseif (ele%key == sbend$ .or. ele%key == rf_bend$) then
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(ref_tilt_tot$), -1, n)
       elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
@@ -3702,14 +3706,14 @@ call dispatch_aperture_on_device_pub(ele, n, entrance_end$)
 ! Misalignment
 has_misalign = ele%bookkeeping_state%has_misalign
 if (has_misalign) then
-  if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+  if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                                .or. ele%value(roll$) /= 0)) then
     call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
          ele%value(l$) * 0.5_rp, ele%value(angle$), &
          ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
          ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
          ele%value(x_pitch$), ele%value(y_pitch$), 1, n)
-  elseif (ele%key == sbend$) then
+  elseif (ele%key == sbend$ .or. ele%key == rf_bend$) then
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(ref_tilt_tot$), 1, n)
   elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
@@ -3748,14 +3752,14 @@ call dispatch_fringe_on_device_pub(ele, param, n, second_track_edge$)
 
 ! Remove misalignment
 if (has_misalign) then
-  if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+  if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                                .or. ele%value(roll$) /= 0)) then
     call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
          ele%value(l$) * 0.5_rp, ele%value(angle$), &
          ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
          ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
          ele%value(x_pitch$), ele%value(y_pitch$), -1, n)
-  elseif (ele%key == sbend$) then
+  elseif (ele%key == sbend$ .or. ele%key == rf_bend$) then
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(ref_tilt_tot$), -1, n)
   elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
@@ -3822,17 +3826,9 @@ integer, intent(in) :: edge
 integer :: fringe_type_val
 real(rp) :: charge_dir_val
 
-select case (ele%key)
-case (quadrupole$)
-  fringe_type_val = nint(ele%value(fringe_type$))
-  if (fringe_type_val == none$) return
-  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
-                   ele%orientation * bunch%particle(1)%direction
-  call gpu_quad_fringe(ele%value(k1$), ele%value(fq1$), ele%value(fq2$), &
-                       charge_dir_val, &
-                       int(fringe_type_val, C_INT), int(edge, C_INT), &
-                       int(bunch%particle(1)%time_dir, C_INT), np)
-end select
+! H2 fix: delegate to gpu_apply_fringe_on_device which handles all element types
+! (quad, sextupole, sbend/rf_bend with all fringe types).
+call gpu_apply_fringe_on_device(bunch, ele, param, edge)
 end subroutine
 
 subroutine dispatch_body_kernel_pub(bunch, ele, param, np)
@@ -4784,7 +4780,7 @@ case (sbend$, rf_bend$)
           if (fb_sad /= 0 .and. g_sad /= 0) call gpu_sad_bend_fringe(g_sad, fb_sad, np)
           block
             real(rp) :: g_hw2, e_hw2
-            g_hw2 = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+            g_hw2 = merge((ele%value(g$) + ele%value(dg$)) * charge_dir_val, 0.0_rp, ele%is_on)
             if (phys_end_sad == entrance_end$) then; e_hw2 = ele%value(e1$); else; e_hw2 = ele%value(e2$); endif
             call gpu_bend_fringe(g_hw2, e_hw2, 0.0_rp, k1_sad, &
                 int(entering_sad, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
@@ -4792,7 +4788,7 @@ case (sbend$, rf_bend$)
         else
           block
             real(rp) :: g_hw2, e_hw2
-            g_hw2 = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+            g_hw2 = merge((ele%value(g$) + ele%value(dg$)) * charge_dir_val, 0.0_rp, ele%is_on)
             if (phys_end_sad == entrance_end$) then; e_hw2 = ele%value(e1$); else; e_hw2 = ele%value(e2$); endif
             call gpu_bend_fringe(g_hw2, e_hw2, 0.0_rp, k1_sad, &
                 int(entering_sad, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
@@ -4842,7 +4838,7 @@ case (sbend$, rf_bend$)
           if (fb_sad /= 0 .and. g_sad /= 0) call gpu_sad_bend_fringe(g_sad, fb_sad, np)
           block
             real(rp) :: g_hw2, e_hw2
-            g_hw2 = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+            g_hw2 = merge((ele%value(g$) + ele%value(dg$)) * charge_dir_val, 0.0_rp, ele%is_on)
             e_hw2 = merge(ele%value(e1$), ele%value(e2$), phys_end_sad == entrance_end$)
             call gpu_bend_fringe(g_hw2, e_hw2, 0.0_rp, k1_sad, &
                 int(entering_sad, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
@@ -4850,7 +4846,7 @@ case (sbend$, rf_bend$)
         else
           block
             real(rp) :: g_hw2, e_hw2
-            g_hw2 = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+            g_hw2 = merge((ele%value(g$) + ele%value(dg$)) * charge_dir_val, 0.0_rp, ele%is_on)
             e_hw2 = merge(ele%value(e1$), ele%value(e2$), phys_end_sad == entrance_end$)
             call gpu_bend_fringe(g_hw2, e_hw2, 0.0_rp, k1_sad, &
                 int(entering_sad, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
@@ -4919,14 +4915,14 @@ if (np == 0) return
 
 sf = merge(1, -1, is_set)
 
-if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                              .or. ele%value(roll$) /= 0)) then
   call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
        ele%value(l$) * 0.5_rp, ele%value(angle$), &
        ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
        ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
        ele%value(x_pitch$), ele%value(y_pitch$), sf, np)
-elseif (ele%key == sbend$) then
+elseif (ele%key == sbend$ .or. ele%key == rf_bend$) then
   call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                      ele%value(ref_tilt_tot$), sf, np)
 elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &

@@ -355,6 +355,18 @@ do i_step = 0, n_step
       end block
       call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
       if (.not. gpu_did_track) then
+        ! H4 fix: undo GPU-applied fringe/misalign before CPU fallback
+        ! to avoid double application (track1_bunch_hom will apply them)
+        if (i_step == 1) then
+          block
+            use, intrinsic :: iso_c_binding
+            integer(C_INT) :: np_undo
+            np_undo = size(bunch%particle)
+            ! Undo in reverse order: fringe then misalign
+            call gpu_apply_fringe_on_device(bunch, ele, branch%param, first_track_edge$)
+            call gpu_apply_misalign_on_device(ele, unset$, np_undo)
+          end block
+        endif
         call gpu_persistent_flush(bunch, runt)
         gpu_csr_active = .false.
         call track1_bunch_hom (bunch, runt)
