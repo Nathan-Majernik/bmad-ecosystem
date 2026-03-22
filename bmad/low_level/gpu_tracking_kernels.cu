@@ -4317,6 +4317,46 @@ extern "C" void gpu_orbit_check_(int n)
 }
 
 /* --------------------------------------------------------------------------
+ * gpu_nan_check -- check for NaN/Inf in particle coordinates on device.
+ * Returns the number of alive particles with NaN/Inf in any coordinate.
+ * Enable with GPU_NAN_CHECK=1 environment variable.
+ * -------------------------------------------------------------------------- */
+__global__ void nan_check_kernel(
+    const double *vx, const double *vpx, const double *vy, const double *vpy,
+    const double *vz, const double *vpz, const int *state,
+    int *nan_count, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (state[i] != ALIVE_ST) return;
+    if (isnan(vx[i]) || isinf(vx[i]) ||
+        isnan(vpx[i]) || isinf(vpx[i]) ||
+        isnan(vy[i]) || isinf(vy[i]) ||
+        isnan(vpy[i]) || isinf(vpy[i]) ||
+        isnan(vz[i]) || isinf(vz[i]) ||
+        isnan(vpz[i]) || isinf(vpz[i])) {
+        atomicAdd(nan_count, 1);
+    }
+}
+
+static int *d_nan_count = NULL;
+
+extern "C" int gpu_nan_check_(int n)
+{
+    if (n <= 0) return 0;
+    if (!d_nan_count) cudaMalloc((void**)&d_nan_count, sizeof(int));
+    cudaMemset(d_nan_count, 0, sizeof(int));
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    nan_check_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_nan_count, n);
+    int h_count = 0;
+    cudaMemcpy(&h_count, d_nan_count, sizeof(int), cudaMemcpyDeviceToHost);
+    return h_count;
+}
+
+/* --------------------------------------------------------------------------
  * gpu_save_bunch_buffers -- download current device particle buffers to
  * caller-supplied host arrays so another bunch can use the device.
  * Returns 0 on success, -1 on failure.

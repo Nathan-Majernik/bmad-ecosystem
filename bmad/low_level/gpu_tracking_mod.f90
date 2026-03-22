@@ -531,6 +531,11 @@ interface
     integer(C_INT), value, intent(in) :: n
   end subroutine
 
+  integer(C_INT) function gpu_nan_check(n) bind(C, name='gpu_nan_check_')
+    use, intrinsic :: iso_c_binding
+    integer(C_INT), value, intent(in) :: n
+  end function
+
   ! ----- Space charge and CSR GPU wrappers -----
 
   subroutine gpu_space_charge_3d(h_charge, n_particles, &
@@ -2780,6 +2785,25 @@ do ie = ix_start, ix_end
 
     ! Orbit-too-large check on device
     call gpu_orbit_check(n)
+
+    ! NaN debug check (enable with GPU_NAN_CHECK=1)
+    block
+      logical, save :: nan_check_on = .false., nan_check_checked = .false.
+      character(8) :: nan_env
+      integer(C_INT) :: nan_count
+      if (.not. nan_check_checked) then
+        call get_environment_variable('GPU_NAN_CHECK', nan_env)
+        nan_check_on = (nan_env == '1' .or. nan_env == 'Y')
+        nan_check_checked = .true.
+      endif
+      if (nan_check_on) then
+        nan_count = gpu_nan_check(n)
+        if (nan_count > 0) then
+          print '(A,I6,A,I4,A,I6,A)', ' GPU_NAN_CHECK: ', nan_count, ' NaN particles at ele ', &
+            ele%ix_ele, ' (', ie, ') ' // trim(ele%name)
+        endif
+      endif
+    end block
 
     did_track_to = ie
 
