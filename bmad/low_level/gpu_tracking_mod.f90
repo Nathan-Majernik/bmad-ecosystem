@@ -43,6 +43,11 @@ logical, save :: gpu_hw_available = .false.
 logical, save :: gpu_persist_on_device = .false.
 integer, save :: gpu_persist_n = 0
 integer(8), save :: gpu_persist_bunch_id = 0  ! bunch fingerprint to detect new beams
+
+! Cached device p0c for precompute_multipole_arrays (avoids per-call cudaMemcpy sync).
+! Only lcavity body kernel changes p0c; flag is set after lcavity tracking.
+real(rp), save :: cached_dev_p0c = 0
+logical, save  :: dev_p0c_stale = .true.
 real(rp), allocatable, save :: gp_vx(:), gp_vpx(:), gp_vy(:), gp_vpy(:)
 real(rp), allocatable, save :: gp_vz(:), gp_vpz(:)
 real(rp), allocatable, save :: gp_beta(:), gp_p0c(:), gp_t(:), gp_s(:)
@@ -716,6 +721,7 @@ if (allocated(gp_vx)) deallocate(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
 gpu_persist_n = 0
 gpu_trk_initialized = .false.
 gpu_persist_on_device = .false.
+dev_p0c_stale = .true.
 gpu_persist_bunch_id = 0
 gpu_active_slot = 0
 bmad_com%gpu_tracking_on = .false.
@@ -1167,19 +1173,25 @@ a2_arr = 0; b2_arr = 0; ea2_arr = 0; eb2_arr = 0; cm_arr = 0
 
 ! C4 fix: when data is on device, host particle p0c is stale after lcavities.
 ! Download particle(1)'s p0c from device for correct scaling.
+! Optimization: cache the downloaded value. Only re-download if an lcavity
+! has run since the last download (dev_p0c_stale flag).
 if (gpu_persist_on_device) then
-  block
-    use, intrinsic :: iso_c_binding
-    real(C_DOUBLE) :: dev_p0c
-    interface
-      subroutine gpu_download_first_p0c(h_p0c) bind(C, name='gpu_download_first_p0c_')
-        use, intrinsic :: iso_c_binding
-        real(C_DOUBLE), intent(out) :: h_p0c
-      end subroutine
-    end interface
-    call gpu_download_first_p0c(dev_p0c)
-    r_ratio = ele%value(p0c$) / dev_p0c
-  end block
+  if (dev_p0c_stale) then
+    block
+      use, intrinsic :: iso_c_binding
+      real(C_DOUBLE) :: dev_p0c
+      interface
+        subroutine gpu_download_first_p0c(h_p0c) bind(C, name='gpu_download_first_p0c_')
+          use, intrinsic :: iso_c_binding
+          real(C_DOUBLE), intent(out) :: h_p0c
+        end subroutine
+      end interface
+      call gpu_download_first_p0c(dev_p0c)
+      cached_dev_p0c = dev_p0c
+      dev_p0c_stale = .false.
+    end block
+  endif
+  r_ratio = ele%value(p0c$) / cached_dev_p0c
 else
   r_ratio = ele%value(p0c$) / particle1%p0c
 endif
@@ -3894,6 +3906,7 @@ if (.not. gpu_persist_on_device) then
   call gpu_upload_particles(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
                             gp_state, gp_beta, gp_p0c, gp_t, n)
   gpu_persist_on_device = .true.
+  dev_p0c_stale = .true.  ! new particles uploaded — invalidate p0c cache
 endif
 
 ! --- Track one element on device (same logic as track_bunch_thru_elements_gpu) ---
@@ -4207,6 +4220,7 @@ case (lcavity$)
                              int(np, C_INT), int(abs_time_flag, C_INT), phi0_no_multi, &
                              ref_time_start_val)
   deallocate(h_step_s0, h_step_s, h_step_p0c, h_step_p1c, h_step_scale, h_step_time)
+  dev_p0c_stale = .true.  ! lcavity changes particle p0c on device
 
 case (solenoid$)
   ele_length = ele%value(l$)
@@ -4379,6 +4393,7 @@ do j = 1, n
 enddo
 bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
 gpu_persist_on_device = .false.
+dev_p0c_stale = .true.  ! device state invalidated — cache no longer valid
 
 ! Invalidate the saved multi-bunch slot for this bunch so stale data isn't restored
 block
@@ -4432,6 +4447,7 @@ enddo
 call gpu_upload_particles(gp_vx, gp_vpx, gp_vy, gp_vpy, gp_vz, gp_vpz, &
                           gp_state, gp_beta, gp_p0c, gp_t, n)
 gpu_persist_on_device = .true.
+dev_p0c_stale = .true.  ! new particles uploaded — invalidate p0c cache
 gpu_persist_bunch_id = transfer(loc(bunch%particle(1)%vec(1)), gpu_persist_bunch_id)
 #endif
 
