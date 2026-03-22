@@ -692,8 +692,10 @@ end function
 ! Runtime conditions (bmad_com flags, particle direction, wakefields)
 ! are NOT checked here — those are evaluated at dispatch time.
 !
-! Currently supported element types: drift, quadrupole, sbend, lcavity,
-! pipe, monitor, instrument.
+! Currently supported element types: drift, quadrupole, sextupole, octupole,
+! thick_multipole, elseparator, sbend, rf_bend, lcavity, pipe, monitor,
+! instrument, kicker, hkicker, vkicker, marker, solenoid, sol_quad,
+! wiggler, undulator.
 !------------------------------------------------------------------------
 function ele_gpu_eligible(ele) result (eligible)
 type (ele_struct), intent(in) :: ele
