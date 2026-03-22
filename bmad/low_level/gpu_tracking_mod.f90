@@ -2484,7 +2484,12 @@ endif
 has_fringe_needs_cpu = .false.
 select case (ele%key)
 case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$)
-  ! These elements have no fringe or fringe is handled by the thick multipole path
+  ! These elements have no fringe
+case (octupole$, thick_multipole$, elseparator$)
+  ! These elements use hard_multipole_edge_kick for fringe — not yet on GPU for these types.
+  ! Conservative: fall back to CPU if fringe is enabled.
+  call init_fringe_info(fringe_info, ele)
+  if (fringe_info%has_fringe) has_fringe_needs_cpu = .true.
 case (lcavity$)
   ! Lcavity fringe is already handled on GPU
 case (quadrupole$)
