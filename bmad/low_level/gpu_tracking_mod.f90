@@ -5131,6 +5131,7 @@ integer :: sf
 
 if (.not. gpu_persist_on_device) return
 if (.not. ele%bookkeeping_state%has_misalign) return
+if (ele%key == patch$) return  ! Patch body kernel handles its own coordinate transforms
 if (np == 0) return
 
 sf = merge(1, -1, is_set)
