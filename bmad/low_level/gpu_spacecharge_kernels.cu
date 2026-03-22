@@ -106,6 +106,118 @@ __global__ void sc_fused_pass1_kernel(
     }
 }
 
+/* --------------------------------------------------------------------------
+ * sc_reduce_pass1_kernel -- GPU-side reduction of pass-1 per-block results.
+ * Reduces n_blocks min_x/max_x/min_y/max_y/sum_zb/count arrays to single
+ * values in d_results: [xmin, xmax, ymin, ymax, dct_ave].
+ * Launched with 1 block of 256 threads.
+ * -------------------------------------------------------------------------- */
+__global__ void sc_reduce_pass1_kernel(
+    const double *b_min_x, const double *b_max_x,
+    const double *b_min_y, const double *b_max_y,
+    const double *b_sum_zb, const int *b_count,
+    double *results, int n_blocks, int has_dct)
+{
+    __shared__ double s_mnx[256], s_mxx[256], s_mny[256], s_mxy[256], s_sum[256];
+    __shared__ int s_cnt[256];
+    int tid = threadIdx.x;
+
+    double mnx = 1e30, mxx = -1e30, mny = 1e30, mxy = -1e30, sum = 0.0;
+    int cnt = 0;
+    for (int i = tid; i < n_blocks; i += 256) {
+        if (b_min_x[i] < mnx) mnx = b_min_x[i];
+        if (b_max_x[i] > mxx) mxx = b_max_x[i];
+        if (b_min_y[i] < mny) mny = b_min_y[i];
+        if (b_max_y[i] > mxy) mxy = b_max_y[i];
+        if (has_dct) { sum += b_sum_zb[i]; cnt += b_count[i]; }
+    }
+    s_mnx[tid] = mnx; s_mxx[tid] = mxx; s_mny[tid] = mny; s_mxy[tid] = mxy;
+    s_sum[tid] = sum; s_cnt[tid] = cnt;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_mnx[tid+s] < s_mnx[tid]) s_mnx[tid] = s_mnx[tid+s];
+            if (s_mxx[tid+s] > s_mxx[tid]) s_mxx[tid] = s_mxx[tid+s];
+            if (s_mny[tid+s] < s_mny[tid]) s_mny[tid] = s_mny[tid+s];
+            if (s_mxy[tid+s] > s_mxy[tid]) s_mxy[tid] = s_mxy[tid+s];
+            if (has_dct) { s_sum[tid] += s_sum[tid+s]; s_cnt[tid] += s_cnt[tid+s]; }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        results[0] = s_mnx[0]; results[1] = s_mxx[0];
+        results[2] = s_mny[0]; results[3] = s_mxy[0];
+        results[4] = has_dct ? (s_cnt[0] > 0 ? s_sum[0] / s_cnt[0] : 0.0) : 0.0;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * sc_reduce_minmax_kernel -- GPU-side reduction of per-block min/max.
+ * Reduces n_blocks arrays to single min, max in results[out_offset:out_offset+1].
+ * Launched with 1 block of 256 threads.
+ * -------------------------------------------------------------------------- */
+__global__ void sc_reduce_minmax_kernel(
+    const double *block_min, const double *block_max,
+    double *results, int out_offset, int n_blocks)
+{
+    __shared__ double s_min[256], s_max[256];
+    int tid = threadIdx.x;
+    double mn = 1e30, mx = -1e30;
+    for (int i = tid; i < n_blocks; i += 256) {
+        if (block_min[i] < mn) mn = block_min[i];
+        if (block_max[i] > mx) mx = block_max[i];
+    }
+    s_min[tid] = mn; s_max[tid] = mx;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_min[tid+s] < s_min[tid]) s_min[tid] = s_min[tid+s];
+            if (s_max[tid+s] > s_max[tid]) s_max[tid] = s_max[tid+s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        results[out_offset]   = s_min[0];
+        results[out_offset+1] = s_max[0];
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * sc_compute_z_adj_dev -- like sc_compute_z_adj but reads dct_ave from device.
+ * -------------------------------------------------------------------------- */
+__global__ void sc_compute_z_adj_dev(const double *z, const double *beta,
+    double *z_adj, const double *dct_results, int dct_offset, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    z_adj[i] = z[i] - dct_results[dct_offset] * beta[i];
+}
+
+/* --------------------------------------------------------------------------
+ * sc_compute_grid_params -- compute mesh parameters from bounds on device.
+ * Reads results[0..6] = {xmin, xmax, ymin, ymax, dct_ave, zmin, zmax}
+ * Writes results[7..16] = {xmin_padded, ymin_padded, zmin_padded, dx, dy, dz,
+ *                          dxi, dyi, dzi, dz_rf}
+ * Single-thread kernel.
+ * -------------------------------------------------------------------------- */
+__global__ void sc_compute_grid_params(double *results,
+    int nx, int ny, int nz, double gamma)
+{
+    if (threadIdx.x != 0) return;
+    double xmin = results[0], xmax = results[1];
+    double ymin = results[2], ymax = results[3];
+    double zmin = results[5], zmax = results[6];
+    double dx = (xmax-xmin)/(nx-1), dy = (ymax-ymin)/(ny-1), dz = (zmax-zmin)/(nz-1);
+    if (dx == 0) dx = 1e-10; if (dy == 0) dy = 1e-10; if (dz == 0) dz = 1e-10;
+    xmin -= 1e-6*dx; ymin -= 1e-6*dy; zmin -= 1e-6*dz;
+    xmax += 1e-6*dx; ymax += 1e-6*dy; zmax += 1e-6*dz;
+    dx = (xmax-xmin)/(nx-1); dy = (ymax-ymin)/(ny-1); dz = (zmax-zmin)/(nz-1);
+    results[7]  = xmin;  results[8]  = ymin;  results[9]  = zmin;
+    results[10] = dx;    results[11] = dy;    results[12] = dz;
+    results[13] = 1.0/dx; results[14] = 1.0/dy; results[15] = 1.0/dz;
+    results[16] = dz * gamma;
+}
+
 /* =========================================================================
  * 3D FFT SPACE CHARGE -- CUDA KERNELS
  * ========================================================================= */
@@ -532,15 +644,7 @@ static double *h_cbk_I_int_csr = NULL;
 static int h_cbk_geom_cap = 0;
 static int h_cbk_kick1_cap = 0;
 
-/* Static host buffers for space charge block reductions */
-static double *h_sc_bsum = NULL;
-static int *h_sc_bcnt = NULL;
-static int h_sc_bsum_cap = 0;
-
-static double *h_sc_bmin_x = NULL, *h_sc_bmax_x = NULL;
-static double *h_sc_bmin_y = NULL, *h_sc_bmax_y = NULL;
-static double *h_sc_bmin_z = NULL, *h_sc_bmax_z = NULL;
-static int h_sc_bounds_cap = 0;
+/* (GPU-side reduction replaced per-block host buffers — see sc_reduce_pass1_kernel) */
 
 /* Static host buffers for gpu_csr_z_minmax_ */
 static double *h_zminmax_bmin = NULL, *h_zminmax_bmax = NULL;
@@ -679,14 +783,16 @@ extern "C" void gpu_space_charge_3d_(
         }
     }
 
-    /* --- Step 1: Compute dct_ave + x/y bounds (fused pass 1), then z_adj + z bounds (pass 2) ---
-     * Pass 1: single fused kernel computes sum(z/beta), count(alive), min/max x, min/max y.
-     * This replaces 3 separate kernels + 1 sync with 1 kernel + 1 sync.
-     * Pass 2: z_adj + z bounds (needs dct_ave from pass 1). */
+    /* --- Step 1: Compute bounds + dct_ave entirely on GPU, single download ---
+     * Pass 1: fused kernel → per-block results → GPU reduce → d_sc_results[0..4]
+     * Pass 2: z_adj + z bounds → GPU reduce → d_sc_results[5..6]
+     * Grid params kernel → d_sc_results[7..16]
+     * Single cudaMemcpy of 17 doubles replaces 2 cudaDeviceSynchronize + 8 cudaMemcpy. */
 
     static double *d_bmin_x=NULL, *d_bmax_x=NULL, *d_bmin_y=NULL, *d_bmax_y=NULL;
     static double *d_bmin_z=NULL, *d_bmax_z=NULL;
     static double *d_block_sum=NULL; static int *d_block_count=NULL;
+    static double *d_sc_results=NULL;  /* 17 doubles: bounds + grid params */
     static int reduce_cached_nb = 0;
     if (n_blocks > reduce_cached_nb) {
         if (d_bmin_x) { cudaFree(d_bmin_x); cudaFree(d_bmax_x); cudaFree(d_bmin_y);
@@ -702,6 +808,7 @@ extern "C" void gpu_space_charge_3d_(
         cudaMalloc((void**)&d_block_count, n_blocks*sizeof(int));
         reduce_cached_nb = n_blocks;
     }
+    if (!d_sc_results) cudaMalloc((void**)&d_sc_results, 17*sizeof(double));
 
     static double *d_z_adj = NULL;
     static int d_z_adj_size = 0;
@@ -724,61 +831,37 @@ extern "C" void gpu_space_charge_3d_(
         z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(dvec[0], dstate, d_bmin_x, d_bmax_x, n_particles);
         z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(dvec[2], dstate, d_bmin_y, d_bmax_y, n_particles);
     }
-    cudaDeviceSynchronize();
 
-    /* Download pass 1 and compute dct_ave */
-    if (n_blocks > h_sc_bounds_cap) {
-        free(h_sc_bmin_x); free(h_sc_bmax_x); free(h_sc_bmin_y);
-        free(h_sc_bmax_y); free(h_sc_bmin_z); free(h_sc_bmax_z);
-        h_sc_bmin_x = (double*)malloc(n_blocks*sizeof(double));
-        h_sc_bmax_x = (double*)malloc(n_blocks*sizeof(double));
-        h_sc_bmin_y = (double*)malloc(n_blocks*sizeof(double));
-        h_sc_bmax_y = (double*)malloc(n_blocks*sizeof(double));
-        h_sc_bmin_z = (double*)malloc(n_blocks*sizeof(double));
-        h_sc_bmax_z = (double*)malloc(n_blocks*sizeof(double));
-        h_sc_bounds_cap = n_blocks;
-    }
-    if (need_dct) {
-        if (n_blocks > h_sc_bsum_cap) {
-            free(h_sc_bsum); free(h_sc_bcnt);
-            h_sc_bsum = (double*)malloc(n_blocks*sizeof(double));
-            h_sc_bcnt = (int*)malloc(n_blocks*sizeof(int));
-            h_sc_bsum_cap = n_blocks;
-        }
-        cudaMemcpy(h_sc_bsum, d_block_sum, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_sc_bcnt, d_block_count, n_blocks*sizeof(int), cudaMemcpyDeviceToHost);
-        double sum_zb = 0.0; int n_alive = 0;
-        for (int i = 0; i < n_blocks; i++) { sum_zb += h_sc_bsum[i]; n_alive += h_sc_bcnt[i]; }
-        dct_ave = (n_alive > 0) ? sum_zb / n_alive : 0.0;
-    }
-    cudaMemcpy(h_sc_bmin_x, d_bmin_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sc_bmax_x, d_bmax_x, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sc_bmin_y, d_bmin_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sc_bmax_y, d_bmax_y, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
+    /* GPU reduce pass 1: n_blocks → single xmin/xmax/ymin/ymax/dct_ave in d_sc_results[0..4] */
+    sc_reduce_pass1_kernel<<<1, 256>>>(
+        d_bmin_x, d_bmax_x, d_bmin_y, d_bmax_y,
+        d_block_sum, d_block_count,
+        d_sc_results, n_blocks, need_dct);
 
-    /* Pass 2: z_adj + z bounds (needs dct_ave from pass 1) */
-    sc_compute_z_adj<<<n_blocks, threads>>>(dvec[4], dbeta, d_z_adj, dct_ave, n_particles);
+    if (!need_dct) {
+        /* Upload known dct_ave to d_sc_results[4] */
+        cudaMemcpy(d_sc_results + 4, &dct_ave, sizeof(double), cudaMemcpyHostToDevice);
+    }
+
+    /* Pass 2: z_adj + z bounds (reads dct_ave from d_sc_results[4] on device) */
+    sc_compute_z_adj_dev<<<n_blocks, threads>>>(dvec[4], dbeta, d_z_adj, d_sc_results, 4, n_particles);
     z_minmax_kernel<<<n_blocks, threads, 2*threads*sizeof(double)>>>(d_z_adj, dstate, d_bmin_z, d_bmax_z, n_particles);
-    cudaDeviceSynchronize();
-    cudaMemcpy(h_sc_bmin_z, d_bmin_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sc_bmax_z, d_bmax_z, n_blocks*sizeof(double), cudaMemcpyDeviceToHost);
 
-    double xmin=1e30, xmax=-1e30, ymin=1e30, ymax=-1e30, zmin=1e30, zmax=-1e30;
-    for (int i = 0; i < n_blocks; i++) {
-        if (h_sc_bmin_x[i] < xmin) xmin = h_sc_bmin_x[i]; if (h_sc_bmax_x[i] > xmax) xmax = h_sc_bmax_x[i];
-        if (h_sc_bmin_y[i] < ymin) ymin = h_sc_bmin_y[i]; if (h_sc_bmax_y[i] > ymax) ymax = h_sc_bmax_y[i];
-        if (h_sc_bmin_z[i] < zmin) zmin = h_sc_bmin_z[i]; if (h_sc_bmax_z[i] > zmax) zmax = h_sc_bmax_z[i];
-    }
+    /* GPU reduce pass 2: n_blocks → single zmin/zmax in d_sc_results[5..6] */
+    sc_reduce_minmax_kernel<<<1, 256>>>(d_bmin_z, d_bmax_z, d_sc_results, 5, n_blocks);
 
-    double dx = (xmax-xmin)/(nx-1), dy = (ymax-ymin)/(ny-1), dz = (zmax-zmin)/(nz-1);
-    if (dx == 0) dx = 1e-10; if (dy == 0) dy = 1e-10; if (dz == 0) dz = 1e-10;
-    /* Small padding */
-    xmin -= 1e-6*dx; xmax += 1e-6*dx;
-    ymin -= 1e-6*dy; ymax += 1e-6*dy;
-    zmin -= 1e-6*dz; zmax += 1e-6*dz;
-    dx = (xmax-xmin)/(nx-1); dy = (ymax-ymin)/(ny-1); dz = (zmax-zmin)/(nz-1);
+    /* Compute grid params on GPU: d_sc_results[7..16] */
+    sc_compute_grid_params<<<1, 1>>>(d_sc_results, nx, ny, nz, gamma);
 
-    double dxi = 1.0/dx, dyi = 1.0/dy, dzi = 1.0/dz;
+    /* Single download: 17 doubles (replaces 2 cudaDeviceSynchronize + 8 cudaMemcpy) */
+    double h_sc_results[17];
+    cudaMemcpy(h_sc_results, d_sc_results, 17*sizeof(double), cudaMemcpyDeviceToHost);
+
+    if (need_dct) dct_ave = h_sc_results[4];
+    double xmin = h_sc_results[7],  ymin = h_sc_results[8],  zmin = h_sc_results[9];
+    double dx   = h_sc_results[10], dy   = h_sc_results[11], dz   = h_sc_results[12];
+    double dxi  = h_sc_results[13], dyi  = h_sc_results[14], dzi  = h_sc_results[15];
+    double dz_rf_local = h_sc_results[16];
 
     /* --- Step 2: Deposit particles on mesh --- */
     CUDA_SC_CHECK(cudaMemset(d_sc_rho, 0, mesh_size * sizeof(double)));
@@ -876,7 +959,7 @@ extern "C" void gpu_space_charge_3d_(
     static int grn_cache_nx2 = 0, grn_cache_ny2 = 0, grn_cache_nz2 = 0;
     static int grn_cache_valid = 0;
 
-    double dz_rf = dz * gamma;
+    double dz_rf = dz_rf_local;  /* already computed on GPU */
     int grn_hit = 0;
     if (grn_cache_valid &&
         grn_cache_nx2 == nx2 && grn_cache_ny2 == ny2 && grn_cache_nz2 == nz2) {
@@ -940,8 +1023,20 @@ extern "C" void gpu_space_charge_3d_(
         }
     }
 
-    /* Sync all 3 component streams before interpolation on default stream */
-    for (int c = 0; c < 3; c++) cudaStreamSynchronize(sc_streams[c]);
+    /* Use events instead of cudaStreamSynchronize to avoid blocking CPU.
+     * Default stream waits for all 3 component streams via GPU-side events. */
+    {
+        static cudaEvent_t sc_comp_done[3] = {0, 0, 0};
+        static int sc_events_created = 0;
+        if (!sc_events_created) {
+            for (int c = 0; c < 3; c++) cudaEventCreateWithFlags(&sc_comp_done[c], cudaEventDisableTiming);
+            sc_events_created = 1;
+        }
+        for (int c = 0; c < 3; c++) {
+            cudaEventRecord(sc_comp_done[c], sc_streams[c]);
+            cudaStreamWaitEvent(0, sc_comp_done[c], 0);  /* default stream waits */
+        }
+    }
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
     sc_interpolate_kick_kernel<<<blocks_p, threads>>>(
@@ -1138,21 +1233,14 @@ extern "C" void gpu_csr_fused_minmax_bin_(
     z_minmax_kernel<<<blocks_p, threads, 2 * threads * sizeof(double)>>>(
         dvec[4], dstate, d_zminmax_bmin, d_zminmax_bmax, n_particles);
 
-    /* Download z_min/z_max block results — the cudaMemcpy implicitly syncs */
-    if (blocks_p > h_zminmax_cap) {
-        free(h_zminmax_bmin); free(h_zminmax_bmax);
-        h_zminmax_bmin = (double*)malloc(blocks_p * sizeof(double));
-        h_zminmax_bmax = (double*)malloc(blocks_p * sizeof(double));
-        h_zminmax_cap = blocks_p;
-    }
-    cudaMemcpy(h_zminmax_bmin, d_zminmax_bmin, blocks_p * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_zminmax_bmax, d_zminmax_bmax, blocks_p * sizeof(double), cudaMemcpyDeviceToHost);
+    /* GPU-side reduction: n_blocks → single zmin/zmax (eliminates CPU reduction loop) */
+    static double *d_csr_z_result = NULL;
+    if (!d_csr_z_result) cudaMalloc((void**)&d_csr_z_result, 2*sizeof(double));
+    sc_reduce_minmax_kernel<<<1, 256>>>(d_zminmax_bmin, d_zminmax_bmax, d_csr_z_result, 0, blocks_p);
 
-    double zmin = 1e30, zmax = -1e30;
-    for (int i = 0; i < blocks_p; i++) {
-        if (h_zminmax_bmin[i] < zmin) zmin = h_zminmax_bmin[i];
-        if (h_zminmax_bmax[i] > zmax) zmax = h_zminmax_bmax[i];
-    }
+    double h_zr[2];
+    cudaMemcpy(h_zr, d_csr_z_result, 2*sizeof(double), cudaMemcpyDeviceToHost);
+    double zmin = h_zr[0], zmax = h_zr[1];
     *h_z_min_out = zmin;
     *h_z_max_out = zmax;
 
@@ -2025,17 +2113,7 @@ extern "C" void gpu_spacecharge_cleanup_(void)
     free(h_cbk_I_int_csr); h_cbk_I_int_csr = NULL;
     h_cbk_kick1_cap = 0;
 
-    /* Space charge host buffers */
-    free(h_sc_bsum); h_sc_bsum = NULL;
-    free(h_sc_bcnt); h_sc_bcnt = NULL;
-    h_sc_bsum_cap = 0;
-    free(h_sc_bmin_x); h_sc_bmin_x = NULL;
-    free(h_sc_bmax_x); h_sc_bmax_x = NULL;
-    free(h_sc_bmin_y); h_sc_bmin_y = NULL;
-    free(h_sc_bmax_y); h_sc_bmax_y = NULL;
-    free(h_sc_bmin_z); h_sc_bmin_z = NULL;
-    free(h_sc_bmax_z); h_sc_bmax_z = NULL;
-    h_sc_bounds_cap = 0;
+    /* (GPU-side reduction replaced per-block host buffers) */
 
     /* z_minmax cached buffers */
     if (d_zminmax_bmin) { cudaFree(d_zminmax_bmin); d_zminmax_bmin = NULL; }
