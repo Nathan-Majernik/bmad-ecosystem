@@ -30,6 +30,7 @@ public :: gpu_persistent_track_element, gpu_persistent_flush, gpu_persistent_see
 public :: gpu_persist_on_device
 public :: gpu_track_body_on_device
 public :: gpu_apply_fringe_on_device
+public :: gpu_apply_misalign_on_device
 public :: gpu_multi_bunch_save, gpu_multi_bunch_restore, gpu_multi_bunch_cleanup
 
 ! Whether gpu_tracking_init has been called
@@ -4866,5 +4867,57 @@ end select
 #endif
 
 end subroutine gpu_apply_fringe_on_device
+
+!------------------------------------------------------------------------
+! gpu_apply_misalign_on_device — apply misalignment on device (public)
+!------------------------------------------------------------------------
+subroutine gpu_apply_misalign_on_device(ele, is_set, np)
+
+use, intrinsic :: iso_c_binding
+
+type (ele_struct), intent(in) :: ele
+logical, intent(in) :: is_set  ! set$ (.true.) or unset$ (.false.)
+integer(C_INT), intent(in) :: np
+
+#ifdef USE_GPU_TRACKING
+integer :: sf
+
+if (.not. gpu_persist_on_device) return
+if (.not. ele%bookkeeping_state%has_misalign) return
+if (np == 0) return
+
+sf = merge(1, -1, is_set)
+
+if (ele%key == sbend$ .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
+                             .or. ele%value(roll$) /= 0)) then
+  call gpu_bend_offset(ele%value(g$), ele%value(rho$), &
+       ele%value(l$) * 0.5_rp, ele%value(angle$), &
+       ele%value(ref_tilt_tot$), ele%value(roll_tot$), &
+       ele%value(x_offset_tot$), ele%value(y_offset_tot$), ele%value(z_offset_tot$), &
+       ele%value(x_pitch$), ele%value(y_pitch$), sf, np)
+elseif (ele%key == sbend$) then
+  call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                     ele%value(ref_tilt_tot$), sf, np)
+elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
+        ele%value(z_offset_tot$) /= 0) then
+  block
+    real(rp) :: W3(3,3)
+    if (is_set) then
+      call floor_angles_to_w_mat(ele%value(x_pitch_tot$), ele%value(y_pitch_tot$), &
+                                 ele%value(tilt_tot$), w_mat_inv = W3)
+    else
+      call floor_angles_to_w_mat(ele%value(x_pitch_tot$), ele%value(y_pitch_tot$), &
+                                 ele%value(tilt_tot$), w_mat = W3)
+    endif
+    call gpu_misalign_3d(W3, ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                         ele%value(z_offset_tot$), sf, np)
+  end block
+else
+  call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                     ele%value(tilt_tot$), sf, np)
+endif
+#endif
+
+end subroutine gpu_apply_misalign_on_device
 
 end module gpu_tracking_mod
