@@ -130,7 +130,8 @@ subroutine track1_bunch_csr (bunch, ele, centroid, err, s_start, s_end, bunch_tr
 
 use gpu_tracking_mod, only: gpu_persistent_flush, &
                              gpu_persistent_seed, gpu_persist_on_device, &
-                             gpu_track_body_on_device, ele_gpu_eligible
+                             gpu_track_body_on_device, ele_gpu_eligible, &
+                             gpu_apply_fringe_on_device
 
 implicit none
 
@@ -340,18 +341,19 @@ do i_step = 0, n_step
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
     if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_slice = csr_dt_slice + real(csr_c1-csr_c0,rp)/csr_crate; endif
     if (csr_timer_on) call system_clock(csr_c0)
-    ! GPU body for non-bends in CSR loop. Bends use CPU body due to a known
-    ! systematic error in the GPU bend kernel's x-plane integration that compounds
-    ! through many CSR sub-steps (~0.4x sigma_x error through arc sections).
-    ! Non-bend elements (drifts, pipes, quads) are the majority of CSR sub-steps
-    ! and benefit most from staying on GPU (avoiding 1M-particle flush/upload cycles).
-    if (gpu_csr_active .and. ele%key /= sbend$ .and. &
-        ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
+    ! GPU body tracking for ALL elements in CSR loop (including bends).
+    ! Apply fringe at element edges (first/last sub-steps) via GPU.
+    if (gpu_csr_active .and. ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
+      ! Entrance fringe on GPU for first sub-step
+      if (i_step == 1) call gpu_apply_fringe_on_device(bunch, ele, branch%param, first_track_edge$)
       call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
       if (.not. gpu_did_track) then
         call gpu_persistent_flush(bunch, runt)
         gpu_csr_active = .false.
         call track1_bunch_hom (bunch, runt)
+      else
+        ! Exit fringe on GPU for last sub-step
+        if (i_step == n_step) call gpu_apply_fringe_on_device(bunch, ele, branch%param, second_track_edge$)
       endif
     else
       ! CPU body: flush particles, track on CPU, re-seed to GPU

@@ -29,6 +29,7 @@ public :: gpu_csr_bin_kicks
 public :: gpu_persistent_track_element, gpu_persistent_flush, gpu_persistent_seed
 public :: gpu_persist_on_device
 public :: gpu_track_body_on_device
+public :: gpu_apply_fringe_on_device
 public :: gpu_multi_bunch_save, gpu_multi_bunch_restore, gpu_multi_bunch_cleanup
 
 ! Whether gpu_tracking_init has been called
@@ -4623,5 +4624,122 @@ if (did_track) call gpu_s_update(ele%s, n)
 #endif
 
 end subroutine gpu_track_body_on_device
+
+!------------------------------------------------------------------------
+! gpu_apply_fringe_on_device — apply fringe kicks on device (public wrapper)
+!
+! For use in the CSR sub-step loop to apply entrance/exit fringe
+! without flushing particles to CPU.
+!------------------------------------------------------------------------
+subroutine gpu_apply_fringe_on_device(bunch, ele, param, edge)
+
+use multipole_mod, only: ab_multipole_kicks
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct),       intent(in)    :: ele
+type (lat_param_struct), intent(in)    :: param
+integer,                 intent(in)    :: edge
+
+#ifdef USE_GPU_TRACKING
+integer(C_INT) :: np
+integer :: fringe_type_val, physical_end_val
+real(rp) :: charge_dir_val
+real(C_DOUBLE) :: bp_arr(8), ap_arr(8)
+
+np = size(bunch%particle)
+if (np == 0) return
+if (.not. gpu_persist_on_device) return
+
+select case (ele%key)
+case (quadrupole$)
+  fringe_type_val = nint(ele%value(fringe_type$))
+  if (fringe_type_val == none$) return
+  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                   ele%orientation * bunch%particle(1)%direction
+  call gpu_quad_fringe(ele%value(k1$), ele%value(fq1$), ele%value(fq2$), &
+                       charge_dir_val, &
+                       int(fringe_type_val, C_INT), int(edge, C_INT), &
+                       int(bunch%particle(1)%time_dir, C_INT), np)
+
+case (sbend$)
+  fringe_type_val = nint(ele%value(fringe_type$))
+  if (fringe_type_val == none$) return
+
+  if (fringe_type_val == full$) then
+    block
+      real(rp) :: g_tot_ex, beta0_ex, e_ang_ex, fint_ex, hgap_ex
+      integer :: is_exit_ex, phys_end_ex
+
+      if (ele%is_on) then
+        g_tot_ex = ele%value(g$) + ele%value(dg$)
+      else
+        g_tot_ex = 0
+      endif
+      beta0_ex = ele%value(p0c$) / ele%value(e_tot$)
+      phys_end_ex = physical_ele_end(edge, bunch%particle(1), ele%orientation)
+
+      ! Hard multipole edge kick at entrance
+      if (phys_end_ex == entrance_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        bp_arr = 0; ap_arr = 0; bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(1, C_INT), np)
+      endif
+
+      if (phys_end_ex == entrance_end$) then
+        e_ang_ex = bunch%particle(1)%time_dir * ele%value(e1$)
+        fint_ex = bunch%particle(1)%time_dir * ele%value(fint$)
+        hgap_ex = ele%value(hgap$); is_exit_ex = 0
+      else
+        e_ang_ex = bunch%particle(1)%time_dir * ele%value(e2$)
+        fint_ex = bunch%particle(1)%time_dir * ele%value(fintx$)
+        hgap_ex = ele%value(hgapx$); is_exit_ex = 1
+      endif
+
+      call gpu_exact_bend_fringe(g_tot_ex, beta0_ex, e_ang_ex, fint_ex, hgap_ex, &
+          int(is_exit_ex, C_INT), np)
+
+      ! Hard multipole edge kick at exit
+      if (phys_end_ex == exit_end$) then
+        charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                         ele%orientation * bunch%particle(1)%direction
+        bp_arr = 0; ap_arr = 0; bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(0, C_INT), np)
+      endif
+    end block
+    return
+  endif
+
+  ! Basic/hard_edge bend fringe (Hwang)
+  if (fringe_type_val /= basic_bend$ .and. fringe_type_val /= hard_edge_only$) return
+  charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                   ele%orientation * bunch%particle(1)%direction
+  block
+    real(rp) :: g_tot_hw, e_ang_hw, fint_gap_hw, k1_hw
+    integer :: entering_hw, phys_end_hw
+    if (ele%is_on) then
+      g_tot_hw = (ele%value(g$) + ele%value(dg$)) * charge_dir_val; k1_hw = ele%value(k1$)
+    else
+      g_tot_hw = 0; k1_hw = 0
+    endif
+    phys_end_hw = physical_ele_end(edge, bunch%particle(1), ele%orientation)
+    if (phys_end_hw == entrance_end$) then
+      e_ang_hw = ele%value(e1$); fint_gap_hw = ele%value(fint$) * ele%value(hgap$)
+    else
+      e_ang_hw = ele%value(e2$); fint_gap_hw = ele%value(fintx$) * ele%value(hgapx$)
+    endif
+    if (fringe_type_val == hard_edge_only$) fint_gap_hw = 0
+    entering_hw = 0
+    if ((edge == first_track_edge$ .and. bunch%particle(1)%direction == 1) .or. &
+        (edge == second_track_edge$ .and. bunch%particle(1)%direction == -1)) entering_hw = 1
+    call gpu_bend_fringe(g_tot_hw, e_ang_hw, fint_gap_hw, k1_hw, &
+                          int(entering_hw, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
+  end block
+
+end select
+#endif
+
+end subroutine gpu_apply_fringe_on_device
 
 end module gpu_tracking_mod
