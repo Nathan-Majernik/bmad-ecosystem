@@ -3192,9 +3192,9 @@ mc2_val = mass_of(bunch%particle(1)%species)
 len_val = ele%value(l$)
 if (len_val == 0) return
 
-! For drift, need s on device. Upload current s_a, run kernel, download.
-call gpu_track_drift_dev(s_a, mc2_val, len_val, np)
-! s_a is now updated on host (drift_dev does upload+download of s)
+! M5 fix: use no_s variant (s-array updated separately by gpu_s_update).
+! Saves ~16MB PCIe round-trip per drift at 1M particles.
+call gpu_track_drift_dev_no_s(mc2_val, len_val, np)
 end subroutine dispatch_drift_body
 
 !------------------------------------------------------------------------
