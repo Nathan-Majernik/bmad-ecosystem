@@ -458,6 +458,76 @@ __global__ void extract_field_kernel(
 }
 
 /* --------------------------------------------------------------------------
+ * Mixed-precision FFT helper kernels.
+ * The 3D SC FFTs are bandwidth-limited; using float halves data movement.
+ * Deposit + interpolation stay in double for accuracy.
+ * -------------------------------------------------------------------------- */
+
+/* Copy rho (double, mesh_size) to zero-padded float array (dbl_size).
+ * Replaces cudaMemset + rho_to_real_kernel with a single kernel. */
+__global__ void rho_to_padded_f_kernel(
+    const double *rho, float *padded,
+    int nx, int ny, int nz, int nx2, int ny2, int nz2)
+{
+    int idx2 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx2 >= nx2 * ny2 * nz2) return;
+    int k2 = idx2 % nz2;
+    int j2 = (idx2 / nz2) % ny2;
+    int i2 = idx2 / (nz2 * ny2);
+    if (i2 < nx && j2 < ny && k2 < nz)
+        padded[idx2] = (float)rho[i2 * ny * nz + j2 * nz + k2];
+    else
+        padded[idx2] = 0.0f;
+}
+
+/* Convert double complex → float complex (for Green fn cache conversion). */
+__global__ void dc_to_fc_kernel(
+    const cufftDoubleComplex *in, cufftComplex *out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { out[i].x = (float)in[i].x; out[i].y = (float)in[i].y; }
+}
+
+/* Float complex multiply: out = a * b (3-operand). */
+__global__ void complex_multiply_src_kernel_f(
+    const cufftComplex *a, const cufftComplex *b, cufftComplex *out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float ar = a[i].x, ai = a[i].y;
+    float br = b[i].x, bi = b[i].y;
+    out[i].x = ar*br - ai*bi;
+    out[i].y = ar*bi + ai*br;
+}
+
+/* In-place float complex multiply: cgrn *= crho. */
+__global__ void complex_multiply_kernel_f(
+    const cufftComplex *crho, cufftComplex *cgrn, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float ar = crho[i].x, ai = crho[i].y;
+    float br = cgrn[i].x, bi = cgrn[i].y;
+    cgrn[i].x = ar*br - ai*bi;
+    cgrn[i].y = ar*bi + ai*br;
+}
+
+/* Extract field from float C2R output to double efield. */
+__global__ void extract_field_kernel_f(
+    const float *real_out, double *field_comp,
+    int nx, int ny, int nz, int nx2, int ny2, int nz2, double scale)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nx*ny*nz) return;
+    int k = idx % nz;
+    int j = (idx / nz) % ny;
+    int i = idx / (nz * ny);
+    int ishift = nx - 1, jshift = ny - 1, kshift = nz - 1;
+    int idx2 = (i+ishift)*ny2*nz2 + (j+jshift)*nz2 + (k+kshift);
+    field_comp[idx] = scale * (double)real_out[idx2];
+}
+
+/* --------------------------------------------------------------------------
  * Interpolate E-field and apply kicks to particles (space charge).
  * Matches csr_and_sc_apply_kicks for fft_3d$ case.
  * -------------------------------------------------------------------------- */
@@ -650,6 +720,9 @@ static double *d_sc_charge = NULL;  /* per-particle charge */
 static double *d_sc_rho_padded = NULL;  /* zero-padded real rho for D2Z, size dbl_size */
 static cufftDoubleComplex *d_sc_crho_freq = NULL;  /* D2Z output, size half_size */
 static cufftHandle sc_fft_plan = 0;  /* D2Z plan for charge density forward FFT */
+static float *d_sc_rho_padded_f = NULL;         /* float padded rho for R2C */
+static cufftComplex *d_sc_crho_freq_f = NULL;   /* R2C output (float complex) */
+static cufftHandle sc_fft_plan_f = 0;           /* R2C plan for float forward FFT */
 static int sc_nx2 = 0, sc_ny2 = 0, sc_nz2 = 0;
 
 /* Cached device arrays for CSR binning */
@@ -710,21 +783,35 @@ static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
     int dbl_size = nx2 * ny2 * nz2;
     int half_size = nx2 * ny2 * (nz2/2 + 1);  /* R2C complex output size */
 
-    /* Recreate FFT plan if mesh size changed */
+    /* Recreate FFT plans if mesh size changed */
     if (nx2 != sc_nx2 || ny2 != sc_ny2 || nz2 != sc_nz2) {
+        /* D2Z plan (kept for Green function forward FFT on cache miss) */
         if (sc_fft_plan) cufftDestroy(sc_fft_plan);
         if (cufftPlan3d(&sc_fft_plan, nx2, ny2, nz2, CUFFT_D2Z) != CUFFT_SUCCESS) {
             fprintf(stderr, "[gpu_sc] cuFFT D2Z plan creation failed\n");
             sc_fft_plan = 0;
             return -1;
         }
+        /* R2C float plan for charge density forward FFT (mixed precision) */
+        if (sc_fft_plan_f) cufftDestroy(sc_fft_plan_f);
+        if (cufftPlan3d(&sc_fft_plan_f, nx2, ny2, nz2, CUFFT_R2C) != CUFFT_SUCCESS) {
+            fprintf(stderr, "[gpu_sc] cuFFT R2C plan creation failed\n");
+            sc_fft_plan_f = 0;
+            return -1;
+        }
         sc_nx2 = nx2; sc_ny2 = ny2; sc_nz2 = nz2;
 
-        /* Reallocate: real padded buffer + half-size complex frequency buffer */
+        /* Reallocate double buffers (kept for Green fn D2Z on cache miss) */
         if (d_sc_rho_padded)  cudaFree(d_sc_rho_padded);
         if (d_sc_crho_freq)   cudaFree(d_sc_crho_freq);
         cudaMalloc((void**)&d_sc_rho_padded, (size_t)dbl_size * sizeof(double));
         cudaMalloc((void**)&d_sc_crho_freq,  (size_t)half_size * sizeof(cufftDoubleComplex));
+
+        /* Float padded rho + float complex frequency buffer */
+        if (d_sc_rho_padded_f) cudaFree(d_sc_rho_padded_f);
+        if (d_sc_crho_freq_f)  cudaFree(d_sc_crho_freq_f);
+        cudaMalloc((void**)&d_sc_rho_padded_f, (size_t)dbl_size * sizeof(float));
+        cudaMalloc((void**)&d_sc_crho_freq_f,  (size_t)half_size * sizeof(cufftComplex));
     }
 
     /* Reallocate mesh arrays only if size changed */
@@ -921,15 +1008,16 @@ extern "C" void gpu_space_charge_3d_(
     CUDA_SC_CHECK(cudaGetLastError());
     /* No sync needed -- next operations are on same default stream */
 
-    /* --- Step 3: FFT of charge density (R2C: real -> half-complex) --- */
-    CUDA_SC_CHECK(cudaMemset(d_sc_rho_padded, 0, (size_t)dbl_size * sizeof(double)));
-
+    /* --- Step 3: FFT of charge density (mixed precision: float R2C) ---
+     * Deposit stays double for accuracy; convert to float for FFT. */
     int blocks_m = (mesh_size + threads - 1) / threads;
-    rho_to_real_kernel<<<blocks_m, threads>>>(
-        d_sc_rho, d_sc_rho_padded, nx, ny, nz, nx2, ny2, nz2);
-    /* No sync needed -- cuFFT on default stream is serialized */
+    int blocks_d = (dbl_size + threads - 1) / threads;
+    int blocks_h = (half_size + threads - 1) / threads;
 
-    CUFFT_SC_CHECK(cufftExecD2Z(sc_fft_plan, d_sc_rho_padded, d_sc_crho_freq));
+    rho_to_padded_f_kernel<<<blocks_d, threads>>>(
+        d_sc_rho, d_sc_rho_padded_f, nx, ny, nz, nx2, ny2, nz2);
+
+    CUFFT_SC_CHECK(cufftExecR2C(sc_fft_plan_f, d_sc_rho_padded_f, d_sc_crho_freq_f));
 
     /* Record event on default stream so component streams can wait for charge FFT */
     static cudaEvent_t sc_crho_ready = 0;
@@ -937,37 +1025,45 @@ extern "C" void gpu_space_charge_3d_(
     cudaEventRecord(sc_crho_ready, 0);  /* 0 = default stream */
 
     /* --- Step 4: For each E-field component: Green function + FFT + multiply + IFFT ---
-     * Each component is independent (reads d_sc_crho_freq, writes to its own d_sc_efield slice).
-     * Process all 3 concurrently using separate workspace buffers.
-     * R2C/C2R: forward D2Z produces half_size complex; inverse Z2D produces dbl_size real. */
-    int blocks_d = (dbl_size + threads - 1) / threads;
-    int blocks_h = (half_size + threads - 1) / threads;
+     * Mixed precision: Green fn cache + multiply + inverse FFT all use float.
+     * Green fn forward FFT uses double D2Z (cache miss only), then converts to float cache.
+     * Charge freq is float from R2C above. Inverse C2R produces float, extracted to double efield. */
     int stencil_size = (nx2-1)*(ny2-1)*(nz2-1);
     int blocks_s = (stencil_size + threads - 1) / threads;
     double scale = SC_FPEI / (double)(nx2*ny2*nz2);
 
-    /* Allocate per-component workspaces + Green function cache.
-     * d_sc_cgrn_c: real scratch for Green fn computation (dbl_size doubles).
-     * d_sc_cgrn2_c: frequency-domain complex workspace (half_size complex).
-     * d_sc_real_c: real workspace for Z2D output (dbl_size doubles).
-     * d_sc_grn_cache: cached FFT'd Green fn (half_size complex). */
-    static double *d_sc_cgrn_c[3] = {NULL, NULL, NULL};                /* Green fn real scratch */
-    static cufftDoubleComplex *d_sc_cgrn2_c[3] = {NULL, NULL, NULL};   /* freq-domain workspace */
-    static double *d_sc_real_c[3] = {NULL, NULL, NULL};                /* Z2D real output */
-    static cufftDoubleComplex *d_sc_grn_cache[3] = {NULL, NULL, NULL}; /* cached FFT'd Green fn */
+    /* Per-component workspaces: double (for Green fn D2Z on cache miss) + float (hot path).
+     * d_sc_cgrn_c: real scratch for Green fn (double, dbl_size).
+     * d_sc_cgrn2_c: freq workspace for Green fn D2Z (double complex, half_size).
+     * d_sc_real_c: real workspace for Green fn stencil+D2Z (double, dbl_size).
+     * d_sc_grn_cache_f: cached FFT'd Green fn in float (float complex, half_size).
+     * d_sc_cgrn2_c_f: multiply output + C2R input (float complex, half_size).
+     * d_sc_real_c_f: C2R output (float, dbl_size). */
+    static double *d_sc_cgrn_c[3] = {NULL, NULL, NULL};
+    static cufftDoubleComplex *d_sc_cgrn2_c[3] = {NULL, NULL, NULL};
+    static double *d_sc_real_c[3] = {NULL, NULL, NULL};
+    static cufftComplex *d_sc_grn_cache_f[3] = {NULL, NULL, NULL};
+    static cufftComplex *d_sc_cgrn2_c_f[3] = {NULL, NULL, NULL};
+    static float *d_sc_real_c_f[3] = {NULL, NULL, NULL};
     static int grn_cached_size = 0;
     if (dbl_size > grn_cached_size) {
         size_t rsz = (size_t)dbl_size * sizeof(double);
-        size_t hsz = (size_t)half_size * sizeof(cufftDoubleComplex);
+        size_t hsz_d = (size_t)half_size * sizeof(cufftDoubleComplex);
+        size_t hsz_f = (size_t)half_size * sizeof(cufftComplex);
+        size_t rsz_f = (size_t)dbl_size * sizeof(float);
         for (int c = 0; c < 3; c++) {
             if (d_sc_cgrn_c[c]) cudaFree(d_sc_cgrn_c[c]);
             if (d_sc_cgrn2_c[c]) cudaFree(d_sc_cgrn2_c[c]);
             if (d_sc_real_c[c]) cudaFree(d_sc_real_c[c]);
-            if (d_sc_grn_cache[c]) cudaFree(d_sc_grn_cache[c]);
-            cudaMalloc((void**)&d_sc_cgrn_c[c], rsz);    /* real scratch for Green fn */
-            cudaMalloc((void**)&d_sc_cgrn2_c[c], hsz);   /* freq-domain complex workspace */
-            cudaMalloc((void**)&d_sc_real_c[c], rsz);     /* Z2D real output */
-            cudaMalloc((void**)&d_sc_grn_cache[c], hsz);  /* cached FFT'd Green fn */
+            if (d_sc_grn_cache_f[c]) cudaFree(d_sc_grn_cache_f[c]);
+            if (d_sc_cgrn2_c_f[c]) cudaFree(d_sc_cgrn2_c_f[c]);
+            if (d_sc_real_c_f[c]) cudaFree(d_sc_real_c_f[c]);
+            cudaMalloc((void**)&d_sc_cgrn_c[c], rsz);       /* Green fn scratch (double) */
+            cudaMalloc((void**)&d_sc_cgrn2_c[c], hsz_d);    /* Green fn D2Z output (double) */
+            cudaMalloc((void**)&d_sc_real_c[c], rsz);        /* Green fn stencil+D2Z (double) */
+            cudaMalloc((void**)&d_sc_grn_cache_f[c], hsz_f); /* cached Green fn (float) */
+            cudaMalloc((void**)&d_sc_cgrn2_c_f[c], hsz_f);  /* multiply output (float) */
+            cudaMalloc((void**)&d_sc_real_c_f[c], rsz_f);    /* C2R output (float) */
         }
         grn_cached_size = dbl_size;
     }
@@ -975,7 +1071,7 @@ extern "C" void gpu_space_charge_3d_(
     /* CUDA streams for concurrent E-field computation */
     static cudaStream_t sc_streams[3] = {0, 0, 0};
     static cufftHandle sc_fwd_plans[3] = {0, 0, 0};  /* D2Z forward plans for Green fn */
-    static cufftHandle sc_inv_plans[3] = {0, 0, 0};  /* Z2D inverse plans for field extraction */
+    static cufftHandle sc_inv_plans_f[3] = {0, 0, 0}; /* C2R float inverse plans */
     static int sc_comp_nx2 = 0, sc_comp_ny2 = 0, sc_comp_nz2 = 0;
     static int streams_created = 0;
     if (!streams_created) {
@@ -985,11 +1081,11 @@ extern "C" void gpu_space_charge_3d_(
     if (nx2 != sc_comp_nx2 || ny2 != sc_comp_ny2 || nz2 != sc_comp_nz2) {
         for (int c = 0; c < 3; c++) {
             if (sc_fwd_plans[c]) cufftDestroy(sc_fwd_plans[c]);
-            if (sc_inv_plans[c]) cufftDestroy(sc_inv_plans[c]);
+            if (sc_inv_plans_f[c]) cufftDestroy(sc_inv_plans_f[c]);
             cufftPlan3d(&sc_fwd_plans[c], nx2, ny2, nz2, CUFFT_D2Z);
-            cufftPlan3d(&sc_inv_plans[c], nx2, ny2, nz2, CUFFT_Z2D);
+            cufftPlan3d(&sc_inv_plans_f[c], nx2, ny2, nz2, CUFFT_C2R);
             cufftSetStream(sc_fwd_plans[c], sc_streams[c]);
-            cufftSetStream(sc_inv_plans[c], sc_streams[c]);
+            cufftSetStream(sc_inv_plans_f[c], sc_streams[c]);
         }
         sc_comp_nx2 = nx2; sc_comp_ny2 = ny2; sc_comp_nz2 = nz2;
     }
@@ -1012,55 +1108,53 @@ extern "C" void gpu_space_charge_3d_(
     }
 
     if (!grn_hit) {
-        /* Cache miss: compute Green function FFTs (D2Z), cache, then multiply + Z2D */
+        /* Cache miss: Green fn D2Z in double, convert cache to float, then float pipeline */
         for (int icomp = 1; icomp <= 3; icomp++) {
             int c = icomp - 1;
 
-            /* Compute Green function into real scratch buffer */
+            /* Compute Green function into real scratch buffer (double) */
             green_function_kernel<<<blocks_d, threads, 0, sc_streams[c]>>>(
                 d_sc_cgrn_c[c], dx, dy, dz, gamma, icomp,
                 nx2, ny2, nz2, 0.0, 0.0, 0.0);
 
-            /* Stencil: cgrn_c -> real_c (zero first since stencil writes (nx2-1)*(ny2-1)*(nz2-1)) */
+            /* Stencil: cgrn_c -> real_c (zero first) */
             cudaMemsetAsync(d_sc_real_c[c], 0, (size_t)dbl_size * sizeof(double), sc_streams[c]);
 
             igf_stencil_kernel<<<blocks_s, threads, 0, sc_streams[c]>>>(
                 d_sc_cgrn_c[c], d_sc_real_c[c], nx2, ny2, nz2);
 
-            /* Forward D2Z FFT of Green function */
+            /* Forward D2Z FFT of Green function (double) */
             CUFFT_SC_CHECK(cufftExecD2Z(sc_fwd_plans[c], d_sc_real_c[c], d_sc_cgrn2_c[c]));
 
-            /* Save to cache (half_size complex) */
-            cudaMemcpyAsync(d_sc_grn_cache[c], d_sc_cgrn2_c[c],
-                (size_t)half_size * sizeof(cufftDoubleComplex),
-                cudaMemcpyDeviceToDevice, sc_streams[c]);
+            /* Convert to float cache */
+            dc_to_fc_kernel<<<blocks_h, threads, 0, sc_streams[c]>>>(
+                d_sc_cgrn2_c[c], d_sc_grn_cache_f[c], half_size);
 
-            /* Multiply with charge FFT (half_size complex arrays) */
+            /* Float multiply: crho_freq_f * grn_cache_f -> cgrn2_c_f */
             cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
-            complex_multiply_kernel<<<blocks_h, threads, 0, sc_streams[c]>>>(
-                d_sc_crho_freq, d_sc_cgrn2_c[c], half_size);
+            complex_multiply_src_kernel_f<<<blocks_h, threads, 0, sc_streams[c]>>>(
+                d_sc_crho_freq_f, d_sc_grn_cache_f[c], d_sc_cgrn2_c_f[c], half_size);
 
-            /* Inverse Z2D FFT -> real output */
-            CUFFT_SC_CHECK(cufftExecZ2D(sc_inv_plans[c], d_sc_cgrn2_c[c], d_sc_real_c[c]));
+            /* Inverse C2R FFT (float) -> extract to double efield */
+            CUFFT_SC_CHECK(cufftExecC2R(sc_inv_plans_f[c], d_sc_cgrn2_c_f[c], d_sc_real_c_f[c]));
 
-            extract_field_kernel<<<blocks_m, threads, 0, sc_streams[c]>>>(
-                d_sc_real_c[c], d_sc_efield + c*mesh_size,
+            extract_field_kernel_f<<<blocks_m, threads, 0, sc_streams[c]>>>(
+                d_sc_real_c_f[c], d_sc_efield + c*mesh_size,
                 nx, ny, nz, nx2, ny2, nz2, scale);
         }
         grn_cache_dx = dx; grn_cache_dy = dy; grn_cache_dz_rf = dz_rf;
         grn_cache_nx2 = nx2; grn_cache_ny2 = ny2; grn_cache_nz2 = nz2;
         grn_cache_valid = 1;
     } else {
-        /* Cache hit: skip Green fn computation. Multiply from cache + Z2D + extract.
-         * Run on per-component streams for concurrency. */
+        /* Cache hit: float multiply + C2R + extract (hot path). */
         for (int icomp = 1; icomp <= 3; icomp++) {
             int c = icomp - 1;
             cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
-            complex_multiply_src_kernel<<<blocks_h, threads, 0, sc_streams[c]>>>(
-                d_sc_crho_freq, d_sc_grn_cache[c], d_sc_cgrn2_c[c], half_size);
-            CUFFT_SC_CHECK(cufftExecZ2D(sc_inv_plans[c], d_sc_cgrn2_c[c], d_sc_real_c[c]));
-            extract_field_kernel<<<blocks_m, threads, 0, sc_streams[c]>>>(
-                d_sc_real_c[c], d_sc_efield + c*mesh_size,
+            complex_multiply_src_kernel_f<<<blocks_h, threads, 0, sc_streams[c]>>>(
+                d_sc_crho_freq_f, d_sc_grn_cache_f[c], d_sc_cgrn2_c_f[c], half_size);
+            CUFFT_SC_CHECK(cufftExecC2R(sc_inv_plans_f[c], d_sc_cgrn2_c_f[c], d_sc_real_c_f[c]));
+            extract_field_kernel_f<<<blocks_m, threads, 0, sc_streams[c]>>>(
+                d_sc_real_c_f[c], d_sc_efield + c*mesh_size,
                 nx, ny, nz, nx2, ny2, nz2, scale);
         }
     }
@@ -2232,6 +2326,9 @@ extern "C" void gpu_spacecharge_cleanup_(void)
     if (d_sc_charge) { cudaFree(d_sc_charge);  d_sc_charge = NULL; }
     if (d_sc_rho_padded)  { cudaFree(d_sc_rho_padded);  d_sc_rho_padded = NULL; }
     if (d_sc_crho_freq)   { cudaFree(d_sc_crho_freq);   d_sc_crho_freq = NULL; }
+    if (d_sc_rho_padded_f) { cudaFree(d_sc_rho_padded_f); d_sc_rho_padded_f = NULL; }
+    if (d_sc_crho_freq_f)  { cudaFree(d_sc_crho_freq_f);  d_sc_crho_freq_f = NULL; }
+    if (sc_fft_plan_f) { cufftDestroy(sc_fft_plan_f); sc_fft_plan_f = 0; }
     sc_nx2 = 0; sc_ny2 = 0; sc_nz2 = 0;
     sc_charge_uploaded = 0;
 
