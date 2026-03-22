@@ -1493,6 +1493,14 @@ __global__ void csr_kick_convolve_kernel(
 static double *d_csr_I_int = NULL, *d_csr_edge_dcdz = NULL, *d_csr_kick_conv = NULL;
 static int d_csr_conv_cap = 0;
 
+/* Dedicated CSR stream: allows CSR convolution + kicks to run concurrently
+ * with SC FFTs on sc_streams[], avoiding default-stream serialization. */
+static cudaStream_t csr_kick_stream = 0;
+static int csr_kick_stream_created = 0;
+/* Pinned host staging buffer for I_int async upload */
+static double *h_csr_I_int_pinned = NULL;
+static int h_csr_I_int_pinned_cap = 0;
+
 static void ensure_csr_conv_buffers(int n_bin) {
     if (n_bin > d_csr_conv_cap) {
         if (d_csr_I_int) { cudaFree(d_csr_I_int); cudaFree(d_csr_edge_dcdz); cudaFree(d_csr_kick_conv); }
@@ -1500,6 +1508,15 @@ static void ensure_csr_conv_buffers(int n_bin) {
         cudaMalloc((void**)&d_csr_edge_dcdz, n_bin * sizeof(double));
         cudaMalloc((void**)&d_csr_kick_conv, n_bin * sizeof(double));
         d_csr_conv_cap = n_bin;
+    }
+    if (!csr_kick_stream_created) {
+        cudaStreamCreate(&csr_kick_stream);
+        csr_kick_stream_created = 1;
+    }
+    if (n_bin + 1 > h_csr_I_int_pinned_cap) {
+        if (h_csr_I_int_pinned) cudaFreeHost(h_csr_I_int_pinned);
+        cudaMallocHost((void**)&h_csr_I_int_pinned, (n_bin + 1) * sizeof(double));
+        h_csr_I_int_pinned_cap = n_bin + 1;
     }
 }
 
@@ -1547,12 +1564,17 @@ extern "C" void gpu_csr_convolve_dev_(
     if (n_bin <= 0) return;
     ensure_csr_conv_buffers(n_bin);
 
-    /* Upload only the I_int_csr kernel (from CPU root-finding) */
-    cudaMemcpy(d_csr_I_int, h_I_int_csr, (n_bin + 1) * sizeof(double), cudaMemcpyHostToDevice);
+    /* Async upload via pinned staging buffer on csr_kick_stream.
+     * This avoids default-stream synchronization, allowing the upload
+     * and convolution to overlap with SC FFTs on sc_streams[]. */
+    size_t sz = (n_bin + 1) * sizeof(double);
+    memcpy(h_csr_I_int_pinned, h_I_int_csr, sz);
+    cudaMemcpyAsync(d_csr_I_int, h_csr_I_int_pinned, sz,
+                    cudaMemcpyHostToDevice, csr_kick_stream);
 
     int threads = 256;
     int blocks = (n_bin + threads - 1) / threads;
-    csr_kick_convolve_kernel<<<blocks, threads>>>(
+    csr_kick_convolve_kernel<<<blocks, threads, 0, csr_kick_stream>>>(
         d_csr_I_int, d_csr_edge_dcdz, d_csr_kick_conv, coef, n_bin);
     CUDA_SC_CHECK(cudaGetLastError());
 }
@@ -1571,13 +1593,12 @@ extern "C" void gpu_csr_apply_kicks_dev_(
     double *dvec[6]; int *dstate; double *dbeta, *dp0c;
     get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
 
-    /* Use d_csr_kick_conv for CSR kicks, zero for LSC */
-    if (ensure_csr_bin_buffers(n_bin) != 0) return;
-    cudaMemset(d_csr_kick_lsc, 0, n_bin * sizeof(double));
-
+    /* CSR-only path: apply_lsc=0 means kick_lsc is never read by kernel,
+     * so we skip the cudaMemset. Launch on csr_kick_stream to avoid
+     * default-stream serialization with concurrent SC FFTs. */
     int threads = 256;
     int blocks = (n_particles + threads - 1) / threads;
-    csr_apply_kick_kernel<<<blocks, threads>>>(
+    csr_apply_kick_kernel<<<blocks, threads, 0, csr_kick_stream>>>(
         dvec[5], dvec[4], dstate,
         d_csr_kick_conv, d_csr_kick_lsc,
         z_center_0, dz_slice,
