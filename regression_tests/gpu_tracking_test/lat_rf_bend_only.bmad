@@ -1,0 +1,16 @@
+no_digested
+
+parameter[lattice] = "GPU tracking plain rf_bend"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+rb1: rf_bend, L = 1.0, g = 0.5, tracking_method = bmad_standard
+
+lat: line = (rb1)
+
+use, lat

@@ -577,10 +577,10 @@ case (bmad_standard$)
   !------------------
   ! SBend
 
-  case (sbend$)
+  case (sbend$, rf_bend$)
 
     ! Finite dg, k1 or k2 is handled with rest of multipoles
-    field%b(2) = ele%value(g$) * f_p0c 
+    field%b(2) = ele%value(g$) * f_p0c
 
 
   !------------------
@@ -648,7 +648,7 @@ case (bmad_standard$)
   !---------------------------------------------
   ! Add multipoles
 
-  if (ele%key == sbend$ .and. nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
+  if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. nint(ele%value(exact_multipoles$)) /= off$ .and. ele%value(g$) /= 0) then
     call bend_exact_multipole_field (ele, param, orbit, local_ref_frame, field2, do_df_calc, calc_potential)
     field%e = field%e + field2%e
     field%b = field%b + field2%b
@@ -663,7 +663,7 @@ case (bmad_standard$)
     ! First magnetic
     ! This should be cleaned up so that include_kicks is always present.
     ! Do do this, the code above which puts in the kick, dg, k1, k2, k3 kicks needs to be removed.
-    if (ele%key == sbend$) then
+    if (ele%key == sbend$ .or. ele%key == rf_bend$) then
       call multipole_ele_to_ab(ele, .false., ix_pole_max, a_pole, b_pole, magnetic$, include_kicks$)
       add_kicks = .false.
     else

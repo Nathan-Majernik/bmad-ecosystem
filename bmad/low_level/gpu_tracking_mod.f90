@@ -708,7 +708,7 @@ if (.not. ele%is_on) return
 
 ! Check supported element types
 select case (ele%key)
-case (drift$, quadrupole$, sextupole$, octupole$, thick_multipole$, elseparator$, sbend$, lcavity$, pipe$, &
+case (drift$, quadrupole$, sextupole$, octupole$, thick_multipole$, elseparator$, sbend$, rf_bend$, lcavity$, pipe$, &
       monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$, &
       wiggler$, undulator$)
   eligible = .true.
@@ -2498,7 +2498,7 @@ case (sextupole$)
       has_fringe_needs_cpu = .true.
     end select
   endif
-case (sbend$)
+case (sbend$, rf_bend$)
   ! Bend fringe: basic_bend$, hard_edge_only$, full$, sad_full$, soft_edge_only$ handled on GPU.
   ! Other fringe types (linear_edge$) need CPU.
   call init_fringe_info(fringe_info, ele)
@@ -2766,7 +2766,7 @@ do ie = ix_start, ix_end
       call track_bunch_thru_drift_gpu(bunch, ele, did_track)
     case (quadrupole$)
       call track_bunch_thru_quad_gpu(bunch, ele, branch%param, did_track)
-    case (sbend$)
+    case (sbend$, rf_bend$)
       call track_bunch_thru_bend_gpu(bunch, ele, branch%param, did_track)
     case (lcavity$)
       call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
@@ -2922,7 +2922,7 @@ case (sextupole$)
                                  int(is_ent, C_INT), np)
   end block
 
-case (sbend$)
+case (sbend$, rf_bend$)
   fringe_type_val = nint(ele%value(fringe_type$))
   if (fringe_type_val == none$) return
   ! Full (PTC-style) fringe
@@ -3138,7 +3138,7 @@ case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
   call dispatch_drift_body(ele, np)
 case (quadrupole$)
   call dispatch_quad_body(ele, param, np)
-case (sbend$)
+case (sbend$, rf_bend$)
   call dispatch_bend_body(ele, param, np)
 case (lcavity$)
   call dispatch_lcavity_body(ele, param, np)
@@ -3831,7 +3831,7 @@ case (sextupole$, octupole$, thick_multipole$, elseparator$)
                                int(ix_mag_max, C_INT), int(n_step, C_INT), &
                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 
-case (sbend$)
+case (sbend$, rf_bend$)
   ele_length = ele%value(l$)
   if (ele_length == 0) return
   mc2 = mass_of(bunch%particle(1)%species)
@@ -4421,7 +4421,7 @@ case (sextupole$, octupole$, thick_multipole$, elseparator$)
                                ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   did_track = .true.
 
-case (sbend$)
+case (sbend$, rf_bend$)
   ele_length = ele%value(l$)
   if (ele_length == 0) then; did_track = .true.; return; endif
   ! Cache multipole setup across CSR sub-steps for the same element.
@@ -4662,7 +4662,7 @@ case (quadrupole$)
                        int(fringe_type_val, C_INT), int(edge, C_INT), &
                        int(bunch%particle(1)%time_dir, C_INT), np)
 
-case (sbend$)
+case (sbend$, rf_bend$)
   fringe_type_val = nint(ele%value(fringe_type$))
   if (fringe_type_val == none$) return
 

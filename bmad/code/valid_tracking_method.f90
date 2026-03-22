@@ -266,7 +266,7 @@ case (rcollimator$)
 
 case (rf_bend$)
   select case (method)
-  case (runge_kutta$, time_runge_kutta$, custom$)
+  case (bmad_standard$, runge_kutta$, time_runge_kutta$, custom$)
     is_valid = .true.
   end select
 

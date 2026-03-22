@@ -52,7 +52,7 @@ if (.not. ele%is_on) then
   select case (key)
   case (ab_multipole$, multipole$, taylor$, match$, fiducial$, floor_shift$)
     key = do_nothing$
-  case (lcavity$, sbend$, patch$)
+  case (lcavity$, sbend$, rf_bend$, patch$)
     ! Note: LCavities will still do wakefields.
   case default
     key = drift$
@@ -205,7 +205,7 @@ case (sad_mult$)
 !-----------------------------------------------
 ! sbend
 
-case (sbend$)
+case (sbend$, rf_bend$)
   call track_a_bend (orbit, ele, param, mat6, make_matrix)
 
 !-----------------------------------------------

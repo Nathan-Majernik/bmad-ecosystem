@@ -248,7 +248,7 @@ case (rcollimator$)
 
 case (rf_bend$)
   select case (mat6_calc_method)
-  case (auto$, tracking$, custom$)
+  case (auto$, bmad_standard$, tracking$, custom$)
     is_valid = .true.
   end select
 

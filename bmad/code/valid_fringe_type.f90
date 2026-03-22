@@ -36,7 +36,7 @@ case (sbend$, rbend$)
 
 case (rf_bend$)
   select case (fringe_type)
-  case (none$)
+  case (none$, basic_bend$)
     is_valid = .true.
   end select
 

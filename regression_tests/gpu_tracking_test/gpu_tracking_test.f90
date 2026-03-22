@@ -465,6 +465,12 @@ call bmad_parser('lat_elseparator_only.bmad', lat)
 call run_comparison_test('Test 56: Plain elseparator', lat, 2d-3, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 57: Plain rf_bend (bmad_standard tracking)
+! ======================================================================
+call bmad_parser('lat_rf_bend_only.bmad', lat)
+call run_comparison_test('Test 57: Plain rf_bend', lat, tol, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *
