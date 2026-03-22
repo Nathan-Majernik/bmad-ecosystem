@@ -1314,15 +1314,7 @@ __global__ void csr_kick_convolve_kernel(
 static double *d_csr_I_int = NULL, *d_csr_edge_dcdz = NULL, *d_csr_kick_conv = NULL;
 static int d_csr_conv_cap = 0;
 
-extern "C" void gpu_csr_kick_convolve_(
-    double *h_I_int_csr,        /* n_bin+1 elements (Fortran 0:n_bin) */
-    double *h_edge_dcharge_dz,  /* n_bin elements */
-    double *h_kick_csr,         /* n_bin output elements */
-    double coef, int n_bin)
-{
-    if (n_bin <= 0) return;
-
-    /* Ensure device buffers */
+static void ensure_csr_conv_buffers(int n_bin) {
     if (n_bin > d_csr_conv_cap) {
         if (d_csr_I_int) { cudaFree(d_csr_I_int); cudaFree(d_csr_edge_dcdz); cudaFree(d_csr_kick_conv); }
         cudaMalloc((void**)&d_csr_I_int, (n_bin + 1) * sizeof(double));
@@ -1330,19 +1322,110 @@ extern "C" void gpu_csr_kick_convolve_(
         cudaMalloc((void**)&d_csr_kick_conv, n_bin * sizeof(double));
         d_csr_conv_cap = n_bin;
     }
+}
 
-    /* Upload */
+/* --------------------------------------------------------------------------
+ * gpu_csr_compute_edge_dcdz -- compute edge_dcharge_density_dz on GPU
+ *
+ * Reads from d_csr_bin_charge (already on device from binning kernel).
+ * Writes to d_csr_edge_dcdz (stays on device for convolution).
+ * -------------------------------------------------------------------------- */
+__global__ void csr_edge_dcdz_kernel(
+    const double *bin_charge, double *edge_dcdz,
+    double inv_dz_sq, int n_bin)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_bin) return;
+    if (i == 0) {
+        edge_dcdz[0] = 0.0;
+    } else {
+        edge_dcdz[i] = (bin_charge[i] - bin_charge[i - 1]) * inv_dz_sq;
+    }
+}
+
+extern "C" void gpu_csr_compute_edge_dcdz_(double dz_slice, int n_bin)
+{
+    if (n_bin <= 0) return;
+    ensure_csr_conv_buffers(n_bin);
+    double inv_dz_sq = 1.0 / (dz_slice * dz_slice);
+    int threads = 256;
+    int blocks = (n_bin + threads - 1) / threads;
+    csr_edge_dcdz_kernel<<<blocks, threads>>>(
+        d_csr_bin_charge, d_csr_edge_dcdz, inv_dz_sq, n_bin);
+    CUDA_SC_CHECK(cudaGetLastError());
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_csr_convolve_dev -- convolution using device-resident edge_dcdz
+ *
+ * Uploads only I_int_csr from host. Reads edge_dcdz from device.
+ * Writes kick_csr to d_csr_kick_conv (stays on device for apply_kicks_dev).
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_csr_convolve_dev_(
+    double *h_I_int_csr,  /* n_bin+1 elements from CPU root-finding */
+    double coef, int n_bin)
+{
+    if (n_bin <= 0) return;
+    ensure_csr_conv_buffers(n_bin);
+
+    /* Upload only the I_int_csr kernel (from CPU root-finding) */
+    cudaMemcpy(d_csr_I_int, h_I_int_csr, (n_bin + 1) * sizeof(double), cudaMemcpyHostToDevice);
+
+    int threads = 256;
+    int blocks = (n_bin + threads - 1) / threads;
+    csr_kick_convolve_kernel<<<blocks, threads>>>(
+        d_csr_I_int, d_csr_edge_dcdz, d_csr_kick_conv, coef, n_bin);
+    CUDA_SC_CHECK(cudaGetLastError());
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_csr_apply_kicks_dev -- apply kicks from device-resident arrays
+ *
+ * Uses d_csr_kick_conv (from convolution) directly. No host upload needed.
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_csr_apply_kicks_dev_(
+    double z_center_0, double dz_slice,
+    int n_bin, int n_particles)
+{
+    if (n_particles <= 0 || n_bin <= 0) return;
+
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
+
+    /* Use d_csr_kick_conv for CSR kicks, zero for LSC */
+    if (ensure_csr_bin_buffers(n_bin) != 0) return;
+    cudaMemset(d_csr_kick_lsc, 0, n_bin * sizeof(double));
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    csr_apply_kick_kernel<<<blocks, threads>>>(
+        dvec[5], dvec[4], dstate,
+        d_csr_kick_conv, d_csr_kick_lsc,
+        z_center_0, dz_slice,
+        1, 0,  /* apply_csr=1, apply_lsc=0 */
+        n_bin, n_particles);
+    CUDA_SC_CHECK(cudaGetLastError());
+}
+
+/* Legacy host-side convolution (still used as fallback) */
+extern "C" void gpu_csr_kick_convolve_(
+    double *h_I_int_csr,
+    double *h_edge_dcharge_dz,
+    double *h_kick_csr,
+    double coef, int n_bin)
+{
+    if (n_bin <= 0) return;
+    ensure_csr_conv_buffers(n_bin);
+
     cudaMemcpy(d_csr_I_int, h_I_int_csr, (n_bin + 1) * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(d_csr_edge_dcdz, h_edge_dcharge_dz, n_bin * sizeof(double), cudaMemcpyHostToDevice);
 
-    /* Launch convolution */
     int threads = 256;
     int blocks = (n_bin + threads - 1) / threads;
     csr_kick_convolve_kernel<<<blocks, threads>>>(
         d_csr_I_int, d_csr_edge_dcdz, d_csr_kick_conv, coef, n_bin);
     CUDA_SC_CHECK(cudaGetLastError());
 
-    /* Download results */
     cudaMemcpy(h_kick_csr, d_csr_kick_conv, n_bin * sizeof(double), cudaMemcpyDeviceToHost);
 }
 

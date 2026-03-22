@@ -605,6 +605,19 @@ block
       csr_in%slice(ii)%edge_dcharge_density_dz = 0
     endif
   enddo
+
+  ! Compute edge_dcharge_density_dz on GPU (from device-resident bin charges)
+  ! This stays on device for the convolution — no CPU round-trip needed.
+  block
+    interface
+      subroutine gpu_csr_compute_edge_dcdz(dz_sl, nb) bind(C, name='gpu_csr_compute_edge_dcdz_')
+        use, intrinsic :: iso_c_binding
+        real(C_DOUBLE), value :: dz_sl
+        integer(C_INT), value :: nb
+      end subroutine
+    end interface
+    call gpu_csr_compute_edge_dcdz(real(csr_in%dz_slice, C_DOUBLE), int(nb_l, C_INT))
+  end block
 end block
 
 end subroutine csr_bin_particles_gpu
@@ -628,23 +641,41 @@ real(rp) :: mc2_l
 nb_l = space_charge_com%n_bin
 np_l = size(bunch_in%particle)
 
-! CSR/LSC kicks
-allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
-do ii = 1, nb_l
-  h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
-  h_kick_lsc_l(ii) = 0
-enddo
+! CSR/LSC kicks — use device-resident kicks when available (from gpu_csr_convolve_dev)
+if (bmad_com%gpu_tracking_on .and. ele_in%csr_method == one_dim$ .and. csr_in%y_source == 0) then
+  ! Device-resident path: kick_csr is already on GPU from gpu_csr_convolve_dev.
+  ! No host→device transfer needed.
+  block
+    interface
+      subroutine gpu_csr_apply_kicks_dev(z_center_0, dz_sl, nb, np) &
+          bind(C, name='gpu_csr_apply_kicks_dev_')
+        use, intrinsic :: iso_c_binding
+        real(C_DOUBLE), value :: z_center_0, dz_sl
+        integer(C_INT), value :: nb, np
+      end subroutine
+    end interface
+    call gpu_csr_apply_kicks_dev(csr_in%slice(1)%z_center, csr_in%dz_slice, &
+        int(nb_l, C_INT), int(np_l, C_INT))
+  end block
+else
+  ! Fallback: upload kicks from host (for image charges or CPU-computed kicks)
+  allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
+  do ii = 1, nb_l
+    h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
+    h_kick_lsc_l(ii) = 0
+  enddo
 
-apply_csr_l = 0; apply_lsc_l = 0
-if (ele_in%csr_method == one_dim$) apply_csr_l = 1
-if (ele_in%space_charge_method == slice$) apply_lsc_l = 1
+  apply_csr_l = 0; apply_lsc_l = 0
+  if (ele_in%csr_method == one_dim$) apply_csr_l = 1
+  if (ele_in%space_charge_method == slice$) apply_lsc_l = 1
 
-call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
-    csr_in%slice(1)%z_center, csr_in%dz_slice, &
-    apply_csr_l, apply_lsc_l, &
-    int(nb_l, C_INT), int(np_l, C_INT))
+  call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
+      csr_in%slice(1)%z_center, csr_in%dz_slice, &
+      apply_csr_l, apply_lsc_l, &
+      int(nb_l, C_INT), int(np_l, C_INT))
 
-deallocate(h_kick_csr_l, h_kick_lsc_l)
+  deallocate(h_kick_csr_l, h_kick_lsc_l)
+endif
 
 ! 3D FFT space charge (on device — no upload/download needed)
 if (ele_in%space_charge_method == fft_3d$ .and. gpu_persist_on_device) then
@@ -1104,17 +1135,17 @@ n_bin = space_charge_com%n_bin
 
 if (csr%y_source == 0) then
   if (ele%csr_method == one_dim$) then
-    ! GPU-accelerated convolution when GPU is active (O(n_bin^2) → parallel on GPU)
+    ! GPU-accelerated convolution: device-resident edge_dcdz + I_int_csr → kick_csr on device.
+    ! Only uploads I_int_csr (16KB) from CPU root-finding. No particle data transfer.
     if (bmad_com%gpu_tracking_on) then
       block
         use, intrinsic :: iso_c_binding
-        real(C_DOUBLE) :: h_I_int(0:n_bin), h_edge_dcdz(n_bin), h_kick(n_bin)
+        real(C_DOUBLE) :: h_I_int(0:n_bin)
         interface
-          subroutine gpu_csr_kick_convolve(h_I_int, h_edge_dcdz, h_kick, coef_in, nb) &
-              bind(C, name='gpu_csr_kick_convolve_')
+          subroutine gpu_csr_convolve_dev(h_I_int, coef_in, nb) &
+              bind(C, name='gpu_csr_convolve_dev_')
             use, intrinsic :: iso_c_binding
-            real(C_DOUBLE), intent(in) :: h_I_int(*), h_edge_dcdz(*)
-            real(C_DOUBLE), intent(out) :: h_kick(*)
+            real(C_DOUBLE), intent(in) :: h_I_int(*)
             real(C_DOUBLE), value, intent(in) :: coef_in
             integer(C_INT), value, intent(in) :: nb
           end subroutine
@@ -1122,13 +1153,8 @@ if (csr%y_source == 0) then
         do i = 0, n_bin
           h_I_int(i) = csr%kick1(i)%I_int_csr
         enddo
-        do i = 1, n_bin
-          h_edge_dcdz(i) = csr%slice(i)%edge_dcharge_density_dz
-        enddo
-        call gpu_csr_kick_convolve(h_I_int, h_edge_dcdz, h_kick, real(coef, C_DOUBLE), int(n_bin, C_INT))
-        do i = 1, n_bin
-          csr%slice(i)%kick_csr = h_kick(i)
-        enddo
+        call gpu_csr_convolve_dev(h_I_int, real(coef, C_DOUBLE), int(n_bin, C_INT))
+        ! kick_csr stays on device — applied by gpu_csr_apply_kicks_dev
       end block
     else
       do i = 1, n_bin
