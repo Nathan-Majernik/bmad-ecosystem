@@ -459,6 +459,12 @@ call bmad_parser('lat_wiggler_misalign.bmad', lat)
 call run_comparison_test('Test 55: Wiggler with misalignment', lat, tol, n_pass, n_fail)
 
 ! ======================================================================
+! TEST 56: Plain elseparator
+! ======================================================================
+call bmad_parser('lat_elseparator_only.bmad', lat)
+call run_comparison_test('Test 56: Plain elseparator', lat, 2d-3, n_pass, n_fail)
+
+! ======================================================================
 ! Summary
 ! ======================================================================
 print *
