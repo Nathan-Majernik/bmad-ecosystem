@@ -4323,9 +4323,9 @@ extern "C" void gpu_orbit_check_(int n)
 extern "C" void gpu_download_first_p0c_(double *h_p0c)
 {
     if (d_p0c) {
-        cudaMemcpy(h_p0c, d_p0c, sizeof(double), cudaMemcpyDeviceToHost);
+        CUDA_CHECK_VOID(cudaMemcpy(h_p0c, d_p0c, sizeof(double), cudaMemcpyDeviceToHost));
     } else {
-        *h_p0c = 1.0;  /* fallback: no device data */
+        *h_p0c = 1.0;  /* fallback: no device data — see AUDITOR concern */
     }
 }
 

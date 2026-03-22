@@ -1166,7 +1166,7 @@ real(rp) :: r_ratio, r_step, step_len_val, f_charge, f_elec
 a2_arr = 0; b2_arr = 0; ea2_arr = 0; eb2_arr = 0; cm_arr = 0
 
 ! C4 fix: when data is on device, host particle p0c is stale after lcavities.
-! Download the first alive particle's p0c from device for correct scaling.
+! Download particle(1)'s p0c from device for correct scaling.
 if (gpu_persist_on_device) then
   block
     use, intrinsic :: iso_c_binding
