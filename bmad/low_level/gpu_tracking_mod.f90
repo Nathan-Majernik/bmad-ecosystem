@@ -1165,11 +1165,21 @@ real(rp) :: r_ratio, r_step, step_len_val, f_charge, f_elec
 
 a2_arr = 0; b2_arr = 0; ea2_arr = 0; eb2_arr = 0; cm_arr = 0
 
-! C4 fix: when data is on device (gpu_persist_on_device), host particle p0c
-! is stale after lcavities. Use r_ratio=1 since element bookkeeping ensures
-! ele%value(p0c$) matches the beam's reference p0c at each element.
+! C4 fix: when data is on device, host particle p0c is stale after lcavities.
+! Download the first alive particle's p0c from device for correct scaling.
 if (gpu_persist_on_device) then
-  r_ratio = 1.0_rp
+  block
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE) :: dev_p0c
+    interface
+      subroutine gpu_download_first_p0c(h_p0c) bind(C, name='gpu_download_first_p0c_')
+        use, intrinsic :: iso_c_binding
+        real(C_DOUBLE), intent(out) :: h_p0c
+      end subroutine
+    end interface
+    call gpu_download_first_p0c(dev_p0c)
+    r_ratio = ele%value(p0c$) / dev_p0c
+  end block
 else
   r_ratio = ele%value(p0c$) / particle1%p0c
 endif

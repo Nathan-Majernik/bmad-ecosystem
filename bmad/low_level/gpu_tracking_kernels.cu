@@ -4317,6 +4317,19 @@ extern "C" void gpu_orbit_check_(int n)
 }
 
 /* --------------------------------------------------------------------------
+ * gpu_download_first_p0c -- download first particle's p0c from device.
+ * Used by precompute_multipole_arrays when host p0c is stale.
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_download_first_p0c_(double *h_p0c)
+{
+    if (d_p0c) {
+        cudaMemcpy(h_p0c, d_p0c, sizeof(double), cudaMemcpyDeviceToHost);
+    } else {
+        *h_p0c = 1.0;  /* fallback: no device data */
+    }
+}
+
+/* --------------------------------------------------------------------------
  * gpu_nan_check -- check for NaN/Inf in particle coordinates on device.
  * Returns the number of alive particles with NaN/Inf in any coordinate.
  * Enable with GPU_NAN_CHECK=1 environment variable.
