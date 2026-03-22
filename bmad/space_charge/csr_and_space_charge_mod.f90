@@ -341,7 +341,8 @@ do i_step = 0, n_step
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
     if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_slice = csr_dt_slice + real(csr_c1-csr_c0,rp)/csr_crate; endif
     if (csr_timer_on) call system_clock(csr_c0)
-    ! GPU body tracking for ALL elements in CSR loop (including bends).
+    ! GPU body tracking for non-bend elements in CSR loop.
+    ! Bends excluded (Bug 010: compounding sigma_x error after long linac).
     ! Apply misalignment + fringe at element edges, matching CPU's
     ! offset_particle(set$) → fringe → body → fringe → offset_particle(unset$).
     if (gpu_csr_active .and. ele%key /= sbend$ .and. ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
