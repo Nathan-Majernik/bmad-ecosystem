@@ -2471,12 +2471,10 @@ if (ele%key == pipe$ .or. ele%key == monitor$ .or. ele%key == instrument$ .or. &
   ! No multipoles: can stay on device as drift
 endif
 
-! Simple misalignment (x_offset, y_offset, tilt/ref_tilt) handled on GPU
-! for all element types including bends. Pitches and z_offset still need CPU.
-if (ele%bookkeeping_state%has_misalign) then
-  if (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
-      ele%value(z_offset_tot$) /= 0) return
-endif
+! All misalignment types handled on GPU:
+! - x/y offset + tilt: gpu_misalign (2D rotation)
+! - pitches + z_offset: gpu_misalign_3d (full 3D rotation matrix)
+! - bends with curvature: gpu_bend_offset (curvature-aware transforms)
 
 ! Check for fringe that requires CPU
 has_fringe_needs_cpu = .false.
@@ -2686,6 +2684,16 @@ do ie = ix_start, ix_end
       elseif (ele%key == sbend$) then
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(ref_tilt_tot$), 1, n)
+      elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
+              ele%value(z_offset_tot$) /= 0) then
+        ! 3D misalignment: pitches and/or z_offset require full rotation matrix
+        block
+          real(rp) :: W_3d(3,3)
+          call floor_angles_to_w_mat(ele%value(x_pitch_tot$), ele%value(y_pitch_tot$), &
+                                     ele%value(tilt_tot$), w_mat_inv = W_3d)
+          call gpu_misalign_3d(W_3d, ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                               ele%value(z_offset_tot$), 1, n)
+        end block
       else
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(tilt_tot$), 1, n)
@@ -2723,6 +2731,15 @@ do ie = ix_start, ix_end
       elseif (ele%key == sbend$) then
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(ref_tilt_tot$), -1, n)
+      elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
+              ele%value(z_offset_tot$) /= 0) then
+        block
+          real(rp) :: W_3d(3,3)
+          call floor_angles_to_w_mat(ele%value(x_pitch_tot$), ele%value(y_pitch_tot$), &
+                                     ele%value(tilt_tot$), w_mat = W_3d)
+          call gpu_misalign_3d(W_3d, ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                               ele%value(z_offset_tot$), -1, n)
+        end block
       else
         call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                            ele%value(tilt_tot$), -1, n)
@@ -3635,6 +3652,15 @@ if (has_misalign) then
   elseif (ele%key == sbend$) then
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(ref_tilt_tot$), 1, n)
+  elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
+          ele%value(z_offset_tot$) /= 0) then
+    block
+      real(rp) :: W_3d(3,3)
+      call floor_angles_to_w_mat(ele%value(x_pitch_tot$), ele%value(y_pitch_tot$), &
+                                 ele%value(tilt_tot$), w_mat_inv = W_3d)
+      call gpu_misalign_3d(W_3d, ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                           ele%value(z_offset_tot$), 1, n)
+    end block
   else
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(tilt_tot$), 1, n)
@@ -3672,6 +3698,15 @@ if (has_misalign) then
   elseif (ele%key == sbend$) then
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(ref_tilt_tot$), -1, n)
+  elseif (ele%value(x_pitch_tot$) /= 0 .or. ele%value(y_pitch_tot$) /= 0 .or. &
+          ele%value(z_offset_tot$) /= 0) then
+    block
+      real(rp) :: W_3d(3,3)
+      call floor_angles_to_w_mat(ele%value(x_pitch_tot$), ele%value(y_pitch_tot$), &
+                                 ele%value(tilt_tot$), w_mat = W_3d)
+      call gpu_misalign_3d(W_3d, ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
+                           ele%value(z_offset_tot$), -1, n)
+    end block
   else
     call gpu_misalign(ele%value(x_offset_tot$), ele%value(y_offset_tot$), &
                        ele%value(tilt_tot$), -1, n)
