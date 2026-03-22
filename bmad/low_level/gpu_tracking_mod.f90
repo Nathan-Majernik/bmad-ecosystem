@@ -2778,12 +2778,18 @@ do ie = ix_start, ix_end
       call track_bunch_thru_bend_gpu(bunch, ele, branch%param, did_track)
     case (lcavity$)
       call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, did_track)
-    case (pipe$, monitor$, instrument$)
+    case (pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$)
       call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, did_track)
+    case (sextupole$, octupole$, thick_multipole$, elseparator$)
+      call track_bunch_thru_sextupole_gpu(bunch, ele, branch%param, did_track)
     case (solenoid$)
       call track_bunch_thru_solenoid_gpu(bunch, ele, branch%param, did_track)
     case (sol_quad$)
       call track_bunch_thru_sol_quad_gpu(bunch, ele, branch%param, did_track)
+    case (wiggler$, undulator$)
+      call track_bunch_thru_wiggler_gpu(bunch, ele, branch%param, did_track)
+    case (marker$)
+      did_track = .true.  ! zero-length, nothing to do
     end select
 
     if (.not. did_track) exit
@@ -3758,6 +3764,11 @@ end select
 end subroutine
 
 subroutine dispatch_fringe_on_device_pub(ele, param, np, edge)
+! NOTE: This handles fringe for the persistent GPU session's element dispatch.
+! Currently only quad fringe is needed here because ele_gpu_can_stay_on_device
+! ensures elements with other fringe types (sbend, sextupole, etc.) fall back
+! to per-element dispatch where the contained dispatch_fringe_on_device handles
+! all fringe types. The CSR path uses gpu_apply_fringe_on_device instead.
 use multipole_mod, only: ab_multipole_kicks
 type (ele_struct), intent(in) :: ele
 type (lat_param_struct), intent(in) :: param
