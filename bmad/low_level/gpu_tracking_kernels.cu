@@ -4325,7 +4325,8 @@ extern "C" void gpu_download_first_p0c_(double *h_p0c)
     if (d_p0c) {
         CUDA_CHECK_VOID(cudaMemcpy(h_p0c, d_p0c, sizeof(double), cudaMemcpyDeviceToHost));
     } else {
-        *h_p0c = 1.0;  /* fallback: no device data — see AUDITOR concern */
+        fprintf(stderr, "ERROR: gpu_download_first_p0c called with no device p0c buffer allocated.\n");
+        *h_p0c = 0.0;  /* zero triggers obvious division-by-zero rather than silent 1e9 scaling */
     }
 }
 
