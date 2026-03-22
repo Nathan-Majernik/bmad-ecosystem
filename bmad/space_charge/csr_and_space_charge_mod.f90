@@ -425,6 +425,12 @@ do i_step = 0, n_step
     if (err_flag) return
   endif
 
+  ! Start async 3D SC computation (GPU FFTs run while CPU does root-finding below).
+  ! The apply phase happens in csr_apply_kicks_gpu after CSR kicks are applied.
+  if (gpu_csr_active .and. ele%space_charge_method == fft_3d$) then
+    call csr_sc_3d_compute_gpu(ele, csr, bunch)
+  endif
+
   ! CSR kick computation — skip entirely for fft_3d-only elements
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
     csr%s_kick = s0_step
@@ -708,30 +714,71 @@ else
   deallocate(h_kick_csr_l, h_kick_lsc_l)
 endif
 
-! 3D FFT space charge (on device — no upload/download needed)
+! 3D FFT space charge: apply phase only (compute was started earlier)
 if (ele_in%space_charge_method == fft_3d$ .and. gpu_persist_on_device) then
-  ! Cache charge array — it doesn't change between sub-steps.
-  ! Use module-level saved array to avoid per-sub-step allocation + 1M-particle loop.
   block
-    real(C_DOUBLE), allocatable, save :: h_charge_cached(:)
-    integer, save :: h_charge_cached_n = 0
-    if (np_l /= h_charge_cached_n) then
-      if (allocated(h_charge_cached)) deallocate(h_charge_cached)
-      allocate(h_charge_cached(np_l))
-      do ii = 1, np_l
-        h_charge_cached(ii) = bunch_in%particle(ii)%charge
-      enddo
-      h_charge_cached_n = np_l
-    endif
-    mc2_l = mass_of(bunch_in%particle(1)%species)
-    call gpu_space_charge_3d(h_charge_cached, int(np_l, C_INT), &
-        int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
-        int(csr_in%mesh3d%nhi(3), C_INT), &
-        csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+    interface
+      subroutine gpu_space_charge_3d_apply(np) bind(C, name='gpu_space_charge_3d_apply_')
+        use, intrinsic :: iso_c_binding
+        integer(C_INT), value :: np
+      end subroutine
+    end interface
+    call gpu_space_charge_3d_apply(int(np_l, C_INT))
   end block
 endif
 
 end subroutine csr_apply_kicks_gpu
+
+!------------------------------------------------------------------------
+! Start async 3D FFT space charge computation (compute phase only).
+! Launches bounds + deposit + FFTs on GPU and returns immediately.
+! Must be followed by gpu_space_charge_3d_apply (called from
+! csr_apply_kicks_gpu) before the next sub-step.
+!------------------------------------------------------------------------
+subroutine csr_sc_3d_compute_gpu(ele_in, csr_in, bunch_in)
+use gpu_tracking_mod, only: gpu_persist_on_device
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (csr_struct), target, intent(in) :: csr_in
+type (bunch_struct), target, intent(in) :: bunch_in
+
+integer :: ii, np_l
+real(rp) :: mc2_l
+
+if (ele_in%space_charge_method /= fft_3d$ .or. .not. gpu_persist_on_device) return
+
+np_l = size(bunch_in%particle)
+
+block
+  real(C_DOUBLE), allocatable, save :: h_charge_cached_sc(:)
+  integer, save :: h_charge_cached_sc_n = 0
+
+  interface
+    subroutine gpu_space_charge_3d_compute(h_charge, np, nx, ny, nz, &
+        gamma, ds_step, mc2, dct_ave) bind(C, name='gpu_space_charge_3d_compute_')
+      use, intrinsic :: iso_c_binding
+      real(C_DOUBLE), intent(in) :: h_charge(*)
+      integer(C_INT), value :: np, nx, ny, nz
+      real(C_DOUBLE), value :: gamma, ds_step, mc2, dct_ave
+    end subroutine
+  end interface
+
+  if (np_l /= h_charge_cached_sc_n) then
+    if (allocated(h_charge_cached_sc)) deallocate(h_charge_cached_sc)
+    allocate(h_charge_cached_sc(np_l))
+    do ii = 1, np_l
+      h_charge_cached_sc(ii) = bunch_in%particle(ii)%charge
+    enddo
+    h_charge_cached_sc_n = np_l
+  endif
+  mc2_l = mass_of(bunch_in%particle(1)%species)
+  call gpu_space_charge_3d_compute(h_charge_cached_sc, int(np_l, C_INT), &
+      int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
+      int(csr_in%mesh3d%nhi(3), C_INT), &
+      csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+end block
+
+end subroutine csr_sc_3d_compute_gpu
 
 !------------------------------------------------------------------------
 ! GPU-accelerated CSR bin kicks.

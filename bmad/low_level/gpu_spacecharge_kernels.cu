@@ -748,7 +748,24 @@ static int ensure_csr_bin_buffers(int n_bin)
  * Modifies vpx, vpy, vpz, vz, beta on device.
  *
  * h_charge: per-particle charge array (host)
+ *
+ * Supports split compute/apply mode: when sc_compute_only_flag is set,
+ * performs bounds + deposit + FFTs and returns immediately (GPU work is
+ * async). The caller must then call gpu_space_charge_3d_apply_() to wait
+ * for FFTs and apply kicks. This allows overlapping SC FFTs with CPU work.
  * -------------------------------------------------------------------------- */
+
+/* File-scope state for split compute/apply SC pipeline */
+static cudaEvent_t sc_fft_done[3] = {0, 0, 0};
+static int sc_fft_events_created = 0;
+static int sc_compute_only_flag = 0;
+static struct {
+    double xmin, ymin, zmin, dx, dy, dz, dxi, dyi, dzi;
+    double ds_step, gamma, mc2, dct_ave;
+    int nx, ny, nz, n_particles;
+    int valid;
+} sc_split_state = {0};
+
 extern "C" void gpu_space_charge_3d_(
     double *h_charge,  /* n_particles, host */
     int n_particles,
@@ -1023,19 +1040,33 @@ extern "C" void gpu_space_charge_3d_(
         }
     }
 
-    /* Use events instead of cudaStreamSynchronize to avoid blocking CPU.
-     * Default stream waits for all 3 component streams via GPU-side events. */
-    {
-        static cudaEvent_t sc_comp_done[3] = {0, 0, 0};
-        static int sc_events_created = 0;
-        if (!sc_events_created) {
-            for (int c = 0; c < 3; c++) cudaEventCreateWithFlags(&sc_comp_done[c], cudaEventDisableTiming);
-            sc_events_created = 1;
-        }
-        for (int c = 0; c < 3; c++) {
-            cudaEventRecord(sc_comp_done[c], sc_streams[c]);
-            cudaStreamWaitEvent(0, sc_comp_done[c], 0);  /* default stream waits */
-        }
+    /* Record events on component streams for synchronization. */
+    if (!sc_fft_events_created) {
+        for (int c = 0; c < 3; c++) cudaEventCreateWithFlags(&sc_fft_done[c], cudaEventDisableTiming);
+        sc_fft_events_created = 1;
+    }
+    for (int c = 0; c < 3; c++) {
+        cudaEventRecord(sc_fft_done[c], sc_streams[c]);
+    }
+
+    if (sc_compute_only_flag) {
+        /* Compute-only mode: save params for later apply, return without kicks.
+         * GPU continues FFT work asynchronously while CPU does other work. */
+        sc_split_state.xmin = xmin; sc_split_state.ymin = ymin; sc_split_state.zmin = zmin;
+        sc_split_state.dx = dx; sc_split_state.dy = dy; sc_split_state.dz = dz;
+        sc_split_state.dxi = dxi; sc_split_state.dyi = dyi; sc_split_state.dzi = dzi;
+        sc_split_state.ds_step = ds_step; sc_split_state.gamma = gamma;
+        sc_split_state.mc2 = mc2; sc_split_state.dct_ave = dct_ave;
+        sc_split_state.nx = nx; sc_split_state.ny = ny; sc_split_state.nz = nz;
+        sc_split_state.n_particles = n_particles;
+        sc_split_state.valid = 1;
+        sc_compute_only_flag = 0;
+        return;
+    }
+
+    /* Normal mode: wait for FFTs and apply kicks immediately */
+    for (int c = 0; c < 3; c++) {
+        cudaStreamWaitEvent(0, sc_fft_done[c], 0);  /* default stream waits */
     }
 
     /* --- Step 5: Interpolate fields and apply kicks --- */
@@ -1049,9 +1080,69 @@ extern "C" void gpu_space_charge_3d_(
         ds_step, gamma, mc2, dct_ave,
         n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
-    /* No sync needed -- next GPU operation on same stream serializes. */
 
     /* d_z_adj is static -- not freed here, reused across calls */
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_space_charge_3d_compute -- compute-only wrapper
+ *
+ * Calls gpu_space_charge_3d_ in compute-only mode: performs bounds,
+ * charge deposition, and FFTs, then returns immediately without applying
+ * kicks. The GPU continues FFT work asynchronously while the CPU can do
+ * other work (e.g. CSR root-finding).
+ *
+ * MUST be followed by gpu_space_charge_3d_apply_ before the next sub-step.
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_space_charge_3d_compute_(
+    double *h_charge, int n_particles,
+    int nx, int ny, int nz,
+    double gamma, double ds_step, double mc2,
+    double dct_ave)
+{
+    sc_compute_only_flag = 1;
+    gpu_space_charge_3d_(h_charge, n_particles, nx, ny, nz, gamma, ds_step, mc2, dct_ave);
+}
+
+/* --------------------------------------------------------------------------
+ * gpu_space_charge_3d_apply -- apply phase of split SC pipeline
+ *
+ * Waits for the compute phase FFTs to complete (via GPU-side events),
+ * then interpolates the E-field and applies kicks to particles.
+ *
+ * MUST be called after gpu_space_charge_3d_compute_ on the same sub-step.
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_space_charge_3d_apply_(int n_particles)
+{
+    if (!sc_split_state.valid || n_particles <= 0) return;
+
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
+
+    int threads = 256;
+    int blocks_p = (n_particles + threads - 1) / threads;
+
+    /* Wait for all 3 component FFTs to complete before interpolation */
+    for (int c = 0; c < 3; c++) {
+        cudaStreamWaitEvent(0, sc_fft_done[c], 0);  /* default stream waits */
+    }
+
+    /* Interpolate E-field at particle positions and apply kicks */
+    sc_interpolate_kick_kernel<<<blocks_p, threads>>>(
+        dvec[0], dvec[1], dvec[2], dvec[3],
+        dvec[4], dvec[5],
+        dstate, dbeta, dp0c,
+        d_sc_efield,
+        sc_split_state.xmin, sc_split_state.ymin, sc_split_state.zmin,
+        sc_split_state.dxi, sc_split_state.dyi, sc_split_state.dzi,
+        sc_split_state.dx, sc_split_state.dy, sc_split_state.dz,
+        sc_split_state.nx, sc_split_state.ny, sc_split_state.nz,
+        sc_split_state.ds_step, sc_split_state.gamma,
+        sc_split_state.mc2, sc_split_state.dct_ave,
+        n_particles);
+    CUDA_SC_CHECK(cudaGetLastError());
+
+    sc_split_state.valid = 0;
 }
 
 
