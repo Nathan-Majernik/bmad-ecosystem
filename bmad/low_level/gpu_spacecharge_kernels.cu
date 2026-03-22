@@ -1116,6 +1116,11 @@ extern "C" void gpu_space_charge_3d_apply_(int n_particles)
 {
     if (!sc_split_state.valid || n_particles <= 0) return;
 
+    if (n_particles != sc_split_state.n_particles) {
+        fprintf(stderr, "gpu_space_charge_3d_apply: n_particles mismatch: %d (apply) vs %d (compute)\n",
+                n_particles, sc_split_state.n_particles);
+    }
+
     double *dvec[6]; int *dstate; double *dbeta, *dp0c;
     get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
 
@@ -2206,6 +2211,13 @@ extern "C" void gpu_spacecharge_cleanup_(void)
     sc_nx2 = 0; sc_ny2 = 0; sc_nz2 = 0;
     sc_charge_uploaded = 0;
 
+    /* Split compute/apply state */
+    sc_split_state.valid = 0;
+    for (int c = 0; c < 3; c++) {
+        if (sc_fft_done[c]) { cudaEventDestroy(sc_fft_done[c]); sc_fft_done[c] = 0; }
+    }
+    sc_fft_events_created = 0;
+
     if (d_csr_bin_charge)     { cudaFree(d_csr_bin_charge);     d_csr_bin_charge = NULL; }
     if (d_csr_bin_x0_wt)     { cudaFree(d_csr_bin_x0_wt);     d_csr_bin_x0_wt = NULL; }
     if (d_csr_bin_y0_wt)     { cudaFree(d_csr_bin_y0_wt);     d_csr_bin_y0_wt = NULL; }
@@ -2224,6 +2236,14 @@ extern "C" void gpu_spacecharge_cleanup_(void)
     free(h_cbk_I_csr); h_cbk_I_csr = NULL;
     free(h_cbk_I_int_csr); h_cbk_I_int_csr = NULL;
     h_cbk_kick1_cap = 0;
+
+    /* CSR convolution buffers + dedicated stream */
+    if (d_csr_I_int) { cudaFree(d_csr_I_int); d_csr_I_int = NULL; }
+    if (d_csr_edge_dcdz) { cudaFree(d_csr_edge_dcdz); d_csr_edge_dcdz = NULL; }
+    if (d_csr_kick_conv) { cudaFree(d_csr_kick_conv); d_csr_kick_conv = NULL; }
+    d_csr_conv_cap = 0;
+    if (csr_kick_stream_created) { cudaStreamDestroy(csr_kick_stream); csr_kick_stream = 0; csr_kick_stream_created = 0; }
+    if (h_csr_I_int_pinned) { cudaFreeHost(h_csr_I_int_pinned); h_csr_I_int_pinned = NULL; h_csr_I_int_pinned_cap = 0; }
 
     /* (GPU-side reduction replaced per-block host buffers) */
 

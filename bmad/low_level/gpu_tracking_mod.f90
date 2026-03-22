@@ -45,7 +45,7 @@ integer, save :: gpu_persist_n = 0
 integer(8), save :: gpu_persist_bunch_id = 0  ! bunch fingerprint to detect new beams
 
 ! Cached device p0c for precompute_multipole_arrays (avoids per-call cudaMemcpy sync).
-! Only lcavity body kernel changes p0c; flag is set after lcavity tracking.
+! Flag is set after lcavity tracking, patch with energy change, or multi-bunch restore.
 real(rp), save :: cached_dev_p0c = 0
 logical, save  :: dev_p0c_stale = .true.
 real(rp), allocatable, save :: gp_vx(:), gp_vpx(:), gp_vy(:), gp_vpy(:)
@@ -3775,6 +3775,7 @@ call gpu_track_patch_dev(ww_flat, &
                          vv(p0c_start$), vv(p0c$), vv(e_tot$), &
                          vv(l$), mc2, &
                          has_rot_val, np)
+if (vv(p0c_start$) /= vv(p0c$)) dev_p0c_stale = .true.
 end subroutine dispatch_patch_body
 
 end subroutine track_bunch_thru_elements_gpu
@@ -4360,6 +4361,7 @@ case (patch$)
                              vv_patch(p0c_start$), vv_patch(p0c$), vv_patch(e_tot$), &
                              vv_patch(l$), mc2, &
                              has_rot_patch, np)
+    if (vv_patch(p0c_start$) /= vv_patch(p0c$)) dev_p0c_stale = .true.
   end block
 
 end select
@@ -4579,6 +4581,7 @@ do i = 1, MAX_GPU_BUNCHES
       endif
       ! Copy the slot's s array to gp_s for consistency with gpu_persistent_flush
       gp_s(1:n_part) = gpu_bunch_slots(i)%s(1:n_part)
+      dev_p0c_stale = .true.
     endif
     return
   endif
@@ -4914,6 +4917,7 @@ case (patch$)
                              vv_p(p0c_start$), vv_p(p0c$), vv_p(e_tot$), &
                              vv_p(l$), mc2, &
                              hr_p, n)
+    if (vv_p(p0c_start$) /= vv_p(p0c$)) dev_p0c_stale = .true.
   end block
   did_track = .true.
 
