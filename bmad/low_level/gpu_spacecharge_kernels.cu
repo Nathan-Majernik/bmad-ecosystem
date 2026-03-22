@@ -1099,6 +1099,118 @@ extern "C" void gpu_csr_z_minmax_(
 
 
 /* --------------------------------------------------------------------------
+ * gpu_csr_fused_minmax_bin -- fused z_minmax + binning in one call
+ *
+ * Eliminates the separate gpu_csr_z_minmax call and its sync point.
+ * Does: z_minmax → compute bin params → bin particles → download.
+ * Only ONE sync point (implicit in the final cudaMemcpy DtoH).
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_csr_fused_minmax_bin_(
+    double *h_charge,      /* per-particle charge, host (cached) */
+    int n_particles,
+    double *h_bin_charge,  /* n_bin, output */
+    double *h_bin_x0_wt,
+    double *h_bin_y0_wt,
+    double *h_bin_n_particle,
+    double *h_z_min_out,   /* computed z_min, output */
+    double *h_z_max_out,   /* computed z_max, output */
+    double dz_slice,       /* computed by caller from z_min/z_max */
+    double dz_particle,
+    int n_bin, int n_bin_eff, int particle_bin_span)
+{
+    if (n_particles <= 0 || n_bin <= 0) return;
+    if (ensure_csr_bin_buffers(n_bin) != 0) return;
+
+    double *dvec[6]; int *dstate; double *dbeta, *dp0c;
+    get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
+
+    int threads = 256;
+    int blocks_p = (n_particles + threads - 1) / threads;
+
+    /* Step 1: z_minmax on GPU */
+    if (blocks_p > d_zminmax_cap) {
+        if (d_zminmax_bmin) cudaFree(d_zminmax_bmin);
+        if (d_zminmax_bmax) cudaFree(d_zminmax_bmax);
+        cudaMalloc((void**)&d_zminmax_bmin, blocks_p * sizeof(double));
+        cudaMalloc((void**)&d_zminmax_bmax, blocks_p * sizeof(double));
+        d_zminmax_cap = blocks_p;
+    }
+    z_minmax_kernel<<<blocks_p, threads, 2 * threads * sizeof(double)>>>(
+        dvec[4], dstate, d_zminmax_bmin, d_zminmax_bmax, n_particles);
+
+    /* Download z_min/z_max block results — the cudaMemcpy implicitly syncs */
+    if (blocks_p > h_zminmax_cap) {
+        free(h_zminmax_bmin); free(h_zminmax_bmax);
+        h_zminmax_bmin = (double*)malloc(blocks_p * sizeof(double));
+        h_zminmax_bmax = (double*)malloc(blocks_p * sizeof(double));
+        h_zminmax_cap = blocks_p;
+    }
+    cudaMemcpy(h_zminmax_bmin, d_zminmax_bmin, blocks_p * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_zminmax_bmax, d_zminmax_bmax, blocks_p * sizeof(double), cudaMemcpyDeviceToHost);
+
+    double zmin = 1e30, zmax = -1e30;
+    for (int i = 0; i < blocks_p; i++) {
+        if (h_zminmax_bmin[i] < zmin) zmin = h_zminmax_bmin[i];
+        if (h_zminmax_bmax[i] > zmax) zmax = h_zminmax_bmax[i];
+    }
+    *h_z_min_out = zmin;
+    *h_z_max_out = zmax;
+
+    /* Step 2: Compute bin parameters from z_min/z_max */
+    double dz = zmax - zmin;
+    if (dz == 0) return;
+    double dz_sl = 1.0000001 * dz / n_bin_eff;
+    double z_center = (zmax + zmin) / 2.0;
+    double z_min_bin = z_center - n_bin * dz_sl / 2.0;
+    double dz_part = particle_bin_span * dz_sl;
+
+    /* Step 3: Charge upload (cached) */
+    {
+        static int csr_charge_cap = 0;
+        if (n_particles > csr_charge_cap) {
+            if (d_sc_charge) cudaFree(d_sc_charge);
+            cudaMalloc((void**)&d_sc_charge, (size_t)n_particles * sizeof(double));
+            csr_charge_cap = n_particles;
+            sc_charge_uploaded = 0;
+        }
+    }
+    {
+        static const double *last_csr_h_charge = NULL;
+        static int last_csr_np = 0;
+        if (h_charge != last_csr_h_charge || n_particles != last_csr_np) {
+            cudaMemcpy(d_sc_charge, h_charge,
+                n_particles * sizeof(double), cudaMemcpyHostToDevice);
+            last_csr_h_charge = h_charge;
+            last_csr_np = n_particles;
+        }
+    }
+
+    /* Step 4: Zero bin arrays and run binning kernel */
+    size_t bsz = n_bin * sizeof(double);
+    cudaMemset(d_csr_bin_charge, 0, bsz);
+    cudaMemset(d_csr_bin_x0_wt, 0, bsz);
+    cudaMemset(d_csr_bin_y0_wt, 0, bsz);
+    cudaMemset(d_csr_bin_n_particle, 0, bsz);
+
+    csr_bin_kernel<<<blocks_p, threads>>>(
+        dvec[4], dvec[0], dvec[2],
+        d_sc_charge, dstate,
+        d_csr_bin_charge, d_csr_bin_x0_wt, d_csr_bin_y0_wt,
+        d_csr_bin_n_particle,
+        z_min_bin, dz_sl, dz_part,
+        n_bin, particle_bin_span,
+        n_particles);
+    CUDA_SC_CHECK(cudaGetLastError());
+
+    /* Step 5: Download bin results */
+    cudaMemcpy(h_bin_charge, d_csr_bin_charge, bsz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_bin_x0_wt, d_csr_bin_x0_wt, bsz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_bin_y0_wt, d_csr_bin_y0_wt, bsz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_bin_n_particle, d_csr_bin_n_particle, bsz, cudaMemcpyDeviceToHost);
+}
+
+
+/* --------------------------------------------------------------------------
  * gpu_csr_bin_particles -- bin particles on GPU
  *
  * Particle vx, vy, vz, state must be on device.

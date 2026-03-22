@@ -316,9 +316,11 @@ call save_a_bunch_step (ele, bunch, bunch_track, s_start)
 ! binning, and kick application. The bin-level kick computation stays on CPU.
 
 ! CSR sub-step timing (controlled by environment variable CSR_TIMER)
+! Uses system_clock for wall time (cpu_time is misleading with async GPU).
 block
-real(rp) :: csr_t0, csr_t1
+integer(8) :: csr_c0, csr_c1, csr_crate
 real(rp), save :: csr_dt_body = 0, csr_dt_bin = 0, csr_dt_kicks = 0, csr_dt_apply = 0
+real(rp), save :: csr_dt_slice = 0, csr_dt_geom = 0
 integer, save :: csr_n_steps_total = 0
 logical, save :: csr_timer_on = .false., csr_timer_checked = .false.
 character(8) :: csr_timer_env
@@ -327,35 +329,34 @@ if (.not. csr_timer_checked) then
   csr_timer_on = (csr_timer_env == '1' .or. csr_timer_env == 'Y')
   csr_timer_checked = .true.
 endif
+call system_clock(count_rate=csr_crate)
 
 do i_step = 0, n_step
 
   ! track through the runt
 
   if (i_step /= 0) then
+    if (csr_timer_on) call system_clock(csr_c0)
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
-    if (csr_timer_on) call cpu_time(csr_t0)
-    if (gpu_csr_active .and. ele_gpu_can_stay_on_device(ele)) then
-      ! GPU body-only: for elements that can stay on device (no unsupported fringe).
-      ! gpu_track_body_on_device skips fringe/misalignment — that's correct for
-      ! interior runts. For edge runts, the persistent session handles supported
-      ! fringe types (basic_bend, hard_edge_only, quad). Elements with full$ fringe
-      ! fail ele_gpu_can_stay_on_device and fall through to CPU path below.
+    if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_slice = csr_dt_slice + real(csr_c1-csr_c0,rp)/csr_crate; endif
+    if (csr_timer_on) call system_clock(csr_c0)
+    if (gpu_csr_active .and. ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
       call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
       if (.not. gpu_did_track) then
+        if (csr_timer_on) print '(A,I4,A,I4,A)', ' CSR_DEBUG: GPU fallback ele=', ele%ix_ele, ' key=', ele%key, ' (did_track=F)'
         call gpu_persistent_flush(bunch, runt)
         gpu_csr_active = .false.
         call track1_bunch_hom (bunch, runt)
       endif
     else
-      ! CPU body: for non-GPU elements or elements with unsupported fringe.
-      ! track1_bunch_hom -> track1 handles fringe at element edges correctly.
+      if (csr_timer_on .and. gpu_csr_active) print '(A,I4,A,I4,A,L1)', &
+        ' CSR_DEBUG: CPU path ele=', ele%ix_ele, ' key=', ele%key, ' can_stay=', ele_gpu_can_stay_on_device(ele)
       if (gpu_persist_on_device) call gpu_persistent_flush(bunch, ele)
       call track1_bunch_hom (bunch, runt)
       if (gpu_csr_active .and. .not. gpu_persist_on_device) &
         call gpu_persistent_seed(bunch, ele, force=.true.)
     endif
-    if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_body = csr_dt_body + (csr_t1 - csr_t0); endif
+    if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_body = csr_dt_body + real(csr_c1-csr_c0,rp)/csr_crate; endif
   endif
 
   s0_step = i_step * csr%ds_track_step
@@ -386,13 +387,13 @@ do i_step = 0, n_step
 
   ! Bin particles — only needed for CSR or slice SC (not for fft_3d-only)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
-    if (csr_timer_on) call cpu_time(csr_t0)
+    if (csr_timer_on) call system_clock(csr_c0)
     if (gpu_csr_active) then
       call csr_bin_particles_gpu(ele, bunch, csr, err_flag)
     else
       call csr_bin_particles (ele, bunch%particle, csr, err_flag)
     endif
-    if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_bin = csr_dt_bin + (csr_t1 - csr_t0); endif
+    if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_bin = csr_dt_bin + real(csr_c1-csr_c0,rp)/csr_crate; endif
     if (err_flag) return
   endif
 
@@ -408,7 +409,7 @@ do i_step = 0, n_step
     csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
   endif
 
-  if (csr_timer_on) call cpu_time(csr_t0)
+  if (csr_timer_on) call system_clock(csr_c0)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
     do ns = 0, space_charge_com%n_shield_images
       ! The factor of -1^ns accounts for the sign of the image currents
@@ -430,10 +431,10 @@ do i_step = 0, n_step
     enddo
   endif
 
-  if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_kicks = csr_dt_kicks + (csr_t1 - csr_t0); endif
+  if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_kicks = csr_dt_kicks + real(csr_c1-csr_c0,rp)/csr_crate; endif
 
   ! Apply kicks to particles — GPU path modifies device data directly
-  if (csr_timer_on) call cpu_time(csr_t0)
+  if (csr_timer_on) call system_clock(csr_c0)
   if (gpu_csr_active) then
     ! GPU path: kicks applied on device
     call csr_apply_kicks_gpu(ele, csr, bunch)
@@ -442,7 +443,7 @@ do i_step = 0, n_step
     call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
   endif
 
-  if (csr_timer_on) then; call cpu_time(csr_t1); csr_dt_apply = csr_dt_apply + (csr_t1 - csr_t0); endif
+  if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_apply = csr_dt_apply + real(csr_c1-csr_c0,rp)/csr_crate; endif
   csr_n_steps_total = csr_n_steps_total + 1
 
   call save_a_bunch_step (ele, bunch, bunch_track, s0_step)
@@ -479,9 +480,9 @@ enddo
 
 ! Print CSR timer summary every 100 sub-steps
 if (csr_timer_on .and. mod(csr_n_steps_total, 10) == 0 .and. csr_n_steps_total > 0) then
-  print '(A,I6,A,F8.3,A,F8.3,A,F8.3,A,F8.3)', &
+  print '(A,I6,A,F8.3,A,F8.3,A,F8.3,A,F8.3,A,F8.3)', &
     ' CSR_TIMER steps=', csr_n_steps_total, &
-    '  body=', csr_dt_body, '  bin=', csr_dt_bin, &
+    '  slice=', csr_dt_slice, '  body=', csr_dt_body, '  bin=', csr_dt_bin, &
     '  kicks=', csr_dt_kicks, '  apply=', csr_dt_apply
 endif
 
@@ -520,45 +521,34 @@ if (n_bin_eff_l < 1) then
   return
 endif
 
-! Get z min/max from device data
-call gpu_csr_z_minmax(z_minval, z_maxval, int(np_l, C_INT))
-dz_l = z_maxval - z_minval
-if (dz_l == 0) then
-  err_flag_out = .true.
-  return
-endif
-
-csr_in%dz_slice = 1.0000001_rp * dz_l / n_bin_eff_l
-z_center_l = (z_maxval + z_minval) / 2
-z_min_l = z_center_l - nb_l * csr_in%dz_slice / 2
-dz_particle_l = space_charge_com%particle_bin_span * csr_in%dz_slice
-
-! Allocate bin arrays
+! Allocate bin arrays (once)
 if (allocated(csr_in%slice)) then
   if (size(csr_in%slice, 1) < nb_l) deallocate (csr_in%slice)
 endif
 if (.not. allocated(csr_in%slice)) &
     allocate (csr_in%slice(nb_l), csr_in%kick1(-nb_l:nb_l))
-! Only zero the fields that are accumulated (charge, x0, y0, n_particle, edge_dcharge_density_dz).
-! Full struct zeroing every sub-step is expensive for n_bin=2000.
-do ii = 1, nb_l
-  csr_in%slice(ii)%charge = 0; csr_in%slice(ii)%x0 = 0; csr_in%slice(ii)%y0 = 0
-  csr_in%slice(ii)%n_particle = 0; csr_in%slice(ii)%edge_dcharge_density_dz = 0
-  csr_in%slice(ii)%kick_csr = 0; csr_in%slice(ii)%kick_lsc = 0
-enddo
 
-! Fill in z geometry
-do ii = 1, nb_l
-  csr_in%slice(ii)%z0_edge  = z_min_l + (ii - 1) * csr_in%dz_slice
-  csr_in%slice(ii)%z_center = csr_in%slice(ii)%z0_edge + csr_in%dz_slice / 2
-  csr_in%slice(ii)%z1_edge  = csr_in%slice(ii)%z0_edge + csr_in%dz_slice
-enddo
-
-! Prepare per-particle charge array (cached — doesn't change between sub-steps)
+! Fused z_minmax + binning: one GPU call, one sync point
 block
+  use, intrinsic :: iso_c_binding
   real(C_DOUBLE), allocatable, save :: h_charge_cached_bin(:)
   real(C_DOUBLE), allocatable, save :: h_bin_ch_s(:), h_bin_x0_s(:), h_bin_y0_s(:), h_bin_np_s(:)
   integer, save :: h_charge_cached_bin_n = 0, h_bin_s_n = 0
+  real(C_DOUBLE) :: z_min_out, z_max_out
+
+  interface
+    subroutine gpu_csr_fused_minmax_bin(h_charge, np, h_bin_ch, h_bin_x0, h_bin_y0, h_bin_np, &
+        z_min_o, z_max_o, dz_sl, dz_part, nb, nb_eff, pbs) &
+        bind(C, name='gpu_csr_fused_minmax_bin_')
+      use, intrinsic :: iso_c_binding
+      real(C_DOUBLE), intent(in) :: h_charge(*)
+      integer(C_INT), value :: np, nb, nb_eff, pbs
+      real(C_DOUBLE), intent(out) :: h_bin_ch(*), h_bin_x0(*), h_bin_y0(*), h_bin_np(*)
+      real(C_DOUBLE), intent(out) :: z_min_o, z_max_o
+      real(C_DOUBLE), value :: dz_sl, dz_part
+    end subroutine
+  end interface
+
   if (np_l /= h_charge_cached_bin_n) then
     if (allocated(h_charge_cached_bin)) deallocate(h_charge_cached_bin)
     allocate(h_charge_cached_bin(np_l))
@@ -571,30 +561,48 @@ block
     enddo
     h_charge_cached_bin_n = np_l
   endif
-  ! Cache bin output arrays (reuse across sub-steps)
   if (nb_l > h_bin_s_n) then
     if (allocated(h_bin_ch_s)) deallocate(h_bin_ch_s, h_bin_x0_s, h_bin_y0_s, h_bin_np_s)
     allocate(h_bin_ch_s(nb_l), h_bin_x0_s(nb_l), h_bin_y0_s(nb_l), h_bin_np_s(nb_l))
     h_bin_s_n = nb_l
   endif
 
-  ! GPU binning kernel (reads vz, vx, vy, state from device; outputs bin arrays to host)
-  call gpu_csr_bin_particles(h_charge_cached_bin, int(np_l, C_INT), &
+  call gpu_csr_fused_minmax_bin(h_charge_cached_bin, int(np_l, C_INT), &
       h_bin_ch_s, h_bin_x0_s, h_bin_y0_s, h_bin_np_s, &
-      z_min_l, csr_in%dz_slice, dz_particle_l, &
-      int(nb_l, C_INT), int(space_charge_com%particle_bin_span, C_INT))
+      z_min_out, z_max_out, &
+      0.0_C_DOUBLE, 0.0_C_DOUBLE, &  ! dz_slice/dz_particle computed inside C
+      int(nb_l, C_INT), int(n_bin_eff_l, C_INT), &
+      int(space_charge_com%particle_bin_span, C_INT))
 
-  ! Copy results into csr%slice and compute edge_dcharge_density_dz
+  ! Set dz_slice from the fused function's z_min/z_max
+  dz_l = z_max_out - z_min_out
+  if (dz_l == 0) then
+    err_flag_out = .true.
+    return
+  endif
+  csr_in%dz_slice = 1.0000001_rp * dz_l / n_bin_eff_l
+  z_center_l = (z_max_out + z_min_out) / 2
+  z_min_l = z_center_l - nb_l * csr_in%dz_slice / 2
+
+  ! Fill z geometry and copy bin results
   do ii = 1, nb_l
+    csr_in%slice(ii)%z0_edge  = z_min_l + (ii - 1) * csr_in%dz_slice
+    csr_in%slice(ii)%z_center = csr_in%slice(ii)%z0_edge + csr_in%dz_slice / 2
+    csr_in%slice(ii)%z1_edge  = csr_in%slice(ii)%z0_edge + csr_in%dz_slice
     csr_in%slice(ii)%charge = h_bin_ch_s(ii)
     if (h_bin_np_s(ii) > 0 .and. h_bin_ch_s(ii) /= 0) then
       csr_in%slice(ii)%x0 = h_bin_x0_s(ii) / h_bin_ch_s(ii)
       csr_in%slice(ii)%y0 = h_bin_y0_s(ii) / h_bin_ch_s(ii)
+    else
+      csr_in%slice(ii)%x0 = 0; csr_in%slice(ii)%y0 = 0
     endif
     csr_in%slice(ii)%n_particle = h_bin_np_s(ii)
+    csr_in%slice(ii)%kick_csr = 0; csr_in%slice(ii)%kick_lsc = 0
     if (ii > 1) then
       csr_in%slice(ii)%edge_dcharge_density_dz = &
         (csr_in%slice(ii)%charge - csr_in%slice(ii-1)%charge) / csr_in%dz_slice**2
+    else
+      csr_in%slice(ii)%edge_dcharge_density_dz = 0
     endif
   enddo
 end block

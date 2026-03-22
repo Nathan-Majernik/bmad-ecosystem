@@ -2440,8 +2440,9 @@ end subroutine check_entrance_aperture_for_gpu
 ! Returns .false. if complex CPU-side operations are needed (complex
 ! fringe, pitches, bend misalignment, etc.).
 !------------------------------------------------------------------------
-function ele_gpu_can_stay_on_device(ele) result (can_stay)
+function ele_gpu_can_stay_on_device(ele, from_csr_loop) result (can_stay)
 type (ele_struct), intent(in) :: ele
+logical, intent(in), optional :: from_csr_loop
 logical :: can_stay
 type (fringe_field_info_struct) :: fringe_info
 logical :: has_fringe_needs_cpu
@@ -2449,8 +2450,10 @@ logical :: has_fringe_needs_cpu
 can_stay = .false.
 if (.not. ele_gpu_eligible(ele)) return
 
-! Elements with CSR or space charge need track1_bunch_csr sub-stepping
-if (bmad_com%csr_and_space_charge_on) then
+! Elements with CSR or space charge need track1_bunch_csr sub-stepping.
+! But when called FROM WITHIN the CSR sub-step loop (from_csr_loop=.true.),
+! the sub-stepping is already being handled — body tracking can stay on GPU.
+if (bmad_com%csr_and_space_charge_on .and. .not. logic_option(.false., from_csr_loop)) then
   if (ele%csr_method /= off$ .or. ele%space_charge_method /= off$) return
 endif
 
