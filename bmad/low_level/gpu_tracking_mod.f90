@@ -742,7 +742,7 @@ end function
 ! Currently supported element types: drift, quadrupole, sextupole, octupole,
 ! thick_multipole, elseparator, sbend, rf_bend, lcavity, pipe, monitor,
 ! instrument, kicker, hkicker, vkicker, marker, solenoid, sol_quad,
-! wiggler, undulator.
+! wiggler, undulator, patch.
 !------------------------------------------------------------------------
 function ele_gpu_eligible(ele) result (eligible)
 type (ele_struct), intent(in) :: ele
