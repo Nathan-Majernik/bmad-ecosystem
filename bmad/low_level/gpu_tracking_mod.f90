@@ -4781,6 +4781,61 @@ case (sbend$)
     return
   endif
 
+  ! SAD fringe types: sad_full$ and soft_edge_only$
+  if (fringe_type_val == sad_full$ .or. fringe_type_val == soft_edge_only$) then
+    block
+      real(rp) :: g_sad, fb_sad, c_dir_sad, k1_sad
+      integer :: phys_end_sad, entering_sad
+      phys_end_sad = physical_ele_end(edge, bunch%particle(1), ele%orientation)
+      if (phys_end_sad == entrance_end$) then
+        fb_sad = 12 * ele%value(fint$) * ele%value(hgap$)
+      else
+        fb_sad = 12 * ele%value(fintx$) * ele%value(hgapx$)
+      endif
+      c_dir_sad = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                  ele%orientation * bunch%particle(1)%direction * bunch%particle(1)%time_dir
+      g_sad = (ele%value(g$) + ele%value(dg$)) * c_dir_sad
+      if (edge == second_track_edge$) g_sad = -g_sad
+      charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
+                       ele%orientation * bunch%particle(1)%direction
+      if (phys_end_sad == entrance_end$) then
+        bp_arr = 0; ap_arr = 0; bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(1, C_INT), np)
+      endif
+      if (fringe_type_val == sad_full$) then
+        k1_sad = merge(ele%value(k1$), 0.0_rp, ele%is_on)
+        entering_sad = merge(1, 0, (edge == first_track_edge$ .and. bunch%particle(1)%direction == 1) .or. &
+            (edge == second_track_edge$ .and. bunch%particle(1)%direction == -1))
+        if (edge == first_track_edge$) then
+          if (fb_sad /= 0 .and. g_sad /= 0) call gpu_sad_bend_fringe(g_sad, fb_sad, np)
+          block
+            real(rp) :: g_hw2, e_hw2
+            g_hw2 = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+            e_hw2 = merge(ele%value(e1$), ele%value(e2$), phys_end_sad == entrance_end$)
+            call gpu_bend_fringe(g_hw2, e_hw2, 0.0_rp, k1_sad, &
+                int(entering_sad, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
+          end block
+        else
+          block
+            real(rp) :: g_hw2, e_hw2
+            g_hw2 = (ele%value(g$) + ele%value(dg$)) * charge_dir_val
+            e_hw2 = merge(ele%value(e1$), ele%value(e2$), phys_end_sad == entrance_end$)
+            call gpu_bend_fringe(g_hw2, e_hw2, 0.0_rp, k1_sad, &
+                int(entering_sad, C_INT), int(bunch%particle(1)%time_dir, C_INT), np)
+          end block
+          if (fb_sad /= 0 .and. g_sad /= 0) call gpu_sad_bend_fringe(g_sad, fb_sad, np)
+        endif
+      else
+        if (fb_sad /= 0 .and. g_sad /= 0) call gpu_sad_bend_fringe(g_sad, fb_sad, np)
+      endif
+      if (phys_end_sad == exit_end$) then
+        bp_arr = 0; ap_arr = 0; bp_arr(1) = ele%value(k1$)
+        call gpu_hard_multipole_edge(bp_arr, ap_arr, int(1, C_INT), charge_dir_val, int(0, C_INT), np)
+      endif
+    end block
+    return
+  endif
+
   ! Basic/hard_edge bend fringe (Hwang)
   if (fringe_type_val /= basic_bend$ .and. fringe_type_val /= hard_edge_only$) return
   charge_dir_val = rel_tracking_charge_to_mass(bunch%particle(1), param%particle) * &
