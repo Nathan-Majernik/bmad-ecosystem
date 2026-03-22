@@ -5,19 +5,19 @@
 ! Tests:
 !   1. Plain drift
 !   2. Plain quadrupole
-!   3. Quad with fringe fields (GPU body, fringe on CPU)
-!   4. Quad with sextupole component (GPU body + magnetic multipole kicks)
-!   5. Quad with electric multipole (GPU handles electric kicks)
-!   6. Quad with misalignment (GPU body, misalign on CPU)
-!   7. Quad fringe+misalign+tilt (combined CPU sandwich)
+!   3. Quad with fringe fields
+!   4. Quad with sextupole component
+!   5. Quad with electric multipole
+!   6. Quad with misalignment
+!   7. Quad fringe+misalign+tilt
 !   8. Quad multi-pole+misalign+fringe
-!   9. Quad electric+magnetic+fringe+misalign (combined)
+!   9. Quad electric+magnetic+fringe+misalign
 !  10. Drift + quad + drift (mixed lattice)
 !  11. CPU-only mode (bmad_com%gpu_tracking_on = .false.)
-!  12. Quad with tight aperture (verify particles clipped identically)
+!  12. Quad with tight aperture
 !  13. Drift with tight aperture
 !  14. Plain bend
-!  15. Bend with k1 (sbend_body_with_k1_map)
+!  15. Bend with k1
 !  16. Bend with fringe fields
 !  17. Bend with misalignment
 !  18. Bend with magnetic multipoles
@@ -28,11 +28,6 @@
 !  23. Lcavity with phi0/phi0_err/voltage_err
 !  24. Lcavity with aperture
 !  25. Lcavity with fringe fields
-!  ...
-!  38. Plain sextupole
-!  39. Sextupole with misalignment
-!  40. Sextupole with higher multipoles
-!  41. Sextupole with aperture
 !  26. Lcavity fringe standing wave
 !  27. Plain pipe
 !  28. Pipe with misalignment
@@ -40,6 +35,31 @@
 !  30. Pipe in mixed lattice (drift+pipe+quad)
 !  31. Pipe with tight aperture
 !  32. Pipe combo (misalign+aperture)
+!  33. Drift with elliptical aperture
+!  34. Quad with elliptical aperture
+!  35. Lcavity with phi0_multipass
+!  36. Lcavity with absolute_time_tracking
+!  37. Lcavity abstime multi-cavity
+!  38. Plain sextupole
+!  39. Sextupole with misalignment
+!  40. Sextupole with higher multipoles
+!  41. Sextupole with aperture
+!  42. Bend with sad_full fringe
+!  43. Bend with soft_edge_only fringe
+!  44. Plain solenoid
+!  45. Solenoid with misalignment
+!  46. Plain sol_quad
+!  47. Sol_quad with misalignment
+!  48. Bend with exact_multipoles
+!  49. Multi-bunch tracking (3 bunches)
+!  50. Multi-bunch tracking (5 bunches)
+!  51. Plain octupole
+!  52. Thick multipole (combined sextupole + octupole)
+!  53. Plain wiggler
+!  54. Plain undulator
+!  55. Wiggler with misalignment
+!  56. Plain elseparator
+!  57. Plain rf_bend
 !-
 
 program gpu_tracking_test
@@ -329,7 +349,6 @@ call run_aperture_test('Test 33: Drift elliptical aperture', lat, tol, n_pass, n
 call bmad_parser('lat_quad_elliptical.bmad', lat)
 call run_aperture_test('Test 34: Quad elliptical aperture', lat, tol, n_pass, n_fail)
 
-! ======================================================================
 ! ======================================================================
 ! TEST 35: Lcavity with phi0_multipass (multipass phase offset)
 ! ======================================================================
