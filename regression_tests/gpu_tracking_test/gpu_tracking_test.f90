@@ -60,6 +60,7 @@
 !  55. Wiggler with misalignment
 !  56. Plain elseparator
 !  57. Plain rf_bend
+!  58. Patch element (offsets, rotations, drift-to-exit)
 !-
 
 program gpu_tracking_test
@@ -488,6 +489,12 @@ call run_comparison_test('Test 56: Plain elseparator', lat, 2d-3, n_pass, n_fail
 ! ======================================================================
 call bmad_parser('lat_rf_bend_only.bmad', lat)
 call run_comparison_test('Test 57: Plain rf_bend', lat, tol, n_pass, n_fail)
+
+! ======================================================================
+! TEST 58: Patch element (offsets, rotations, drift-to-exit)
+! ======================================================================
+call bmad_parser('lat_patch_only.bmad', lat)
+call run_comparison_test('Test 58: Patch element', lat, tol, n_pass, n_fail)
 
 ! ======================================================================
 ! Summary

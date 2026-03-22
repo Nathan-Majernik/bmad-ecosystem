@@ -109,6 +109,8 @@ if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bma
         call track_bunch_thru_sol_quad_gpu(bunch, ele, branch%param, gpu_did_track)
       case (wiggler$, undulator$)
         call track_bunch_thru_wiggler_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (patch$)
+        call track_bunch_thru_patch_gpu(bunch, ele, branch%param, gpu_did_track)
       case (marker$)
         gpu_did_track = .true.  ! Zero-length, no tracking needed
       end select

@@ -1,0 +1,20 @@
+no_digested
+
+parameter[lattice] = "GPU tracking plain patch"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+d1: drift, L = 1.0
+p1: patch, x_offset = 0.001, y_offset = -0.0005, z_offset = 0.002, &
+           x_pitch = 0.01, y_pitch = -0.005, tilt = 0.003, &
+           t_offset = 1e-11
+d2: drift, L = 1.0
+
+lat: line = (d1, p1, d2)
+
+use, lat

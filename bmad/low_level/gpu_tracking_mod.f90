@@ -18,6 +18,7 @@ public :: track_bunch_thru_lcavity_gpu
 public :: track_bunch_thru_solenoid_gpu
 public :: track_bunch_thru_sol_quad_gpu
 public :: track_bunch_thru_wiggler_gpu
+public :: track_bunch_thru_patch_gpu
 public :: track_bunch_thru_pipe_gpu
 public :: check_entrance_aperture_for_gpu
 public :: gpu_rad_eligible
@@ -599,6 +600,43 @@ interface
   subroutine gpu_spacecharge_cleanup() bind(C, name='gpu_spacecharge_cleanup_')
   end subroutine
 
+  ! ----- Patch kernel wrappers -----
+
+  subroutine gpu_track_patch(vx, vpx, vy, vpy, vz, vpz, &
+                             state, beta, p0c, t_time, &
+                             ww, &
+                             x_off, y_off, z_off, t_offset, &
+                             upstream_coord_dir, &
+                             p0c_start, p0c_exit, e_tot_exit, &
+                             ele_length, mc2, &
+                             has_rotation, n_particles) bind(C, name='gpu_track_patch_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(inout) :: vx(*), vpx(*), vy(*), vpy(*), vz(*), vpz(*)
+    integer(C_INT), intent(inout) :: state(*)
+    real(C_DOUBLE), intent(inout) :: beta(*), p0c(*), t_time(*)
+    real(C_DOUBLE), intent(in) :: ww(9)
+    real(C_DOUBLE), value, intent(in) :: x_off, y_off, z_off, t_offset
+    real(C_DOUBLE), value, intent(in) :: upstream_coord_dir
+    real(C_DOUBLE), value, intent(in) :: p0c_start, p0c_exit, e_tot_exit
+    real(C_DOUBLE), value, intent(in) :: ele_length, mc2
+    integer(C_INT), value, intent(in) :: has_rotation, n_particles
+  end subroutine
+
+  subroutine gpu_track_patch_dev(ww, &
+                                 x_off, y_off, z_off, t_offset, &
+                                 upstream_coord_dir, &
+                                 p0c_start, p0c_exit, e_tot_exit, &
+                                 ele_length, mc2, &
+                                 has_rotation, n_particles) bind(C, name='gpu_track_patch_dev_')
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), intent(in) :: ww(9)
+    real(C_DOUBLE), value, intent(in) :: x_off, y_off, z_off, t_offset
+    real(C_DOUBLE), value, intent(in) :: upstream_coord_dir
+    real(C_DOUBLE), value, intent(in) :: p0c_start, p0c_exit, e_tot_exit
+    real(C_DOUBLE), value, intent(in) :: ele_length, mc2
+    integer(C_INT), value, intent(in) :: has_rotation, n_particles
+  end subroutine
+
   ! ----- Multi-bunch buffer save/restore -----
 
   integer(C_INT) function gpu_save_bunch_buffers(vx, vpx, vy, vpy, vz, vpz, &
@@ -722,13 +760,16 @@ if (.not. ele%is_on) return
 select case (ele%key)
 case (drift$, quadrupole$, sextupole$, octupole$, thick_multipole$, elseparator$, sbend$, rf_bend$, lcavity$, pipe$, &
       monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$, solenoid$, sol_quad$, &
-      wiggler$, undulator$)
+      wiggler$, undulator$, patch$)
   eligible = .true.
 end select
 
 ! M3 fix: rf_bend GPU tracking only handles DC bending, not RF fields.
 ! Fall back to CPU for nonzero voltage (actual RF deflection).
 if (ele%key == rf_bend$ .and. ele%value(voltage$) /= 0) eligible = .false.
+
+! Patch: GPU only handles forward tracking (direction=1, time_dir=1, orientation=1)
+! which is checked at dispatch time. No additional restrictions here.
 
 end function ele_gpu_eligible
 
@@ -2281,6 +2322,94 @@ enddo
 end subroutine track_bunch_thru_wiggler_gpu
 
 !------------------------------------------------------------------------
+! track_bunch_thru_patch_gpu
+!
+! GPU batch tracking through a patch element.
+! A patch is a zero-length coordinate transform: offsets, rotations,
+! energy reference change, and drift to exit face.
+! No misalignment or fringe handling needed.
+!------------------------------------------------------------------------
+subroutine track_bunch_thru_patch_gpu (bunch, ele, param, did_track)
+
+use, intrinsic :: iso_c_binding
+
+type (bunch_struct),     intent(inout) :: bunch
+type (ele_struct), target, intent(inout) :: ele
+type (lat_param_struct), intent(in)    :: param
+logical,                 intent(out)   :: did_track
+
+#ifdef USE_GPU_TRACKING
+integer(C_INT) :: n, has_rot
+integer :: j
+real(rp) :: mc2
+real(rp), pointer :: v(:)
+real(C_DOUBLE) :: ww_arr(3,3), ww_flat(9)
+real(C_DOUBLE) :: upstream_cd
+
+real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:)
+integer(C_INT), allocatable :: state_a(:)
+#endif
+
+did_track = .false.
+
+#ifdef USE_GPU_TRACKING
+n = size(bunch%particle)
+if (n == 0) return
+
+v => ele%value
+mc2 = mass_of(bunch%particle(1)%species)
+
+! Compute rotation matrix on host
+! For forward tracking (dir=1, time_dir=1, orientation=1),
+! entering from upstream: use w_mat_inv
+has_rot = 0
+if (v(x_pitch$) /= 0 .or. v(y_pitch$) /= 0 .or. v(tilt$) /= 0) then
+  has_rot = 1
+  call floor_angles_to_w_mat(v(x_pitch$), v(y_pitch$), v(tilt$), w_mat_inv = ww_arr)
+else
+  ww_arr = 0
+  ww_arr(1,1) = 1; ww_arr(2,2) = 1; ww_arr(3,3) = 1
+endif
+
+! Flatten 3x3 to 9-element array (Fortran column-major = what CUDA expects)
+ww_flat = transfer(ww_arr, ww_flat)
+
+! upstream_coord_dir for the entering-from-upstream branch (orientation=1)
+upstream_cd = v(upstream_coord_dir$)
+
+allocate(vx(n), vpx(n), vy(n), vpy(n), vz(n), vpz(n))
+allocate(state_a(n), beta_a(n), p0c_a(n), t_a(n))
+
+call bunch_to_soa(bunch, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+
+call gpu_track_patch(vx, vpx, vy, vpy, vz, vpz, &
+                     state_a, beta_a, p0c_a, t_a, &
+                     ww_flat, &
+                     v(x_offset$), v(y_offset$), v(z_offset$), v(t_offset$), &
+                     upstream_cd, &
+                     v(p0c_start$), v(p0c$), v(e_tot$), &
+                     v(l$), mc2, &
+                     has_rot, n)
+
+! Patch can change p0c and beta, so pass copy_beta=.true., copy_p0c=.true.
+call soa_to_bunch(bunch, ele, n, vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, &
+                   .true., .true.)
+deallocate(vx, vpx, vy, vpy, vz, vpz)
+deallocate(state_a, beta_a, p0c_a, t_a)
+
+do j = 1, n
+  if (bunch%particle(j)%state == alive$) then
+    bunch%particle(j)%s = ele%s
+  endif
+enddo
+
+did_track = .true.
+#endif
+
+end subroutine track_bunch_thru_patch_gpu
+
+!------------------------------------------------------------------------
 ! track_bunch_thru_pipe_gpu
 !
 ! GPU batch tracking through a pipe element.  A pipe is tracked as a
@@ -2504,7 +2633,7 @@ endif
 ! Check for fringe that requires CPU
 has_fringe_needs_cpu = .false.
 select case (ele%key)
-case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$)
+case (drift$, pipe$, monitor$, instrument$, kicker$, hkicker$, vkicker$, marker$, patch$)
   ! These elements have no fringe
 case (octupole$, thick_multipole$, elseparator$)
   ! These elements use hard_multipole_edge_kick for fringe — not yet on GPU for these types.
@@ -2699,10 +2828,11 @@ do ie = ix_start, ix_end
     ! Entrance aperture check on device (before misalignment, in lab frame)
     call dispatch_aperture_on_device(ele, n, entrance_end$)
 
-    ! Misalignment on device.
+    ! Misalignment on device (skip for patch elements — they handle their own transforms).
     ! For bends with curvature/ref_tilt/roll, use full curvature-aware bend_offset.
     ! For others, use simple 2D offset+tilt kernel.
     has_misalign = ele%bookkeeping_state%has_misalign
+    if (ele%key == patch$) has_misalign = .false.
     if (has_misalign) then
       if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                                    .or. ele%value(roll$) /= 0)) then
@@ -2828,6 +2958,8 @@ do ie = ix_start, ix_end
       call track_bunch_thru_sol_quad_gpu(bunch, ele, branch%param, did_track)
     case (wiggler$, undulator$)
       call track_bunch_thru_wiggler_gpu(bunch, ele, branch%param, did_track)
+    case (patch$)
+      call track_bunch_thru_patch_gpu(bunch, ele, branch%param, did_track)
     case (marker$)
       did_track = .true.  ! zero-length, nothing to do
     end select
@@ -3204,6 +3336,8 @@ case (sextupole$, octupole$, thick_multipole$, elseparator$)
   call dispatch_sextupole_body(ele, param, np)
 case (wiggler$, undulator$)
   call dispatch_wiggler_body(ele, param, np)
+case (patch$)
+  call dispatch_patch_body(ele, np)
 end select
 
 end subroutine dispatch_body_kernel_on_device
@@ -3595,6 +3729,35 @@ call gpu_track_wiggler_dev(mc2, ele_length, delta_ref_time, &
                             ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
 end subroutine dispatch_wiggler_body
 
+!------------------------------------------------------------------------
+subroutine dispatch_patch_body(ele, np)
+type (ele_struct), target, intent(inout) :: ele
+integer(C_INT), intent(in) :: np
+real(rp), pointer :: vv(:)
+real(C_DOUBLE) :: ww_arr(3,3), ww_flat(9)
+integer(C_INT) :: has_rot_val
+real(C_DOUBLE) :: upstream_cd_val
+
+vv => ele%value
+has_rot_val = 0
+if (vv(x_pitch$) /= 0 .or. vv(y_pitch$) /= 0 .or. vv(tilt$) /= 0) then
+  has_rot_val = 1
+  call floor_angles_to_w_mat(vv(x_pitch$), vv(y_pitch$), vv(tilt$), w_mat_inv = ww_arr)
+else
+  ww_arr = 0; ww_arr(1,1) = 1; ww_arr(2,2) = 1; ww_arr(3,3) = 1
+endif
+ww_flat = transfer(ww_arr, ww_flat)
+upstream_cd_val = vv(upstream_coord_dir$)
+mc2 = mass_of(bunch%particle(1)%species)
+
+call gpu_track_patch_dev(ww_flat, &
+                         vv(x_offset$), vv(y_offset$), vv(z_offset$), vv(t_offset$), &
+                         upstream_cd_val, &
+                         vv(p0c_start$), vv(p0c$), vv(e_tot$), &
+                         vv(l$), mc2, &
+                         has_rot_val, np)
+end subroutine dispatch_patch_body
+
 end subroutine track_bunch_thru_elements_gpu
 
 !------------------------------------------------------------------------
@@ -3731,8 +3894,9 @@ endif
 ! Entrance aperture
 call dispatch_aperture_on_device_pub(ele, n, entrance_end$)
 
-! Misalignment
+! Misalignment (skip for patch elements — they handle their own coordinate transforms)
 has_misalign = ele%bookkeeping_state%has_misalign
+if (ele%key == patch$) has_misalign = .false.
 if (has_misalign) then
   if ((ele%key == sbend$ .or. ele%key == rf_bend$) .and. (ele%value(g$) /= 0 .or. ele%value(ref_tilt_tot$) /= 0 &
                                .or. ele%value(roll$) /= 0)) then
@@ -4149,6 +4313,34 @@ case (wiggler$, undulator$)
                                 int(ix_mag_max, C_INT), &
                                 ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   end block
+
+case (patch$)
+  block
+    real(rp), pointer :: vv_patch(:)
+    real(C_DOUBLE) :: ww_arr_patch(3,3), ww_flat_patch(9)
+    integer(C_INT) :: has_rot_patch
+    real(C_DOUBLE) :: ucd_patch
+
+    vv_patch => ele%value
+    has_rot_patch = 0
+    if (vv_patch(x_pitch$) /= 0 .or. vv_patch(y_pitch$) /= 0 .or. vv_patch(tilt$) /= 0) then
+      has_rot_patch = 1
+      call floor_angles_to_w_mat(vv_patch(x_pitch$), vv_patch(y_pitch$), vv_patch(tilt$), w_mat_inv = ww_arr_patch)
+    else
+      ww_arr_patch = 0; ww_arr_patch(1,1) = 1; ww_arr_patch(2,2) = 1; ww_arr_patch(3,3) = 1
+    endif
+    ww_flat_patch = transfer(ww_arr_patch, ww_flat_patch)
+    ucd_patch = vv_patch(upstream_coord_dir$)
+    mc2 = mass_of(bunch%particle(1)%species)
+
+    call gpu_track_patch_dev(ww_flat_patch, &
+                             vv_patch(x_offset$), vv_patch(y_offset$), vv_patch(z_offset$), vv_patch(t_offset$), &
+                             ucd_patch, &
+                             vv_patch(p0c_start$), vv_patch(p0c$), vv_patch(e_tot$), &
+                             vv_patch(l$), mc2, &
+                             has_rot_patch, np)
+  end block
+
 end select
 end subroutine
 
@@ -4673,6 +4865,35 @@ case (wiggler$, undulator$)
                               int(ix_mag_max, C_INT), &
                               ea2_arr, eb2_arr, int(ix_elec_max, C_INT))
   did_track = .true.
+
+case (patch$)
+  block
+    real(rp), pointer :: vv_p(:)
+    real(C_DOUBLE) :: ww_p(3,3), ww_fp(9)
+    integer(C_INT) :: hr_p
+    real(C_DOUBLE) :: ucd_p
+
+    vv_p => ele%value
+    hr_p = 0
+    if (vv_p(x_pitch$) /= 0 .or. vv_p(y_pitch$) /= 0 .or. vv_p(tilt$) /= 0) then
+      hr_p = 1
+      call floor_angles_to_w_mat(vv_p(x_pitch$), vv_p(y_pitch$), vv_p(tilt$), w_mat_inv = ww_p)
+    else
+      ww_p = 0; ww_p(1,1) = 1; ww_p(2,2) = 1; ww_p(3,3) = 1
+    endif
+    ww_fp = transfer(ww_p, ww_fp)
+    ucd_p = vv_p(upstream_coord_dir$)
+    mc2 = mass_of(bunch%particle(1)%species)
+
+    call gpu_track_patch_dev(ww_fp, &
+                             vv_p(x_offset$), vv_p(y_offset$), vv_p(z_offset$), vv_p(t_offset$), &
+                             ucd_p, &
+                             vv_p(p0c_start$), vv_p(p0c$), vv_p(e_tot$), &
+                             vv_p(l$), mc2, &
+                             hr_p, n)
+  end block
+  did_track = .true.
+
 end select
 
 ! Update s on device

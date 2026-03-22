@@ -4356,6 +4356,192 @@ extern "C" int gpu_nan_check_(int n)
     return h_count;
 }
 
+/* ==========================================================================
+ * PATCH KERNEL
+ *
+ * Replicates track_a_patch.f90 for the forward-tracking case:
+ *   direction=1, time_dir=1, orientation=1
+ *   => entering from upstream, orbit%direction*orbit%time_dir*ele%orientation == 1
+ *
+ * Steps:
+ *   1) Reconstruct 3D momentum p_vec from (px, py, pz_rel)
+ *   2) Adjust pz sign for upstream_coord_dir
+ *   3) Remove offsets: r_vec = (x - x_off, y - y_off, -z_off)
+ *   4) Apply w_mat_inv rotation to both r_vec and p_vec (if non-identity)
+ *   5) Apply time offset: z += beta * c_light * t_offset
+ *   6) Energy reference correction (rescale px, py, pz when p0c changes)
+ *   7) Drift to exit face
+ *   8) Update beta, p0c
+ *
+ * Parameters passed from host (precomputed):
+ *   ww[9]: w_mat_inv in column-major order (Fortran layout)
+ *   x_off, y_off, z_off, t_offset: element offsets
+ *   upstream_coord_dir: +1 or -1
+ *   p0c_start, p0c_exit: reference momenta at entrance/exit
+ *   e_tot_exit: total energy at exit
+ *   ele_length: element length (for s update in z)
+ *   mc2: rest mass energy
+ *   has_rotation: 1 if rotation matrix is non-identity, 0 otherwise
+ * ========================================================================== */
+
+__global__ void patch_kernel(
+    double *vx, double *vpx, double *vy, double *vpy, double *vz, double *vpz,
+    int *state, double *beta_arr, double *p0c_arr, double *t_arr,
+    const double *ww,
+    double x_off, double y_off, double z_off, double t_offset,
+    double upstream_coord_dir,
+    double p0c_start, double p0c_exit, double e_tot_exit,
+    double ele_length, double mc2,
+    int has_rotation, int n_particles)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_particles) return;
+    if (state[i] != ALIVE_ST) return;
+
+    /* Step 1: reconstruct 3D momentum (before any correction) */
+    double px = vpx[i], py = vpy[i];
+    double rel_p = 1.0 + vpz[i];
+    double pz_sq = rel_p * rel_p - px * px - py * py;
+    if (pz_sq <= 0.0) { state[i] = LOST_PZ; return; }
+    double pz = sqrt(pz_sq);
+
+    /* Step 2: pz sign for upstream_coord_dir (direction=1 for GPU) */
+    pz = pz * upstream_coord_dir;
+
+    /* Step 3: remove offsets (forward branch: entering from upstream) */
+    double rx = vx[i] - x_off;
+    double ry = vy[i] - y_off;
+    double rz = -z_off;
+
+    /* p_vec components (will be rotated if has_rotation) */
+    double p1 = px, p2 = py, p3 = pz;
+
+    /* Step 4: apply w_mat_inv rotation (column-major from Fortran) */
+    if (has_rotation) {
+        double w11 = ww[0], w21 = ww[1], w31 = ww[2];
+        double w12 = ww[3], w22 = ww[4], w32 = ww[5];
+        double w13 = ww[6], w23 = ww[7], w33 = ww[8];
+
+        p1 = w11 * px + w12 * py + w13 * pz;
+        p2 = w21 * px + w22 * py + w23 * pz;
+        p3 = w31 * px + w32 * py + w33 * pz;
+
+        double rx2 = w11 * rx + w12 * ry + w13 * rz;
+        double ry2 = w21 * rx + w22 * ry + w23 * rz;
+        double rz2 = w31 * rx + w32 * ry + w33 * rz;
+        rx = rx2; ry = ry2; rz = rz2;
+    }
+
+    /* Store rotated position and momentum */
+    vpx[i] = p1;
+    vpy[i] = p2;
+    vx[i] = rx;
+    vy[i] = ry;
+
+    /* Step 5: time offset */
+    double beta_val = beta_arr[i];
+    vz[i] = vz[i] + beta_val * C_LIGHT * t_offset;
+
+    /* Step 6: energy reference correction
+     * For forward tracking (dir*time_dir==1), first_track_edge$ => correct to p0c_exit.
+     * IMPORTANT: The CPU drift (step 7) uses the PRE-correction p_vec and rel_p.
+     * Also, orbit%beta is NOT updated by orbit_reference_energy_correction,
+     * so the drift uses the entrance-side beta. We update beta only at the end. */
+    if (p0c_start != p0c_exit) {
+        double p0c_old = p0c_arr[i];
+        double p_rel = p0c_old / p0c_exit;
+        vpx[i] = vpx[i] * p_rel;
+        vpy[i] = vpy[i] * p_rel;
+        vpz[i] = (vpz[i] * p0c_old - (p0c_exit - p0c_old)) / p0c_exit;
+        p0c_arr[i] = p0c_exit;
+        /* Note: beta_val stays at entrance-side value for the drift */
+    }
+
+    /* Step 7: drift to exit face using PRE-correction p_vec and rel_p,
+     * and entrance-side beta_val (matching CPU orbit%beta behavior).
+     * NOTE: The CPU track_a_patch does NOT update orbit%beta, so we
+     * leave beta_arr[i] unchanged to match. */
+    double beta0 = p0c_exit / e_tot_exit;
+    vx[i] = vx[i] - rz * p1 / p3;
+    vy[i] = vy[i] - rz * p2 / p3;
+    vz[i] = vz[i] + rz * rel_p / p3 + ele_length * beta_val / beta0;
+    t_arr[i] = t_arr[i] - rz * rel_p / (p3 * beta_val * C_LIGHT);
+}
+
+/* HOST WRAPPERS for patch */
+
+static double *d_patch_ww = NULL;
+
+extern "C" void gpu_track_patch_(
+    double *h_vx, double *h_vpx, double *h_vy, double *h_vpy,
+    double *h_vz, double *h_vpz,
+    int *h_state, double *h_beta, double *h_p0c, double *h_t,
+    double *h_ww,
+    double x_off, double y_off, double z_off, double t_offset,
+    double upstream_coord_dir,
+    double p0c_start, double p0c_exit, double e_tot_exit,
+    double ele_length, double mc2,
+    int has_rotation, int n_particles)
+{
+    if (ensure_buffers(n_particles) != 0) return;
+
+    if (upload_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                             h_state, h_beta, h_p0c, h_t) != 0) return;
+
+    if (!d_patch_ww) {
+        cudaMalloc((void**)&d_patch_ww, 9*sizeof(double));
+    }
+    CUDA_CHECK_VOID(cudaMemcpy(d_patch_ww, h_ww, 9*sizeof(double), cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    patch_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        d_patch_ww,
+        x_off, y_off, z_off, t_offset,
+        upstream_coord_dir,
+        p0c_start, p0c_exit, e_tot_exit,
+        ele_length, mc2,
+        has_rotation, n_particles);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+
+    /* Patch can change beta and p0c, so always download them */
+    if (download_particle_data(n_particles, h_vx, h_vpx, h_vy, h_vpy, h_vz, h_vpz,
+                               h_state, h_beta, h_p0c, h_t,
+                               1, 1) != 0) return;
+}
+
+/* Patch body-only: data already on device */
+extern "C" void gpu_track_patch_dev_(
+    double *h_ww,
+    double x_off, double y_off, double z_off, double t_offset,
+    double upstream_coord_dir,
+    double p0c_start, double p0c_exit, double e_tot_exit,
+    double ele_length, double mc2,
+    int has_rotation, int n_particles)
+{
+    if (!d_patch_ww) {
+        cudaMalloc((void**)&d_patch_ww, 9*sizeof(double));
+    }
+    CUDA_CHECK_VOID(cudaMemcpy(d_patch_ww, h_ww, 9*sizeof(double), cudaMemcpyHostToDevice));
+
+    int threads = 256;
+    int blocks = (n_particles + threads - 1) / threads;
+    patch_kernel<<<blocks, threads>>>(
+        d_vec[0], d_vec[1], d_vec[2], d_vec[3], d_vec[4], d_vec[5],
+        d_state, d_beta, d_p0c, d_t,
+        d_patch_ww,
+        x_off, y_off, z_off, t_offset,
+        upstream_coord_dir,
+        p0c_start, p0c_exit, e_tot_exit,
+        ele_length, mc2,
+        has_rotation, n_particles);
+    CUDA_CHECK_VOID(cudaGetLastError());
+    CUDA_CHECK_VOID(cudaDeviceSynchronize());
+}
+
 /* --------------------------------------------------------------------------
  * gpu_save_bunch_buffers -- download current device particle buffers to
  * caller-supplied host arrays so another bunch can use the device.
@@ -4449,6 +4635,7 @@ extern "C" void gpu_tracking_cleanup_(void)
     if (d_damp_dmat)     cudaFree(d_damp_dmat);     d_damp_dmat     = NULL;
     if (d_xfer_damp_vec) cudaFree(d_xfer_damp_vec); d_xfer_damp_vec = NULL;
     if (d_ref_orb)       cudaFree(d_ref_orb);       d_ref_orb       = NULL;
+    if (d_patch_ww)      cudaFree(d_patch_ww);      d_patch_ww      = NULL;
     d_rng_cap = 0;
     d_step_cap = 0;
     d_cap = 0;
