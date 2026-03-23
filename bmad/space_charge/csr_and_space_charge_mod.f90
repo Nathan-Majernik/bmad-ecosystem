@@ -445,26 +445,17 @@ do i_step = 0, n_step
 
   if (csr_timer_on) call system_clock(csr_c0)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
-    if (gpu_csr_active .and. ele%csr_method == one_dim$ .and. &
-        space_charge_com%n_shield_images == 0) then
-      ! GPU-native path: root-finding + I_int + convolution all on GPU.
-      ! Eliminates CPU root-finding bottleneck (~3ms/step).
-      csr%kick_factor = 1.0_rp
+    do ns = 0, space_charge_com%n_shield_images
+      ! The factor of -1^ns accounts for the sign of the image currents
+      ! Take into account that at the endpoints we are only putting in a half kick.
+      ! The factor of two is due to there being image currents both above and below.
+      csr%kick_factor = (-1)**ns
       if (i_step == 0 .or. i_step == n_step) csr%kick_factor = csr%kick_factor / 2
-      csr%y_source = 0
-      call csr_bin_kicks_gpu_full_wrap(ele, csr, err_flag)
+      if (ns /= 0) csr%kick_factor = 2 * csr%kick_factor
+      csr%y_source = ns * space_charge_com%beam_chamber_height
+      call csr_bin_kicks (ele, s0_step, csr, err_flag)
       if (err_flag) return
-    else
-      ! CPU path: used for image charges (n_shield_images > 0) or non-GPU tracking
-      do ns = 0, space_charge_com%n_shield_images
-        csr%kick_factor = (-1)**ns
-        if (i_step == 0 .or. i_step == n_step) csr%kick_factor = csr%kick_factor / 2
-        if (ns /= 0) csr%kick_factor = 2 * csr%kick_factor
-        csr%y_source = ns * space_charge_com%beam_chamber_height
-        call csr_bin_kicks (ele, s0_step, csr, err_flag)
-        if (err_flag) return
-      enddo
-    endif
+    enddo
   endif
 
   if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_kicks = csr_dt_kicks + real(csr_c1-csr_c0,rp)/csr_crate; endif
