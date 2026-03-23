@@ -255,56 +255,6 @@ __global__ void sc_compute_grid_params(double *results,
  * ========================================================================= */
 
 /* --------------------------------------------------------------------------
- * Deposit particles on 3D mesh using trilinear interpolation with atomicAdd.
- * Each particle contributes charge to 8 surrounding grid points.
- * -------------------------------------------------------------------------- */
-__global__ void deposit_kernel(
-    const double *x, const double *y, const double *z,
-    const double *beta, /* per-particle beta for z_adj computation */
-    const double *charge, const int *state,
-    double *rho,
-    double xmin, double ymin, double zmin,
-    double dxi, double dyi, double dzi,
-    double dx, double dy, double dz,
-    int nx, int ny, int nz,
-    double dct_ave, /* z_adj = z - dct_ave*beta */
-    int n_particles)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_particles) return;
-    if (state[i] != SC_ALIVE_ST) return;
-
-    double z_adj = z[i] - dct_ave * beta[i];
-
-    int ip = (int)floor((x[i] - xmin) * dxi + 1.0) - 1;  /* 0-based */
-    int jp = (int)floor((y[i] - ymin) * dyi + 1.0) - 1;
-    int kp = (int)floor((z_adj - zmin) * dzi + 1.0) - 1;
-
-    /* Clamp to valid range */
-    if (ip < 0) ip = 0; if (ip >= nx-1) ip = nx-2;
-    if (jp < 0) jp = 0; if (jp >= ny-1) jp = ny-2;
-    if (kp < 0) kp = 0; if (kp >= nz-1) kp = nz-2;
-
-    double ab = ((xmin - x[i]) + (ip+1)*dx) * dxi;
-    double de = ((ymin - y[i]) + (jp+1)*dy) * dyi;
-    double gh = ((zmin - z_adj) + (kp+1)*dz) * dzi;
-
-    double q = charge[i];
-
-    /* Deposit to 8 corners (0-based flat indexing into nx*ny*nz array) */
-    #define RHO_IDX(ii,jj,kk) ((ii)*ny*nz + (jj)*nz + (kk))
-    atomicAdd(&rho[RHO_IDX(ip,  jp,  kp  )], ab    *de    *gh    *q);
-    atomicAdd(&rho[RHO_IDX(ip,  jp+1,kp  )], ab    *(1-de)*gh    *q);
-    atomicAdd(&rho[RHO_IDX(ip,  jp+1,kp+1)], ab    *(1-de)*(1-gh)*q);
-    atomicAdd(&rho[RHO_IDX(ip,  jp,  kp+1)], ab    *de    *(1-gh)*q);
-    atomicAdd(&rho[RHO_IDX(ip+1,jp,  kp+1)], (1-ab)*de    *(1-gh)*q);
-    atomicAdd(&rho[RHO_IDX(ip+1,jp+1,kp+1)], (1-ab)*(1-de)*(1-gh)*q);
-    atomicAdd(&rho[RHO_IDX(ip+1,jp+1,kp  )], (1-ab)*(1-de)*gh    *q);
-    atomicAdd(&rho[RHO_IDX(ip+1,jp,  kp  )], (1-ab)*de    *gh    *q);
-    #undef RHO_IDX
-}
-
-/* --------------------------------------------------------------------------
  * Float deposit: deposit charge directly into the zero-padded float buffer
  * used by R2C FFT, using float atomicAdd (hardware-native, ~5x faster than
  * double atomicAdd).  Eliminates the intermediate d_sc_rho double buffer
@@ -434,104 +384,11 @@ __global__ void igf_stencil_kernel(
 }
 
 /* --------------------------------------------------------------------------
- * Complex multiply in frequency domain: cgrn = crho * cgrn
- * -------------------------------------------------------------------------- */
-__global__ void complex_multiply_kernel(
-    const cufftDoubleComplex *crho,
-    cufftDoubleComplex *cgrn,
-    int n_total)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_total) return;
-
-    double ar = crho[i].x, ai = crho[i].y;
-    double br = cgrn[i].x, bi = cgrn[i].y;
-    cgrn[i].x = ar*br - ai*bi;
-    cgrn[i].y = ar*bi + ai*br;
-}
-
-/* 3-operand multiply: out = a * b (reads from separate source, no in-place) */
-__global__ void complex_multiply_src_kernel(
-    const cufftDoubleComplex *a,
-    const cufftDoubleComplex *b,
-    cufftDoubleComplex *out,
-    int n_total)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_total) return;
-    double ar = a[i].x, ai = a[i].y;
-    double br = b[i].x, bi = b[i].y;
-    out[i].x = ar*br - ai*bi;
-    out[i].y = ar*bi + ai*br;
-}
-
-/* --------------------------------------------------------------------------
- * Place rho (real) into one octant of doubled real array for R2C FFT.
- * -------------------------------------------------------------------------- */
-__global__ void rho_to_real_kernel(
-    const double *rho,
-    double *rho_padded,
-    int nx, int ny, int nz,
-    int nx2, int ny2, int nz2)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nx*ny*nz) return;
-
-    int k = idx % nz;
-    int j = (idx / nz) % ny;
-    int i = idx / (nz * ny);
-
-    int idx2 = i*ny2*nz2 + j*nz2 + k;
-    rho_padded[idx2] = rho[idx];
-}
-
-/* --------------------------------------------------------------------------
- * Extract real field from inverse C2R FFT result (with shift).
- * -------------------------------------------------------------------------- */
-__global__ void extract_field_kernel(
-    const double *real_out,  /* real-valued C2R output, size nx2*ny2*nz2 */
-    double *field_comp,  /* efield(:,:,:,icomp) */
-    int nx, int ny, int nz,
-    int nx2, int ny2, int nz2,
-    double scale)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nx*ny*nz) return;
-
-    int k = idx % nz;
-    int j = (idx / nz) % ny;
-    int i = idx / (nz * ny);
-
-    int ishift = nx - 1;
-    int jshift = ny - 1;
-    int kshift = nz - 1;
-
-    int idx2 = (i+ishift)*ny2*nz2 + (j+jshift)*nz2 + (k+kshift);
-    field_comp[idx] = scale * real_out[idx2];
-}
-
-/* --------------------------------------------------------------------------
  * Mixed-precision FFT helper kernels.
  * The 3D SC FFTs are bandwidth-limited; using float halves data movement.
- * Deposit + interpolation stay in double for accuracy.
+ * Deposit uses float atomicAdd directly into the padded R2C buffer.
+ * Kick interpolation stays in double for accuracy.
  * -------------------------------------------------------------------------- */
-
-/* Copy rho (double, mesh_size) to zero-padded float array (dbl_size).
- * Replaces cudaMemset + rho_to_real_kernel with a single kernel. */
-__global__ void rho_to_padded_f_kernel(
-    const double *rho, float *padded,
-    int nx, int ny, int nz, int nx2, int ny2, int nz2)
-{
-    int idx2 = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx2 >= nx2 * ny2 * nz2) return;
-    int k2 = idx2 % nz2;
-    int j2 = (idx2 / nz2) % ny2;
-    int i2 = idx2 / (nz2 * ny2);
-    if (i2 < nx && j2 < ny && k2 < nz)
-        padded[idx2] = (float)rho[i2 * ny * nz + j2 * nz + k2];
-    else
-        padded[idx2] = 0.0f;
-}
 
 /* Convert double complex → float complex (for Green fn cache conversion). */
 __global__ void dc_to_fc_kernel(
@@ -551,18 +408,6 @@ __global__ void complex_multiply_src_kernel_f(
     float br = b[i].x, bi = b[i].y;
     out[i].x = ar*br - ai*bi;
     out[i].y = ar*bi + ai*br;
-}
-
-/* In-place float complex multiply: cgrn *= crho. */
-__global__ void complex_multiply_kernel_f(
-    const cufftComplex *crho, cufftComplex *cgrn, int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float ar = crho[i].x, ai = crho[i].y;
-    float br = cgrn[i].x, bi = cgrn[i].y;
-    cgrn[i].x = ar*br - ai*bi;
-    cgrn[i].y = ar*bi + ai*br;
 }
 
 /* Extract field from float C2R output to double efield. */
