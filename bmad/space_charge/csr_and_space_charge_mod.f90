@@ -445,24 +445,26 @@ do i_step = 0, n_step
 
   if (csr_timer_on) call system_clock(csr_c0)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
-    do ns = 0, space_charge_com%n_shield_images
-      ! The factor of -1^ns accounts for the sign of the image currents
-      ! Take into account that at the endpoints we are only putting in a half kick.
-      ! The factor of two is due to there being image currents both above and below.
-
-      csr%kick_factor = (-1)**ns
+    if (gpu_csr_active .and. ele%csr_method == one_dim$ .and. &
+        space_charge_com%n_shield_images == 0) then
+      ! GPU-native path: root-finding + I_int + convolution all on GPU.
+      ! Eliminates CPU root-finding bottleneck (~3ms/step).
+      csr%kick_factor = 1.0_rp
       if (i_step == 0 .or. i_step == n_step) csr%kick_factor = csr%kick_factor / 2
-      if (ns /= 0) csr%kick_factor = 2 * csr%kick_factor
-
-      csr%y_source = ns * space_charge_com%beam_chamber_height
-
-      ! Always use CPU for bin kicks — it's O(n_bin) sequential root-findings
-      ! which is fast on CPU (~1ms). The GPU version has kernel launch + geometry
-      ! upload overhead that exceeds CPU compute, and poor warp efficiency from
-      ! divergent branching in the root-finding loop.
-      call csr_bin_kicks (ele, s0_step, csr, err_flag)
+      csr%y_source = 0
+      call csr_bin_kicks_gpu_full_wrap(ele, csr, err_flag)
       if (err_flag) return
-    enddo
+    else
+      ! CPU path: used for image charges (n_shield_images > 0) or non-GPU tracking
+      do ns = 0, space_charge_com%n_shield_images
+        csr%kick_factor = (-1)**ns
+        if (i_step == 0 .or. i_step == n_step) csr%kick_factor = csr%kick_factor / 2
+        if (ns /= 0) csr%kick_factor = 2 * csr%kick_factor
+        csr%y_source = ns * space_charge_com%beam_chamber_height
+        call csr_bin_kicks (ele, s0_step, csr, err_flag)
+        if (err_flag) return
+      enddo
+    endif
   endif
 
   if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_kicks = csr_dt_kicks + real(csr_c1-csr_c0,rp)/csr_crate; endif
@@ -783,38 +785,41 @@ end block
 end subroutine csr_sc_3d_compute_gpu
 
 !------------------------------------------------------------------------
-! GPU-accelerated CSR bin kicks.
-! Uploads element geometry to device, runs parallel root-finding for all
-! kick1 bins, then computes convolution to get per-slice kick_csr.
+! GPU-native CSR bin kicks: root-finding + I_int + convolution all on GPU.
+! Results stay in device memory (d_csr_kick_conv) for gpu_csr_apply_kicks_dev.
+! No host-device data round-trips except the geometry upload.
 !------------------------------------------------------------------------
-subroutine csr_bin_kicks_gpu_wrap(ele_in, csr_in, err_flag_out)
-use gpu_tracking_mod, only: gpu_csr_bin_kicks
+subroutine csr_bin_kicks_gpu_full_wrap(ele_in, csr_in, err_flag_out)
+use gpu_tracking_mod, only: gpu_csr_bin_kicks_full
 use, intrinsic :: iso_c_binding
 type (ele_struct), intent(in) :: ele_in
-type (csr_struct), target, intent(inout) :: csr_in
+type (csr_struct), target, intent(in) :: csr_in
 logical, intent(out) :: err_flag_out
 
-real(C_DOUBLE), allocatable :: h_f0x(:), h_f0z(:), h_f0t(:)
-real(C_DOUBLE), allocatable :: h_f1x(:), h_f1z(:), h_f1t(:)
-real(C_DOUBLE), allocatable :: h_lc(:), h_tc(:), h_spl(:), h_dls(:), h_es(:)
-integer(C_INT), allocatable :: h_ek(:)
-real(C_DOUBLE), allocatable :: h_edge_dcdz(:), h_slice_charge(:)
-real(C_DOUBLE), allocatable :: h_kick_csr_l(:), h_I_csr_out(:)
-integer :: ie, nb, n_ele_geom, n_kick1
-real(rp) :: species_radius, coef
+real(C_DOUBLE), allocatable, save :: h_f0x(:), h_f0z(:), h_f0t(:)
+real(C_DOUBLE), allocatable, save :: h_f1x(:), h_f1z(:), h_f1t(:)
+real(C_DOUBLE), allocatable, save :: h_lc(:), h_tc(:), h_spl(:), h_dls(:), h_es(:)
+integer(C_INT), allocatable, save :: h_ek(:)
+integer, save :: geom_cap = 0
+integer :: ie, nb, n_ele_geom
+real(rp) :: conv_coef
 
 err_flag_out = .false.
 nb = space_charge_com%n_bin
 n_ele_geom = size(csr_in%eleinfo) - 1  ! 0:n_ele_geom
-n_kick1 = 2 * nb + 1
 
-! Build geometry arrays from csr%eleinfo
-allocate(h_f0x(0:n_ele_geom), h_f0z(0:n_ele_geom), h_f0t(0:n_ele_geom))
-allocate(h_f1x(0:n_ele_geom), h_f1z(0:n_ele_geom), h_f1t(0:n_ele_geom))
-allocate(h_lc(0:n_ele_geom), h_tc(0:n_ele_geom))
-allocate(h_spl(3*(n_ele_geom+1)))
-allocate(h_dls(0:n_ele_geom), h_es(0:n_ele_geom))
-allocate(h_ek(0:n_ele_geom))
+! Build geometry arrays from csr%eleinfo (save'd to avoid repeated allocation)
+if (n_ele_geom + 1 > geom_cap) then
+  if (allocated(h_f0x)) deallocate(h_f0x, h_f0z, h_f0t, h_f1x, h_f1z, h_f1t, &
+                                    h_lc, h_tc, h_spl, h_dls, h_es, h_ek)
+  allocate(h_f0x(0:n_ele_geom), h_f0z(0:n_ele_geom), h_f0t(0:n_ele_geom))
+  allocate(h_f1x(0:n_ele_geom), h_f1z(0:n_ele_geom), h_f1t(0:n_ele_geom))
+  allocate(h_lc(0:n_ele_geom), h_tc(0:n_ele_geom))
+  allocate(h_spl(3*(n_ele_geom+1)))
+  allocate(h_dls(0:n_ele_geom), h_es(0:n_ele_geom))
+  allocate(h_ek(0:n_ele_geom))
+  geom_cap = n_ele_geom + 1
+endif
 
 do ie = 0, n_ele_geom
   h_f0x(ie) = csr_in%eleinfo(ie)%floor0%r(1)
@@ -833,19 +838,11 @@ do ie = 0, n_ele_geom
   h_ek(ie) = csr_in%eleinfo(ie)%ele%key
 enddo
 
-! Build bin data arrays
-allocate(h_edge_dcdz(nb), h_slice_charge(nb))
-do ie = 1, nb
-  h_edge_dcdz(ie) = csr_in%slice(ie)%edge_dcharge_density_dz
-  h_slice_charge(ie) = csr_in%slice(ie)%charge
-enddo
+! Convolution coefficient: actual_track_step * classical_radius / (rel_mass * e * |q| * gamma)
+conv_coef = csr_in%actual_track_step * classical_radius(csr_in%species) / &
+            (csr_in%rel_mass * e_charge * abs(charge_of(csr_in%species)) * csr_in%gamma)
 
-species_radius = classical_radius(csr_in%species)
-
-allocate(h_kick_csr_l(nb), h_I_csr_out(n_kick1))
-h_kick_csr_l = 0
-
-call gpu_csr_bin_kicks( &
+call gpu_csr_bin_kicks_full( &
     h_f0x, h_f0z, h_f0t, h_f1x, h_f1z, h_f1t, &
     h_lc, h_tc, h_spl, h_dls, h_es, h_ek, &
     int(n_ele_geom, C_INT), &
@@ -853,36 +850,13 @@ call gpu_csr_bin_kicks( &
     csr_in%s_chord_kick, &
     csr_in%floor_k%r(1), csr_in%floor_k%r(3), &
     csr_in%gamma, csr_in%gamma2, csr_in%beta**2, &
-    csr_in%y_source, csr_in%dz_slice, &
+    csr_in%dz_slice, &
     int(nb, C_INT), csr_in%kick_factor, &
-    csr_in%actual_track_step, species_radius, &
-    csr_in%rel_mass, abs(e_charge * charge_of(csr_in%species)), &
-    merge(1, 0, ele_in%csr_method == one_dim$), &
-    h_edge_dcdz, h_slice_charge, &
-    h_kick_csr_l, h_I_csr_out)
+    conv_coef)
 
-! Copy results back to csr%slice
-if (csr_in%y_source == 0 .and. ele_in%csr_method == one_dim$) then
-  do ie = 1, nb
-    csr_in%slice(ie)%kick_csr = h_kick_csr_l(ie)
-  enddo
-else
-  ! Image charge: GPU accumulates into h_kick_csr_l
-  do ie = 1, nb
-    csr_in%slice(ie)%kick_csr = h_kick_csr_l(ie)
-  enddo
-endif
+! Results stay on GPU in d_csr_kick_conv — applied by gpu_csr_apply_kicks_dev
 
-! Copy I_csr back to kick1 for image charge accumulation
-do ie = -nb, nb
-  csr_in%kick1(ie)%I_csr = h_I_csr_out(ie + nb + 1)
-enddo
-
-deallocate(h_f0x, h_f0z, h_f0t, h_f1x, h_f1z, h_f1t)
-deallocate(h_lc, h_tc, h_spl, h_dls, h_es, h_ek)
-deallocate(h_edge_dcdz, h_slice_charge, h_kick_csr_l, h_I_csr_out)
-
-end subroutine csr_bin_kicks_gpu_wrap
+end subroutine csr_bin_kicks_gpu_full_wrap
 
 end subroutine track1_bunch_csr
 

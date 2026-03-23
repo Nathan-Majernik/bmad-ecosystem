@@ -406,34 +406,22 @@ __global__ void complex_multiply_src_kernel_f(
     out[i].y = ar*bi + ai*br;
 }
 
-/* Extract field from float C2R output to double efield. */
-__global__ void extract_field_kernel_f(
-    const float *real_out, double *field_comp,
-    int nx, int ny, int nz, int nx2, int ny2, int nz2, double scale)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nx*ny*nz) return;
-    int k = idx % nz;
-    int j = (idx / nz) % ny;
-    int i = idx / (nz * ny);
-    int ishift = nx - 1, jshift = ny - 1, kshift = nz - 1;
-    int idx2 = (i+ishift)*ny2*nz2 + (j+jshift)*nz2 + (k+kshift);
-    field_comp[idx] = scale * (double)real_out[idx2];
-}
-
 /* --------------------------------------------------------------------------
  * Interpolate E-field and apply kicks to particles (space charge).
- * Matches csr_and_sc_apply_kicks for fft_3d$ case.
+ * Reads directly from padded C2R float output buffers, eliminating the
+ * intermediate extract_field step and d_sc_efield buffer.
  * -------------------------------------------------------------------------- */
 __global__ void sc_interpolate_kick_kernel(
     double *vx, double *vpx, double *vy, double *vpy,
     double *vz, double *vpz,
     int *state, double *beta_arr, double *p0c_arr,
-    const double *efield,  /* nx*ny*nz*3 flat array */
+    const float *field_x, const float *field_y, const float *field_z,
     double xmin, double ymin, double zmin,
     double dxi, double dyi, double dzi,
     double dx, double dy, double dz,
     int nx, int ny, int nz,
+    int nx2, int ny2, int nz2,
+    double scale,
     double ds_step, double gamma, double mc2,
     double dct_ave,
     int n_particles)
@@ -460,13 +448,15 @@ __global__ void sc_interpolate_kick_kernel(
     double de = ((ymin - vy[i]) + (jp+1)*dy) * dyi;
     double gh = ((zmin - z_sc)  + (kp+1)*dz) * dzi;
 
-    /* Trilinear interpolation of 3 E-field components */
-    double Evec[3] = {0, 0, 0};
-    int mesh_size = nx * ny * nz;
+    /* Trilinear interpolation from padded C2R output (float → double with scale).
+     * Padded index: (ii + nx-1)*ny2*nz2 + (jj + ny-1)*nz2 + (kk + nz-1) */
+    int xshift = nx - 1, yshift = ny - 1, zshift = nz - 1;
+    const float *fields[3] = {field_x, field_y, field_z};
+    double Evec[3];
 
     for (int comp = 0; comp < 3; comp++) {
-        const double *ef = efield + comp * mesh_size;
-        #define EF(ii,jj,kk) ef[(ii)*ny*nz + (jj)*nz + (kk)]
+        const float *ef = fields[comp];
+        #define EF(ii,jj,kk) ((double)ef[((ii)+xshift)*ny2*nz2 + ((jj)+yshift)*nz2 + ((kk)+zshift)] * scale)
         Evec[comp] = EF(ip,  jp,  kp  )*ab    *de    *gh
                    + EF(ip,  jp+1,kp  )*ab    *(1-de)*gh
                    + EF(ip,  jp+1,kp+1)*ab    *(1-de)*(1-gh)
@@ -608,12 +598,12 @@ __global__ void csr_apply_kick_kernel(
 struct CsrEleGeom;
 
 /* Cached device arrays for space charge */
-static double *d_sc_efield = NULL;  /* nx*ny*nz*3 */
 static double *d_sc_charge = NULL;  /* per-particle charge */
 static float *d_sc_rho_padded_f = NULL;         /* float padded rho for R2C */
 static cufftComplex *d_sc_crho_freq_f = NULL;   /* R2C output (float complex) */
 static cufftHandle sc_fft_plan_f = 0;           /* R2C plan for float forward FFT */
 static int sc_nx2 = 0, sc_ny2 = 0, sc_nz2 = 0;
+static float *d_sc_real_c_f[3] = {NULL, NULL, NULL};  /* C2R output per component (read by interp kernel) */
 
 /* Cached device arrays for CSR binning */
 static double *d_csr_bin_charge = NULL;
@@ -669,7 +659,6 @@ static void get_device_ptrs(
 static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
 {
     int nx2 = 2*nx, ny2 = 2*ny, nz2 = 2*nz;
-    int mesh_size = nx * ny * nz;
     int dbl_size = nx2 * ny2 * nz2;
     int half_size = nx2 * ny2 * (nz2/2 + 1);  /* R2C complex output size */
 
@@ -689,16 +678,6 @@ static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
         if (d_sc_crho_freq_f)  cudaFree(d_sc_crho_freq_f);
         cudaMalloc((void**)&d_sc_rho_padded_f, (size_t)dbl_size * sizeof(float));
         cudaMalloc((void**)&d_sc_crho_freq_f,  (size_t)half_size * sizeof(cufftComplex));
-    }
-
-    /* Reallocate efield array only if mesh size changed */
-    {
-        static int cached_mesh_size = 0;
-        if (mesh_size != cached_mesh_size) {
-            if (d_sc_efield) cudaFree(d_sc_efield);
-            cudaMalloc((void**)&d_sc_efield, (size_t)mesh_size * 3 * sizeof(double));
-            cached_mesh_size = mesh_size;
-        }
     }
 
     /* Per-particle charge array -- reuse if large enough */
@@ -755,8 +734,8 @@ static int sc_fft_events_created = 0;
 static int sc_compute_only_flag = 0;
 static struct {
     double xmin, ymin, zmin, dx, dy, dz, dxi, dyi, dzi;
-    double ds_step, gamma, mc2, dct_ave;
-    int nx, ny, nz, n_particles;
+    double ds_step, gamma, mc2, dct_ave, scale;
+    int nx, ny, nz, nx2, ny2, nz2, n_particles;
     int valid;
 } sc_split_state = {0};
 
@@ -775,7 +754,6 @@ extern "C" void gpu_space_charge_3d_(
     get_device_ptrs(dvec, &dstate, &dbeta, &dp0c);
 
     int nx2 = 2*nx, ny2 = 2*ny, nz2 = 2*nz;
-    int mesh_size = nx * ny * nz;
     int dbl_size = nx2 * ny2 * nz2;
     int half_size = nx2 * ny2 * (nz2/2 + 1);  /* R2C complex output size */
     int threads = 256;
@@ -871,7 +849,6 @@ extern "C" void gpu_space_charge_3d_(
      * Float atomicAdd is hardware-native (~5x faster than double).
      * Eliminates the intermediate double rho buffer and rho_to_padded conversion. */
     int blocks_p = (n_particles + threads - 1) / threads;
-    int blocks_m = (mesh_size + threads - 1) / threads;
     int blocks_d = (dbl_size + threads - 1) / threads;
     int blocks_h = (half_size + threads - 1) / threads;
 
@@ -895,7 +872,8 @@ extern "C" void gpu_space_charge_3d_(
     /* --- Step 4: For each E-field component: Green function + FFT + multiply + IFFT ---
      * Mixed precision: Green fn cache + multiply + inverse FFT all use float.
      * Green fn forward FFT uses double D2Z (cache miss only), then converts to float cache.
-     * Charge freq is float from R2C above. Inverse C2R produces float, extracted to double efield. */
+     * Charge freq is float from R2C above. Inverse C2R produces float in padded layout;
+     * the interpolation kernel reads directly from the padded output (no extract step). */
     int stencil_size = (nx2-1)*(ny2-1)*(nz2-1);
     int blocks_s = (stencil_size + threads - 1) / threads;
     double scale = SC_FPEI / (double)(nx2*ny2*nz2);
@@ -912,7 +890,6 @@ extern "C" void gpu_space_charge_3d_(
     static double *d_sc_real_c[3] = {NULL, NULL, NULL};
     static cufftComplex *d_sc_grn_cache_f[3] = {NULL, NULL, NULL};
     static cufftComplex *d_sc_cgrn2_c_f[3] = {NULL, NULL, NULL};
-    static float *d_sc_real_c_f[3] = {NULL, NULL, NULL};
     static int grn_cached_size = 0;
     if (dbl_size > grn_cached_size) {
         size_t rsz = (size_t)dbl_size * sizeof(double);
@@ -1003,27 +980,21 @@ extern "C" void gpu_space_charge_3d_(
             complex_multiply_src_kernel_f<<<blocks_h, threads, 0, sc_streams[c]>>>(
                 d_sc_crho_freq_f, d_sc_grn_cache_f[c], d_sc_cgrn2_c_f[c], half_size);
 
-            /* Inverse C2R FFT (float) -> extract to double efield */
+            /* Inverse C2R FFT (float) — interpolation reads directly from padded output */
             CUFFT_SC_CHECK(cufftExecC2R(sc_inv_plans_f[c], d_sc_cgrn2_c_f[c], d_sc_real_c_f[c]));
-
-            extract_field_kernel_f<<<blocks_m, threads, 0, sc_streams[c]>>>(
-                d_sc_real_c_f[c], d_sc_efield + c*mesh_size,
-                nx, ny, nz, nx2, ny2, nz2, scale);
         }
         grn_cache_dx = dx; grn_cache_dy = dy; grn_cache_dz_rf = dz_rf;
         grn_cache_nx2 = nx2; grn_cache_ny2 = ny2; grn_cache_nz2 = nz2;
         grn_cache_valid = 1;
     } else {
-        /* Cache hit: float multiply + C2R + extract (hot path). */
+        /* Cache hit: float multiply + C2R (hot path).
+         * Interpolation reads directly from padded C2R output. */
         for (int icomp = 1; icomp <= 3; icomp++) {
             int c = icomp - 1;
             cudaStreamWaitEvent(sc_streams[c], sc_crho_ready, 0);
             complex_multiply_src_kernel_f<<<blocks_h, threads, 0, sc_streams[c]>>>(
                 d_sc_crho_freq_f, d_sc_grn_cache_f[c], d_sc_cgrn2_c_f[c], half_size);
             CUFFT_SC_CHECK(cufftExecC2R(sc_inv_plans_f[c], d_sc_cgrn2_c_f[c], d_sc_real_c_f[c]));
-            extract_field_kernel_f<<<blocks_m, threads, 0, sc_streams[c]>>>(
-                d_sc_real_c_f[c], d_sc_efield + c*mesh_size,
-                nx, ny, nz, nx2, ny2, nz2, scale);
         }
     }
 
@@ -1043,8 +1014,9 @@ extern "C" void gpu_space_charge_3d_(
         sc_split_state.dx = dx; sc_split_state.dy = dy; sc_split_state.dz = dz;
         sc_split_state.dxi = dxi; sc_split_state.dyi = dyi; sc_split_state.dzi = dzi;
         sc_split_state.ds_step = ds_step; sc_split_state.gamma = gamma;
-        sc_split_state.mc2 = mc2; sc_split_state.dct_ave = dct_ave;
+        sc_split_state.mc2 = mc2; sc_split_state.dct_ave = dct_ave; sc_split_state.scale = scale;
         sc_split_state.nx = nx; sc_split_state.ny = ny; sc_split_state.nz = nz;
+        sc_split_state.nx2 = nx2; sc_split_state.ny2 = ny2; sc_split_state.nz2 = nz2;
         sc_split_state.n_particles = n_particles;
         sc_split_state.valid = 1;
         sc_compute_only_flag = 0;
@@ -1056,14 +1028,14 @@ extern "C" void gpu_space_charge_3d_(
         cudaStreamWaitEvent(0, sc_fft_done[c], 0);  /* default stream waits */
     }
 
-    /* --- Step 5: Interpolate fields and apply kicks --- */
+    /* --- Step 5: Interpolate directly from padded C2R output and apply kicks --- */
     sc_interpolate_kick_kernel<<<blocks_p, threads>>>(
         dvec[0], dvec[1], dvec[2], dvec[3],
         dvec[4], dvec[5],
         dstate, dbeta, dp0c,
-        d_sc_efield,
+        d_sc_real_c_f[0], d_sc_real_c_f[1], d_sc_real_c_f[2],
         xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
-        nx, ny, nz,
+        nx, ny, nz, nx2, ny2, nz2, scale,
         ds_step, gamma, mc2, dct_ave,
         n_particles);
     CUDA_SC_CHECK(cudaGetLastError());
@@ -1118,16 +1090,18 @@ extern "C" void gpu_space_charge_3d_apply_(int n_particles)
         cudaStreamWaitEvent(0, sc_fft_done[c], 0);  /* default stream waits */
     }
 
-    /* Interpolate E-field at particle positions and apply kicks */
+    /* Interpolate directly from padded C2R output and apply kicks */
     sc_interpolate_kick_kernel<<<blocks_p, threads>>>(
         dvec[0], dvec[1], dvec[2], dvec[3],
         dvec[4], dvec[5],
         dstate, dbeta, dp0c,
-        d_sc_efield,
+        d_sc_real_c_f[0], d_sc_real_c_f[1], d_sc_real_c_f[2],
         sc_split_state.xmin, sc_split_state.ymin, sc_split_state.zmin,
         sc_split_state.dxi, sc_split_state.dyi, sc_split_state.dzi,
         sc_split_state.dx, sc_split_state.dy, sc_split_state.dz,
         sc_split_state.nx, sc_split_state.ny, sc_split_state.nz,
+        sc_split_state.nx2, sc_split_state.ny2, sc_split_state.nz2,
+        sc_split_state.scale,
         sc_split_state.ds_step, sc_split_state.gamma,
         sc_split_state.mc2, sc_split_state.dct_ave,
         n_particles);
@@ -1626,6 +1600,11 @@ __device__ double spline1_deriv_dev(const double *coef, double z) {
     return coef[0] + 2.0*coef[1]*z + 3.0*coef[2]*z*z;
 }
 
+/* Spline second derivative: d2x/dz2 = 2*coef[1] + 6*coef[2]*z */
+__device__ double spline1_d2_dev(const double *coef, double z) {
+    return 2.0*coef[1] + 6.0*coef[2]*z;
+}
+
 /* dspline_len: Ls - L (path length excess over chord).
    Approximation matching Bmad's dspline_len for small deviations. */
 __device__ double dspline_len_dev(const double *coef, double z0, double z1, double dtheta_L) {
@@ -1959,9 +1938,45 @@ __global__ void csr_bin_kicks_kernel(
 
     out_I_csr[tid] = I_csr_val;
 
-    /* I_int_csr: for i_bin==1, use special formula; otherwise use trapezoidal rule.
-       The trapezoidal rule requires the PREVIOUS bin's I_csr, which we compute in a
-       separate serial pass on CPU after the kernel. Store I_csr for now. */
+    /* For i_bin==1 (y_source==0): compute I_int_csr using the exact formula
+       (not the trapezoidal approximation used for i_bin>=2).
+       Store in out_I_int_csr[0] for the csr_I_int_kernel to read. */
+    if (i_bin == 1 && y_source == 0.0 && I_csr_val != 0.0) {
+        /* Find the effective kick element (handle s_chord_kick == 0 at element edge) */
+        int ix_ek = ix_ele_kick;
+        double sk = s_chord_kick;
+        while (sk == 0.0 && ix_ek > 0) {
+            ix_ek--;
+            sk = geom[ix_ek].L_chord;
+        }
+        if (ix_ek > 0 || sk != 0.0) {
+            const double *ck = geom[ix_ek].spline_coef;
+            double d1 = spline1_deriv_dev(ck, sk);
+            double d2 = spline1_d2_dev(ck, sk);
+            double g_bend = -d2 / pow(1.0 + d1*d1, 1.5);
+            double z1 = dz_slice;
+            double I_int_1;
+
+            if (out_ix_ele_source[tid] == ix_ek) {
+                /* Source and kick in same element */
+                double Ls1 = L + dL;
+                double gLs2 = g_bend * Ls1 * 0.5;
+                I_int_1 = -kick_factor * (gLs2 * gLs2
+                           - log(2.0 * gamma2 * z1 / Ls1) / gamma2);
+            } else {
+                /* Source in different element — split integral at kick element entrance */
+                double dtheta_L2 = ck[0] + ck[1] * sk + ck[2] * sk * sk;
+                double dL2 = dspline_len_dev(ck, 0.0, sk, dtheta_L2);
+                double Ls2 = sk + dL2;
+                double zz = sk / (2.0 * gamma2) + dL2;
+                double gLs2 = g_bend * Ls2 * 0.5;
+                I_int_1 = -kick_factor * (gLs2 * gLs2
+                           - log(2.0 * gamma2 * zz / Ls2) / gamma2);
+                I_int_1 += I_csr_val * (z1 - zz);
+            }
+            out_I_int_csr[0] = I_int_1;
+        }
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -2134,14 +2149,154 @@ extern "C" void gpu_csr_bin_kicks_(
 
 
 /* --------------------------------------------------------------------------
+ * csr_I_int_kernel -- compute I_int_csr[0..n_bin] from I_csr[0..2*n_bin]
+ *
+ * Thread 0:      I_int[0] = 0
+ * Thread 1:      I_int[1] = I_int_bin1[0]  (exact formula from root-finding kernel)
+ * Thread ib>=2:  I_int[ib] = (I_csr[n_bin+ib] + I_csr[n_bin+ib-1]) * dz_slice / 2
+ * -------------------------------------------------------------------------- */
+__global__ void csr_I_int_kernel(
+    const double *I_csr,         /* 2*n_bin+1 elements from root-finding */
+    const double *I_int_bin1,    /* single element: exact I_int for i_bin=1 */
+    double *I_int_out,           /* n_bin+1 elements output (for convolution) */
+    double dz_slice, int n_bin)
+{
+    int ib = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ib > n_bin) return;
+
+    if (ib == 0) {
+        I_int_out[0] = 0.0;
+    } else if (ib == 1) {
+        I_int_out[1] = I_int_bin1[0];
+    } else {
+        I_int_out[ib] = (I_csr[n_bin + ib] + I_csr[n_bin + ib - 1]) * dz_slice * 0.5;
+    }
+}
+
+
+/* --------------------------------------------------------------------------
+ * gpu_csr_bin_kicks_full -- GPU-native CSR root-finding + I_int + convolution
+ *
+ * Runs the entire CSR kick pipeline on GPU for y_source=0:
+ *   1. Root-finding kernel → I_csr per bin (parallel Brent's method)
+ *   2. I_int kernel → I_int_csr from I_csr
+ *   3. Convolution kernel → kick_csr into d_csr_kick_conv
+ *
+ * All kernels launch on csr_kick_stream. No host sync or download.
+ * Result stays in d_csr_kick_conv for gpu_csr_apply_kicks_dev_.
+ * -------------------------------------------------------------------------- */
+extern "C" void gpu_csr_bin_kicks_full_(
+    /* Element geometry (host, n_ele+1 elements, 0..n_ele) */
+    double *h_floor0_x, double *h_floor0_z, double *h_floor0_theta,
+    double *h_floor1_x, double *h_floor1_z, double *h_floor1_theta,
+    double *h_L_chord, double *h_theta_chord,
+    double *h_spline_coef, /* 3 * (n_ele+1) */
+    double *h_dL_s, double *h_ele_s,
+    int *h_ele_key,
+    int n_ele,
+    /* CSR parameters */
+    int ix_ele_kick,
+    double s_chord_kick,
+    double floor_k_x, double floor_k_z,
+    double gamma, double gamma2, double beta2,
+    double dz_slice,
+    int n_bin,
+    double kick_factor,
+    /* Convolution coefficient */
+    double coef)
+{
+    int n_kick1 = 2 * n_bin + 1;
+
+    /* Ensure convolution buffers (d_csr_I_int, d_csr_edge_dcdz, d_csr_kick_conv)
+       and csr_kick_stream */
+    ensure_csr_conv_buffers(n_bin);
+
+    /* --- Build and upload geometry --- */
+    if (n_ele + 1 > h_cbk_geom_cap) {
+        free(h_cbk_geom);
+        h_cbk_geom = (CsrEleGeom*)malloc((n_ele + 1) * sizeof(CsrEleGeom));
+        h_cbk_geom_cap = n_ele + 1;
+    }
+    CsrEleGeom *h_geom = h_cbk_geom;
+    for (int i = 0; i <= n_ele; i++) {
+        h_geom[i].floor0_x = h_floor0_x[i];
+        h_geom[i].floor0_z = h_floor0_z[i];
+        h_geom[i].floor0_theta = h_floor0_theta[i];
+        h_geom[i].floor1_x = h_floor1_x[i];
+        h_geom[i].floor1_z = h_floor1_z[i];
+        h_geom[i].floor1_theta = h_floor1_theta[i];
+        h_geom[i].L_chord = h_L_chord[i];
+        h_geom[i].theta_chord = h_theta_chord[i];
+        h_geom[i].spline_coef[0] = h_spline_coef[3*i];
+        h_geom[i].spline_coef[1] = h_spline_coef[3*i+1];
+        h_geom[i].spline_coef[2] = h_spline_coef[3*i+2];
+        h_geom[i].dL_s = h_dL_s[i];
+        h_geom[i].ele_s = h_ele_s[i];
+        h_geom[i].ele_key = h_ele_key[i];
+    }
+
+    if (n_ele + 1 > d_cbk_geom_cap) {
+        if (d_cbk_geom) cudaFree(d_cbk_geom);
+        cudaMalloc((void**)&d_cbk_geom, (n_ele + 1) * sizeof(CsrEleGeom));
+        d_cbk_geom_cap = n_ele + 1;
+    }
+    cudaMemcpyAsync(d_cbk_geom, h_geom, (n_ele + 1) * sizeof(CsrEleGeom),
+                    cudaMemcpyHostToDevice, csr_kick_stream);
+
+    /* --- Ensure kick1 output arrays --- */
+    if (n_kick1 > d_cbk_kick1_cap) {
+        if (d_cbk_I_csr) cudaFree(d_cbk_I_csr);
+        if (d_cbk_I_int_csr) cudaFree(d_cbk_I_int_csr);
+        if (d_cbk_ix_ele_source) cudaFree(d_cbk_ix_ele_source);
+        cudaMalloc((void**)&d_cbk_I_csr, n_kick1 * sizeof(double));
+        cudaMalloc((void**)&d_cbk_I_int_csr, n_kick1 * sizeof(double));
+        cudaMalloc((void**)&d_cbk_ix_ele_source, n_kick1 * sizeof(int));
+        d_cbk_kick1_cap = n_kick1;
+    }
+    cudaMemsetAsync(d_cbk_I_csr, 0, n_kick1 * sizeof(double), csr_kick_stream);
+    cudaMemsetAsync(d_cbk_I_int_csr, 0, n_kick1 * sizeof(double), csr_kick_stream);
+
+    /* --- 1. Root-finding kernel: one thread per kick1 bin --- */
+    int threads = 256;
+    int blocks = (n_kick1 + threads - 1) / threads;
+    csr_bin_kicks_kernel<<<blocks, threads, 0, csr_kick_stream>>>(
+        d_cbk_geom, n_ele, ix_ele_kick, s_chord_kick,
+        floor_k_x, floor_k_z,
+        gamma, gamma2, beta2, 0.0 /* y_source=0 */,
+        dz_slice, n_bin, kick_factor,
+        d_cbk_I_csr, d_cbk_I_int_csr, d_cbk_ix_ele_source);
+    CUDA_SC_CHECK(cudaGetLastError());
+
+    /* --- 2. I_int kernel: compute I_int_csr[0..n_bin] from I_csr --- */
+    int iblocks = (n_bin + 1 + 255) / 256;
+    csr_I_int_kernel<<<iblocks, 256, 0, csr_kick_stream>>>(
+        d_cbk_I_csr,       /* I_csr from root-finding */
+        d_cbk_I_int_csr,   /* I_int_bin1 stored at [0] by root-finding kernel */
+        d_csr_I_int,        /* output: I_int[0..n_bin] for convolution */
+        dz_slice, n_bin);
+    CUDA_SC_CHECK(cudaGetLastError());
+
+    /* --- 3. Convolution kernel: I_int * edge_dcdz → kick_csr --- */
+    int cblocks = (n_bin + 255) / 256;
+    csr_kick_convolve_kernel<<<cblocks, 256, 0, csr_kick_stream>>>(
+        d_csr_I_int, d_csr_edge_dcdz, d_csr_kick_conv, coef, n_bin);
+    CUDA_SC_CHECK(cudaGetLastError());
+
+    /* No sync — kicks applied later by gpu_csr_apply_kicks_dev_ on same stream */
+}
+
+
+/* --------------------------------------------------------------------------
  * Cleanup
  * -------------------------------------------------------------------------- */
 extern "C" void gpu_spacecharge_cleanup_(void)
 {
-    if (d_sc_efield) { cudaFree(d_sc_efield);  d_sc_efield = NULL; }
     if (d_sc_charge) { cudaFree(d_sc_charge);  d_sc_charge = NULL; }
     if (d_sc_rho_padded_f) { cudaFree(d_sc_rho_padded_f); d_sc_rho_padded_f = NULL; }
     if (d_sc_crho_freq_f)  { cudaFree(d_sc_crho_freq_f);  d_sc_crho_freq_f = NULL; }
+    for (int c = 0; c < 3; c++) {
+        if (d_sc_real_c_f[c]) { cudaFree(d_sc_real_c_f[c]); d_sc_real_c_f[c] = NULL; }
+    }
     if (sc_fft_plan_f) { cufftDestroy(sc_fft_plan_f); sc_fft_plan_f = 0; }
     sc_nx2 = 0; sc_ny2 = 0; sc_nz2 = 0;
     sc_charge_uploaded = 0;
