@@ -678,40 +678,42 @@ real(rp) :: mc2_l
 nb_l = space_charge_com%n_bin
 np_l = size(bunch_in%particle)
 
-! CSR/LSC kicks — use device-resident kicks when available (from gpu_csr_convolve_dev)
-if (bmad_com%gpu_tracking_on .and. ele_in%csr_method == one_dim$ .and. csr_in%y_source == 0) then
-  ! Device-resident path: kick_csr is already on GPU from gpu_csr_convolve_dev.
-  ! No host→device transfer needed.
-  block
-    interface
-      subroutine gpu_csr_apply_kicks_dev(z_center_0, dz_sl, nb, np) &
-          bind(C, name='gpu_csr_apply_kicks_dev_')
-        use, intrinsic :: iso_c_binding
-        real(C_DOUBLE), value :: z_center_0, dz_sl
-        integer(C_INT), value :: nb, np
-      end subroutine
-    end interface
-    call gpu_csr_apply_kicks_dev(csr_in%slice(1)%z_center, csr_in%dz_slice, &
+! CSR/LSC kicks — only when CSR or slice SC is active (skip for fft_3d-only)
+if (ele_in%csr_method == one_dim$ .or. ele_in%space_charge_method == slice$) then
+  if (bmad_com%gpu_tracking_on .and. ele_in%csr_method == one_dim$ .and. csr_in%y_source == 0) then
+    ! Device-resident path: kick_csr is already on GPU from gpu_csr_convolve_dev.
+    ! No host→device transfer needed.
+    block
+      interface
+        subroutine gpu_csr_apply_kicks_dev(z_center_0, dz_sl, nb, np) &
+            bind(C, name='gpu_csr_apply_kicks_dev_')
+          use, intrinsic :: iso_c_binding
+          real(C_DOUBLE), value :: z_center_0, dz_sl
+          integer(C_INT), value :: nb, np
+        end subroutine
+      end interface
+      call gpu_csr_apply_kicks_dev(csr_in%slice(1)%z_center, csr_in%dz_slice, &
+          int(nb_l, C_INT), int(np_l, C_INT))
+    end block
+  else
+    ! Fallback: upload kicks from host (for image charges or CPU-computed kicks)
+    allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
+    do ii = 1, nb_l
+      h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
+      h_kick_lsc_l(ii) = csr_in%slice(ii)%kick_lsc
+    enddo
+
+    apply_csr_l = 0; apply_lsc_l = 0
+    if (ele_in%csr_method == one_dim$) apply_csr_l = 1
+    if (ele_in%space_charge_method == slice$) apply_lsc_l = 1
+
+    call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
+        csr_in%slice(1)%z_center, csr_in%dz_slice, &
+        apply_csr_l, apply_lsc_l, &
         int(nb_l, C_INT), int(np_l, C_INT))
-  end block
-else
-  ! Fallback: upload kicks from host (for image charges or CPU-computed kicks)
-  allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
-  do ii = 1, nb_l
-    h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
-    h_kick_lsc_l(ii) = csr_in%slice(ii)%kick_lsc
-  enddo
 
-  apply_csr_l = 0; apply_lsc_l = 0
-  if (ele_in%csr_method == one_dim$) apply_csr_l = 1
-  if (ele_in%space_charge_method == slice$) apply_lsc_l = 1
-
-  call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
-      csr_in%slice(1)%z_center, csr_in%dz_slice, &
-      apply_csr_l, apply_lsc_l, &
-      int(nb_l, C_INT), int(np_l, C_INT))
-
-  deallocate(h_kick_csr_l, h_kick_lsc_l)
+    deallocate(h_kick_csr_l, h_kick_lsc_l)
+  endif
 endif
 
 ! 3D FFT space charge: apply phase only (compute was started earlier)
