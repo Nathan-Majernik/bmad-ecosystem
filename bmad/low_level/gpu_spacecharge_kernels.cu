@@ -46,10 +46,6 @@
 /* Forward declarations for kernels used across sections */
 __global__ void z_minmax_kernel(const double *z, const int *state,
     double *block_min, double *block_max, int n);
-__global__ void sc_compute_z_adj(const double *z, const double *beta,
-    double *z_adj, double dct_ave, int n);
-__global__ void dct_ave_reduce_kernel(const double *z, const double *beta,
-    const int *state, double *block_sum, int *block_count, int n);
 
 /* Fused pass-1 kernel: computes dct_ave reduction + x/y bounds in single pass.
    Each block produces: sum(z/beta), count(alive), min_x, max_x, min_y, max_y. */
@@ -1138,56 +1134,6 @@ extern "C" void gpu_space_charge_3d_apply_(int n_particles)
     CUDA_SC_CHECK(cudaGetLastError());
 
     sc_split_state.valid = 0;
-}
-
-
-/* --------------------------------------------------------------------------
- * sc_compute_z_adj -- compute z_adj = z - dct_ave * beta for SC bounds
- * -------------------------------------------------------------------------- */
-__global__ void sc_compute_z_adj(const double *z, const double *beta,
-    double *z_adj, double dct_ave, int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    z_adj[i] = z[i] - dct_ave * beta[i];
-}
-
-
-/* --------------------------------------------------------------------------
- * dct_ave_reduce_kernel -- block reduction of sum(z/beta) and count(alive)
- * -------------------------------------------------------------------------- */
-__global__ void dct_ave_reduce_kernel(const double *z, const double *beta,
-    const int *state, double *block_sum, int *block_count, int n)
-{
-    extern __shared__ char sdata_raw[];
-    double *ssum = (double*)sdata_raw;
-    int *scnt = (int*)(sdata_raw + blockDim.x * sizeof(double));
-
-    int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    double local_sum = 0.0;
-    int local_cnt = 0;
-    if (i < n && state[i] == 1) {
-        local_sum = z[i] / beta[i];
-        local_cnt = 1;
-    }
-    ssum[tid] = local_sum;
-    scnt[tid] = local_cnt;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            ssum[tid] += ssum[tid + s];
-            scnt[tid] += scnt[tid + s];
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        block_sum[blockIdx.x] = ssum[0];
-        block_count[blockIdx.x] = scnt[0];
-    }
 }
 
 
