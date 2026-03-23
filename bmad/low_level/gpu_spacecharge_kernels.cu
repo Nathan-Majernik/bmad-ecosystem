@@ -936,11 +936,20 @@ extern "C" void gpu_space_charge_3d_(
     }
 
     /* Green function caching: depends only on dx, dy, dz*gamma, mesh dims.
-     * 0.1% tolerance -- within a single element's sub-steps the grid spacing
-     * barely changes, so most sub-steps are cache hits. */
+     * Default 15% tolerance -- the Green function varies smoothly with grid
+     * spacing, so reusing a cached Green function when the grid has drifted
+     * by up to ~15% introduces only a small error in the SC kicks (the SC
+     * force is itself a small perturbation on the tracking).
+     * Override: set SC_GRN_TOL to a fractional value (e.g. 0.001 for 0.1%). */
     static double grn_cache_dx = 0, grn_cache_dy = 0, grn_cache_dz_rf = 0;
     static int grn_cache_nx2 = 0, grn_cache_ny2 = 0, grn_cache_nz2 = 0;
     static int grn_cache_valid = 0;
+    static double grn_tol = -1;
+    if (grn_tol < 0) {
+        grn_tol = 0.15;
+        const char *env = getenv("SC_GRN_TOL");
+        if (env) { double v = atof(env); if (v > 0) grn_tol = v; }
+    }
 
     double dz_rf = dz_rf_local;  /* already computed on GPU */
     int grn_hit = 0;
@@ -949,7 +958,7 @@ extern "C" void gpu_space_charge_3d_(
         double rdx = fabs(dx - grn_cache_dx) / (fabs(grn_cache_dx) + 1e-30);
         double rdy = fabs(dy - grn_cache_dy) / (fabs(grn_cache_dy) + 1e-30);
         double rdz = fabs(dz_rf - grn_cache_dz_rf) / (fabs(grn_cache_dz_rf) + 1e-30);
-        grn_hit = (rdx < 1e-3 && rdy < 1e-3 && rdz < 1e-3);
+        grn_hit = (rdx < grn_tol && rdy < grn_tol && rdz < grn_tol);
     }
 
     if (!grn_hit) {
