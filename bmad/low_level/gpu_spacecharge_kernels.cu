@@ -305,6 +305,59 @@ __global__ void deposit_kernel(
 }
 
 /* --------------------------------------------------------------------------
+ * Float deposit: deposit charge directly into the zero-padded float buffer
+ * used by R2C FFT, using float atomicAdd (hardware-native, ~5x faster than
+ * double atomicAdd).  Eliminates the intermediate d_sc_rho double buffer
+ * and the rho_to_padded_f conversion kernel.
+ * Particle positions [0,nx)×[0,ny)×[0,nz) map to the first octant of the
+ * padded [0,nx2)×[0,ny2)×[0,nz2) buffer; padding positions stay zero.
+ * -------------------------------------------------------------------------- */
+__global__ void deposit_kernel_f(
+    const double *x, const double *y, const double *z,
+    const double *beta,
+    const double *charge, const int *state,
+    float *rho_padded,
+    double xmin, double ymin, double zmin,
+    double dxi, double dyi, double dzi,
+    double dx, double dy, double dz,
+    int nx, int ny, int nz,
+    int ny2, int nz2,
+    double dct_ave,
+    int n_particles)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_particles) return;
+    if (state[i] != SC_ALIVE_ST) return;
+
+    double z_adj = z[i] - dct_ave * beta[i];
+
+    int ip = (int)floor((x[i] - xmin) * dxi + 1.0) - 1;
+    int jp = (int)floor((y[i] - ymin) * dyi + 1.0) - 1;
+    int kp = (int)floor((z_adj - zmin) * dzi + 1.0) - 1;
+
+    if (ip < 0) ip = 0; if (ip >= nx-1) ip = nx-2;
+    if (jp < 0) jp = 0; if (jp >= ny-1) jp = ny-2;
+    if (kp < 0) kp = 0; if (kp >= nz-1) kp = nz-2;
+
+    double ab = ((xmin - x[i]) + (ip+1)*dx) * dxi;
+    double de = ((ymin - y[i]) + (jp+1)*dy) * dyi;
+    double gh = ((zmin - z_adj) + (kp+1)*dz) * dzi;
+
+    double q = charge[i];
+
+    #define PAD_IDX(ii,jj,kk) ((ii)*ny2*nz2 + (jj)*nz2 + (kk))
+    atomicAdd(&rho_padded[PAD_IDX(ip,  jp,  kp  )], (float)(ab    *de    *gh    *q));
+    atomicAdd(&rho_padded[PAD_IDX(ip,  jp+1,kp  )], (float)(ab    *(1-de)*gh    *q));
+    atomicAdd(&rho_padded[PAD_IDX(ip,  jp+1,kp+1)], (float)(ab    *(1-de)*(1-gh)*q));
+    atomicAdd(&rho_padded[PAD_IDX(ip,  jp,  kp+1)], (float)(ab    *de    *(1-gh)*q));
+    atomicAdd(&rho_padded[PAD_IDX(ip+1,jp,  kp+1)], (float)((1-ab)*de    *(1-gh)*q));
+    atomicAdd(&rho_padded[PAD_IDX(ip+1,jp+1,kp+1)], (float)((1-ab)*(1-de)*(1-gh)*q));
+    atomicAdd(&rho_padded[PAD_IDX(ip+1,jp+1,kp  )], (float)((1-ab)*(1-de)*gh    *q));
+    atomicAdd(&rho_padded[PAD_IDX(ip+1,jp,  kp  )], (float)((1-ab)*de    *gh    *q));
+    #undef PAD_IDX
+}
+
+/* --------------------------------------------------------------------------
  * Compute free-space Green function (integrated Green function method).
  * Matches osc_get_cgrn_freespace: xlafun2 for E-field, lafun2 for potential.
  * -------------------------------------------------------------------------- */
@@ -714,12 +767,8 @@ __global__ void csr_apply_kick_kernel(
 struct CsrEleGeom;
 
 /* Cached device arrays for space charge */
-static double *d_sc_rho = NULL;
 static double *d_sc_efield = NULL;  /* nx*ny*nz*3 */
 static double *d_sc_charge = NULL;  /* per-particle charge */
-static double *d_sc_rho_padded = NULL;  /* zero-padded real rho for D2Z, size dbl_size */
-static cufftDoubleComplex *d_sc_crho_freq = NULL;  /* D2Z output, size half_size */
-static cufftHandle sc_fft_plan = 0;  /* D2Z plan for charge density forward FFT */
 static float *d_sc_rho_padded_f = NULL;         /* float padded rho for R2C */
 static cufftComplex *d_sc_crho_freq_f = NULL;   /* R2C output (float complex) */
 static cufftHandle sc_fft_plan_f = 0;           /* R2C plan for float forward FFT */
@@ -785,14 +834,7 @@ static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
 
     /* Recreate FFT plans if mesh size changed */
     if (nx2 != sc_nx2 || ny2 != sc_ny2 || nz2 != sc_nz2) {
-        /* D2Z plan (kept for Green function forward FFT on cache miss) */
-        if (sc_fft_plan) cufftDestroy(sc_fft_plan);
-        if (cufftPlan3d(&sc_fft_plan, nx2, ny2, nz2, CUFFT_D2Z) != CUFFT_SUCCESS) {
-            fprintf(stderr, "[gpu_sc] cuFFT D2Z plan creation failed\n");
-            sc_fft_plan = 0;
-            return -1;
-        }
-        /* R2C float plan for charge density forward FFT (mixed precision) */
+        /* R2C float plan for charge density forward FFT */
         if (sc_fft_plan_f) cufftDestroy(sc_fft_plan_f);
         if (cufftPlan3d(&sc_fft_plan_f, nx2, ny2, nz2, CUFFT_R2C) != CUFFT_SUCCESS) {
             fprintf(stderr, "[gpu_sc] cuFFT R2C plan creation failed\n");
@@ -801,26 +843,18 @@ static int ensure_sc_buffers(int nx, int ny, int nz, int n_particles)
         }
         sc_nx2 = nx2; sc_ny2 = ny2; sc_nz2 = nz2;
 
-        /* Reallocate double buffers (kept for Green fn D2Z on cache miss) */
-        if (d_sc_rho_padded)  cudaFree(d_sc_rho_padded);
-        if (d_sc_crho_freq)   cudaFree(d_sc_crho_freq);
-        cudaMalloc((void**)&d_sc_rho_padded, (size_t)dbl_size * sizeof(double));
-        cudaMalloc((void**)&d_sc_crho_freq,  (size_t)half_size * sizeof(cufftDoubleComplex));
-
-        /* Float padded rho + float complex frequency buffer */
+        /* Float padded rho (deposit target + R2C input) + float freq output */
         if (d_sc_rho_padded_f) cudaFree(d_sc_rho_padded_f);
         if (d_sc_crho_freq_f)  cudaFree(d_sc_crho_freq_f);
         cudaMalloc((void**)&d_sc_rho_padded_f, (size_t)dbl_size * sizeof(float));
         cudaMalloc((void**)&d_sc_crho_freq_f,  (size_t)half_size * sizeof(cufftComplex));
     }
 
-    /* Reallocate mesh arrays only if size changed */
+    /* Reallocate efield array only if mesh size changed */
     {
         static int cached_mesh_size = 0;
         if (mesh_size != cached_mesh_size) {
-            if (d_sc_rho) cudaFree(d_sc_rho);
             if (d_sc_efield) cudaFree(d_sc_efield);
-            cudaMalloc((void**)&d_sc_rho, (size_t)mesh_size * sizeof(double));
             cudaMalloc((void**)&d_sc_efield, (size_t)mesh_size * 3 * sizeof(double));
             cached_mesh_size = mesh_size;
         }
@@ -992,30 +1026,23 @@ extern "C" void gpu_space_charge_3d_(
     double dxi  = h_sc_results[13], dyi  = h_sc_results[14], dzi  = h_sc_results[15];
     double dz_rf_local = h_sc_results[16];
 
-    /* --- Step 2: Deposit particles on mesh --- */
-    CUDA_SC_CHECK(cudaMemset(d_sc_rho, 0, mesh_size * sizeof(double)));
-
-    /* Deposit using raw z (dvec[4]) + beta. The kernel computes z_adj = z - dct_ave*beta
-     * internally, eliminating the need for a separate sc_compute_z_adj kernel. */
+    /* --- Step 2+3: Deposit directly into float padded buffer, then R2C FFT ---
+     * Float atomicAdd is hardware-native (~5x faster than double).
+     * Eliminates the intermediate double rho buffer and rho_to_padded conversion. */
     int blocks_p = (n_particles + threads - 1) / threads;
-
-    deposit_kernel<<<blocks_p, threads>>>(
-        dvec[0], dvec[2], dvec[4], dbeta,
-        d_sc_charge, dstate,
-        d_sc_rho,
-        xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
-        nx, ny, nz, dct_ave, n_particles);
-    CUDA_SC_CHECK(cudaGetLastError());
-    /* No sync needed -- next operations are on same default stream */
-
-    /* --- Step 3: FFT of charge density (mixed precision: float R2C) ---
-     * Deposit stays double for accuracy; convert to float for FFT. */
     int blocks_m = (mesh_size + threads - 1) / threads;
     int blocks_d = (dbl_size + threads - 1) / threads;
     int blocks_h = (half_size + threads - 1) / threads;
 
-    rho_to_padded_f_kernel<<<blocks_d, threads>>>(
-        d_sc_rho, d_sc_rho_padded_f, nx, ny, nz, nx2, ny2, nz2);
+    CUDA_SC_CHECK(cudaMemset(d_sc_rho_padded_f, 0, (size_t)dbl_size * sizeof(float)));
+
+    deposit_kernel_f<<<blocks_p, threads>>>(
+        dvec[0], dvec[2], dvec[4], dbeta,
+        d_sc_charge, dstate,
+        d_sc_rho_padded_f,
+        xmin, ymin, zmin, dxi, dyi, dzi, dx, dy, dz,
+        nx, ny, nz, ny2, nz2, dct_ave, n_particles);
+    CUDA_SC_CHECK(cudaGetLastError());
 
     CUFFT_SC_CHECK(cufftExecR2C(sc_fft_plan_f, d_sc_rho_padded_f, d_sc_crho_freq_f));
 
@@ -2320,12 +2347,8 @@ extern "C" void gpu_csr_bin_kicks_(
  * -------------------------------------------------------------------------- */
 extern "C" void gpu_spacecharge_cleanup_(void)
 {
-    if (sc_fft_plan) { cufftDestroy(sc_fft_plan); sc_fft_plan = 0; }
-    if (d_sc_rho)    { cudaFree(d_sc_rho);    d_sc_rho = NULL; }
     if (d_sc_efield) { cudaFree(d_sc_efield);  d_sc_efield = NULL; }
     if (d_sc_charge) { cudaFree(d_sc_charge);  d_sc_charge = NULL; }
-    if (d_sc_rho_padded)  { cudaFree(d_sc_rho_padded);  d_sc_rho_padded = NULL; }
-    if (d_sc_crho_freq)   { cudaFree(d_sc_crho_freq);   d_sc_crho_freq = NULL; }
     if (d_sc_rho_padded_f) { cudaFree(d_sc_rho_padded_f); d_sc_rho_padded_f = NULL; }
     if (d_sc_crho_freq_f)  { cudaFree(d_sc_crho_freq_f);  d_sc_crho_freq_f = NULL; }
     if (sc_fft_plan_f) { cufftDestroy(sc_fft_plan_f); sc_fft_plan_f = 0; }
