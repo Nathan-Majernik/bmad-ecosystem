@@ -11,6 +11,6 @@ parameter[geometry] = open
 
 b1: sbend, L = 1.0, g = 0.5, csr_method = 1_dim, space_charge_method = fft_3d
 
-lat: line = (3*b1)
+lat: line = (10*b1)
 
 use, lat
