@@ -155,12 +155,18 @@ else
     i = e1%ix_ele + 1
     do while (i <= e2%ix_ele)
       ! Try multi-element GPU batch tracking
+      ! Multi-element GPU dispatch: skip when CSR/SC is active on this element
+      ! or the next, since track_bunch_thru_elements_gpu does not apply CSR or
+      ! space-charge kicks. Such elements must go through track1_bunch_csr.
       if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(branch%ele(i)) .and. &
           .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
           bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
           .not. present(bunch_track) .and. &
           i < e2%ix_ele .and. i+1 <= branch%n_ele_track .and. &
-          ele_gpu_eligible(branch%ele(i+1))) then
+          ele_gpu_eligible(branch%ele(i+1)) .and. &
+          .not. (bmad_com%csr_and_space_charge_on .and. &
+                 (branch%ele(i)%csr_method /= off$ .or. branch%ele(i)%space_charge_method /= off$ .or. &
+                  branch%ele(i+1)%csr_method /= off$ .or. branch%ele(i+1)%space_charge_method /= off$))) then
         call track_bunch_thru_elements_gpu(bunch, branch, i, e2%ix_ele, j)
         if (j >= i) then
           i = j + 1

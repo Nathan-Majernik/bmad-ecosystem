@@ -427,7 +427,13 @@ do i_step = 0, n_step
 
   ! Start async 3D SC computation (GPU FFTs run while CPU does root-finding below).
   ! The apply phase happens in csr_apply_kicks_gpu after CSR kicks are applied.
-  if (gpu_csr_active .and. ele%space_charge_method == fft_3d$) then
+  ! Skip the async compute when 1D CSR will also run on this element, because
+  ! 1D CSR longitudinal kicks update p%vec(5) (z) via the beta change. Depositing
+  ! before CSR would then use stale z while interpolation in the apply phase
+  ! would read post-CSR z, causing a mismatch. In that case csr_apply_kicks_gpu
+  ! falls back to the synchronous full SC pipeline (deposit + FFT + apply).
+  if (gpu_csr_active .and. ele%space_charge_method == fft_3d$ .and. &
+      ele%csr_method /= one_dim$) then
     call csr_sc_3d_compute_gpu(ele, csr, bunch)
   endif
 
@@ -709,17 +715,36 @@ if (ele_in%csr_method == one_dim$ .or. ele_in%space_charge_method == slice$) the
   endif
 endif
 
-! 3D FFT space charge: apply phase only (compute was started earlier)
+! 3D FFT space charge: apply phase
 if (ele_in%space_charge_method == fft_3d$ .and. gpu_persist_on_device) then
-  block
-    interface
-      subroutine gpu_space_charge_3d_apply(np) bind(C, name='gpu_space_charge_3d_apply_')
-        use, intrinsic :: iso_c_binding
-        integer(C_INT), value :: np
-      end subroutine
-    end interface
-    call gpu_space_charge_3d_apply(int(np_l, C_INT))
-  end block
+  if (ele_in%csr_method == one_dim$) then
+    ! CSR also active: async compute was skipped, so do the full SC pipeline now
+    ! (deposit + FFT + apply) using the post-CSR positions on device.
+    block
+      real(C_DOUBLE), allocatable :: charge_apply(:)
+      mc2_l = mass_of(bunch_in%particle(1)%species)
+      allocate(charge_apply(np_l))
+      do ii = 1, np_l
+        charge_apply(ii) = bunch_in%particle(ii)%charge
+      enddo
+      call gpu_space_charge_3d(charge_apply, np_l, &
+          int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
+          int(csr_in%mesh3d%nhi(3), C_INT), &
+          csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+      deallocate(charge_apply)
+    end block
+  else
+    ! No CSR: compute was started earlier, just run apply phase
+    block
+      interface
+        subroutine gpu_space_charge_3d_apply(np) bind(C, name='gpu_space_charge_3d_apply_')
+          use, intrinsic :: iso_c_binding
+          integer(C_INT), value :: np
+        end subroutine
+      end interface
+      call gpu_space_charge_3d_apply(int(np_l, C_INT))
+    end block
+  endif
 endif
 
 end subroutine csr_apply_kicks_gpu

@@ -41,7 +41,7 @@
 
 #define SC_ALIVE_ST 1
 #define SC_LOST_PZ  8
-#define SC_FPEI 89875517873.68176  /* 1/(4*pi*eps0) = c^2 * 1e-7 */
+#define SC_FPEI 8987551787.368176  /* 1/(4*pi*eps0) = c^2 * 1e-7 */
 
 /* Forward declarations for kernels used across sections */
 __global__ void z_minmax_kernel(const double *z, const int *state,
@@ -311,7 +311,12 @@ __device__ double xlafun2_dev(double x, double y, double z)
 {
     double r = sqrt(x*x + y*y + z*z);
     if (r < 1e-30) return 0.0;
-    return x*atan2(y*z, r*x) - z*log(r+y) + y*log((r-z)/(r+z))*0.5;
+    /* Match CPU: use single-argument atan (not atan2) so that the
+     * antiderivative branch matches osc_get_cgrn_freespace.
+     * The integrated Green function comes from differences in the
+     * stencil, so consistency between adjacent corners matters more
+     * than mathematical "correctness" of atan2. */
+    return x*atan((y*z)/(r*x)) - z*log(r+y) + y*log((r-z)/(r+z))*0.5;
 }
 
 __global__ void green_function_kernel(
