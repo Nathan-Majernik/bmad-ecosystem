@@ -370,10 +370,10 @@ integer, pointer :: i_level
 
 character(*) how
 character(*), optional :: file_name_in
-character(400) file_name, basename, file_name2
+character(400) file_name, basename, file_name2, dir_name
 
 logical, optional :: finished, err, open_file, abort_on_open_error
-logical found_it, is_relative, valid, err_flag, stop_here
+logical found_it, is_relative, valid, err_flag, stop_here, err2
 
 ! "Init" means init
 
@@ -444,6 +444,7 @@ case ('push', 'push_inline')
   endif
 
   ix = splitfilename (file_name2, bp_com%file(i_level)%dir, basename, is_relative)
+  if (bp_com%file(i_level)%dir == '') bp_com%file(i_level)%dir = './'
 
   if (bp_com%use_local_lat_file) then
     inquire (file = basename, exist = found_it, name = file_name2)
@@ -462,6 +463,22 @@ case ('push', 'push_inline')
 
   bp_com%file(i_level)%full_name = file_name
   bp_com%file(i_level)%f_unit = lunget()
+  if (i_level == 1) then
+    if (allocated(bp_com%env_var_name)) then
+      ! n = size(bp_com%env_var_name) + 1
+      ! call re_allocate (bp_com%env_var_name, n)
+      ! bp_com%env_var_name(n) = 'LATTICE_SECONDARY_DIR' 
+    else
+      n = 1
+      call re_allocate (bp_com%env_var_name, n)
+      bp_com%env_var_name(n) = 'LATTICE_ROOT_DIR' 
+
+      ix = splitfilename(file_name, dir_name, basename, is_relative)
+      call re_allocate (bp_com%env_var_value, n)
+      bp_com%env_var_value(n) = dir_name
+      call set_env(bp_com%env_var_name(n), dir_name, err2)
+    endif
+  endif
 
   ! Note: open_file will be False when the file is a binary file.
 
@@ -1110,7 +1127,9 @@ if (ix1 == 0) then
     if (bp_com%undefined_vars_evaluate_to_zero) then
       call parser_error ('VARIABLE USED BUT NOT YET DEFINED: ' // word, 'WILL TREAT AS ZERO.', level = s_warn$)
     else
-      call parser_error ('VARIABLE USED BUT NOT YET DEFINED: ' // word)
+      call parser_error ('VARIABLE USED BUT NOT YET DEFINED: ' // word, &
+                         'NOTE: IF YOU WANT UNDEFINED VARS TO BE TREATED AS ZERO,', &
+                         'SET "UNDEFINED_VARS_EVALUATE_TO_ZERO" IN THE LATTICE FILE (BUT THIS IS *NOT* RECOMMENDED).')
       return
     endif
     value = 0
@@ -6984,8 +7003,8 @@ type (ele_struct), target :: ele
 type (ele_struct), pointer :: match_ele
 type (lat_struct), target :: lat
 type (branch_struct), pointer :: branch
-type (em_taylor_term_struct), allocatable :: term(:)
-type (em_taylor_term_struct), pointer :: tm
+type (gg_taylor_term_struct), allocatable :: term(:)
+type (gg_taylor_term_struct), pointer :: tm
 
 real(rp) coef, deriv(0:50), z(1)
 
@@ -8139,31 +8158,31 @@ end subroutine parse_superimpose_command
 !-----------------------------------------------------------------------------------------------
 !-----------------------------------------------------------------------------------------------
 !+
-! Subroutine init_surface_segment (phot, ix, iy)
+! Subroutine init_surface_segment (phot, ix_pt, iy_pt)
 !
-! Routine to init the componentes in ele%photon%segmented%pt(ix,iy) for use with segmented surface calculations.
+! Routine to init the componentes in ele%photon%segmented%pt(ix_pt,iy_pt) for use with segmented surface calculations.
 !
 ! Input:
 !   phot    -- Surface structure.
-!   ix, iy  -- integer: index of grid point to init.
+!   ix_pt, iy_pt  -- integer: index of grid point to init.
 !-
 
-subroutine init_surface_segment (phot, ix, iy)
+subroutine init_surface_segment (phot, ix_pt, iy_pt)
 
 type (photon_element_struct), target :: phot
 type (surface_segmented_struct), pointer :: seg
 type (surface_segmented_pt_struct), pointer :: pt
 
 real(rp) zt, x0, y0, dx, dy, coef_xx, coef_xy, coef_yy, coef_diag, g(3), gs
-integer ix, iy
+integer ix_pt, iy_pt, ix, iy
 
 !
 
 seg => phot%segmented
-pt => seg%pt(ix, iy)
+pt => seg%pt(ix_pt, iy_pt)
 
-x0 = ix * seg%dr(1) + seg%r0(1)
-y0 = iy * seg%dr(2) + seg%r0(2)
+x0 = ix_pt * seg%dr(1) + seg%r0(1)
+y0 = iy_pt * seg%dr(2) + seg%r0(2)
 
 pt%x0 = x0
 pt%y0 = y0

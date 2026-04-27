@@ -278,6 +278,15 @@ parsing_loop: do
   endif
 
   !-------------------------------------------
+  ! UNDEFINED_VARS_EVALUATE_TO_ZERO
+
+  if (word_1(:ix_word) == 'UNDEFINED_VARS_EVALUATE_TO_ZERO') then
+    bp_com%undefined_vars_evaluate_to_zero = .true.
+    call parser_error('Note: Found "UNDEFINED_VARS_EVALUATE_TO_ZERO" statement.', level = s_warn$)
+    cycle parsing_loop
+  endif
+
+  !-------------------------------------------
   ! USE_LOCAL_LAT_FILE
 
   if (word_1(:ix_word) == 'USE_LOCAL_LAT_FILE') then
@@ -331,6 +340,11 @@ parsing_loop: do
     endif
     call set_env(str1, str2, err)
     if (err) call parser_error('ERROR SETTING ENVIRONMENT VARIABLE: ' // quote(str1) // ' TO: ' // quote(str2))
+    n = size(bp_com%env_var_name) + 1
+    call re_allocate (bp_com%env_var_name, n)
+    call re_allocate (bp_com%env_var_value, n)
+    bp_com%env_var_name(n)  = str1
+    bp_com%env_var_value(n) = str2
     cycle parsing_loop
   endif 
 

@@ -58,7 +58,7 @@ type (cartesian_map_struct), pointer :: ct_map
 type (cartesian_map_term1_struct), pointer :: ct_term
 type (gen_grad_map_struct), pointer :: gg_map
 type (grid_field_struct), pointer :: g_field
-type (em_taylor_term_struct), pointer :: t_term
+type (gg_taylor_term_struct), pointer :: t_term
 type (wall3d_section_struct), pointer :: section
 type (wall3d_vertex_struct), pointer :: v
 type (bmad_common_struct), parameter :: bmad_com_default = bmad_common_struct()
@@ -525,10 +525,10 @@ do ib = 0, ubound(lat%branch, 1)
     ! field overlap
 
     if (ele%n_slave_field /= 0) then
-      slave => pointer_to_slave (ele, 1, lord_type = field_lord$)
+      slave => pointer_to_slave (ele, 1, slave_type = field_slave$)
       line = trim(line) // ', field_overlaps = {' // slave%name
       do n = 2, ele%n_slave_field
-        slave => pointer_to_slave (ele, n, lord_type = field_lord$)
+        slave => pointer_to_slave (ele, n, slave_type = field_slave$)
         line = trim(line) // ', ' // slave%name
       enddo
       line = trim(line) // '}'
@@ -814,7 +814,6 @@ do ib = 0, ubound(lat%branch, 1)
     !----------------------------------------------------------------------------
     ! Write the element attributes.
 
-    fid = nint(ele%value(fiducial_pt$))
     attribute_loop: do j = 1, num_ele_attrib$
       attrib = attribute_info(ele, j)
       val = ele%value(j)
@@ -823,6 +822,7 @@ do ib = 0, ubound(lat%branch, 1)
         if (j == fintx$ .and. ele%value(fintx$) == ele%value(fint$)) cycle
         if (j == hgapx$ .and. ele%value(hgapx$) == ele%value(hgap$)) cycle
 
+        fid = nint(ele%value(fiducial_pt$))
         if (j == l$ .and. (fid == entrance_end$ .or. fid == entrance_end$)) cycle
         if (j == l_rectangle$ .and. (fid == none_pt$ .or. fid == center_pt$)) cycle
         if (j == angle$) cycle

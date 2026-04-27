@@ -682,7 +682,7 @@ case ('diagnostic_output_file')
   space_charge_com%diagnostic_output_file = unquote(value_str)
   return
 
-case ('ds_track_step', 'beam_chamber_height', 'sigma_cutoff')
+case ('ds_track_step', 'beam_chamber_height', 'sigma_cutoff', 'mesh_growth_factor', 'mesh_shrink_factor')
   call tao_evaluate_expression (value_str, 1, .false., set_val, err); if (err) return
   write (val, '(es24.16)', iostat = ios) set_val(1)
 
@@ -3109,9 +3109,9 @@ if (attribute_type(upcase(attribute)) == is_real$ .or. attribute_type(upcase(att
   enddo
 
   if (n_set == 0) then
+    call out_io (s_error$, r_name, 'NOTHING SET. TYPICAL ATTRIBUTE_FREE ERROR MESSAGE IS:')
     i = size(eles)
     call set_ele_real_attribute (ele, attribute, set_val(i), err, .true.)
-    call out_io (s_error$, r_name, 'NOTHING SET.')
     return
 
   elseif (n_eles > 1 .and. n_set /= n_eles) then

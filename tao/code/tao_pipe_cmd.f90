@@ -131,7 +131,7 @@ type (wall3d_section_struct), pointer :: sec
 type (gen_grad_map_struct), pointer :: gg_map
 type (gen_grad1_struct), pointer :: gg
 type (twiss_struct), pointer :: twiss_arr(:)
-type (em_taylor_term_struct), pointer :: em_tt
+type (gg_taylor_term_struct), pointer :: em_tt
 type (grid_field_struct), pointer :: g_field
 type (grid_field_pt1_struct), pointer :: g_pt
 type (tao_drawing_struct), pointer :: drawing
@@ -649,13 +649,13 @@ case ('bunch_comb')
   comb1 => bunch_params_comb(ix_bunch)
 
   if (comb1%ds_save < 0) then
-    call invalid ('COMB_DS_SAVE NOT POSITIVE.')
+    call invalid ('COMB_DS_SAVE IS NOT POSITIVE (WHICH IS THE DEFAULT) AND THERE IS NO COMB TO OUTPUT.')
     return
   endif
 
   n = comb1%n_pt
-  if (n < 0) then
-    call invalid ('COMB POINTS NOT CALCULATED.')
+  if (n <= 0) then
+    call invalid ('NO COMB POINTS NOT CALCULATED.')
     return
   endif
 
@@ -3911,7 +3911,7 @@ case ('ele:wake')
       lr_mode => wake%lr%mode(i)
       v_str = 'none'
       if (lr_mode%polarized) write (v_str, '(f8.3)') lr_mode%angle
-      nl=incr(nl); write (li(nl), '(4(es22.14, a), 2a)') &
+      nl=incr(nl); write (li(nl), '(3(es22.14, a), i0, 2a)') &
                 lr_mode%freq, ';', lr_mode%R_over_Q, ';', lr_mode%Q, ';', lr_mode%m, ';', v_str
     enddo
 
@@ -5010,12 +5010,15 @@ case ('lat_branch_list')  ! lat_general is deprecated.
 !     ele.ref_time, ele.ref_time_start
 !     ele.s, ele.l
 !     ele.e_tot, ele.p0c
-!     ele.mat6      ! Output: mat6(1,:), mat6(2,:), ... mat6(6,:)
-!     ele.vec0      ! Output: vec0(1), ... vec0(6)
-!     ele.c_mat     ! Output: c_mat11, c_mat12, c_mat21, c_mat22.
-!     ele.gamma_c   ! Parameter associated with coupling c-matrix.
-!     ele.XXX       ! Where XXX is a Bmad syntax element attribute. 
-!                   !   EG: ele.beta_a, ele.k1, etc.
+!     ele.mat6        ! Output: mat6(1,:); mat6(2,:); ... mat6(6,:)
+!     ele.vec0        ! Output: vec0(1); ... vec0(6)
+!     ele.c_mat       ! Output: c_mat11; c_mat12; c_mat21; c_mat22.
+!     ele.gamma_c     ! Parameter associated with coupling c-matrix.
+!     ele.XXX         ! Where XXX is a Bmad syntax element attribute. 
+!                     !   EG: ele.beta_a, ele.k1, etc.
+!     multipass_lord  ! Outpu: ix_pass; ix_multipass_lord 
+!                     !   where ix_pass is the multipass index with zero indicating not in a multipass region.
+!                     !   And ix_multipass_lord is the lord element index (Note: lords are always in branch 0).
 ! 
 !   {elements} is a string to match element names to.
 !     Use "*" to match to all elements.
@@ -7118,6 +7121,8 @@ case ('space_charge_com')
   nl=incr(nl); write(li(nl), rmt)  'beam_chamber_height;REAL;T;',              space_charge_com%beam_chamber_height
   nl=incr(nl); write(li(nl), rmt)  'lsc_sigma_cutoff;REAL;T;',                 space_charge_com%lsc_sigma_cutoff
   nl=incr(nl); write(li(nl), rmt)  'particle_sigma_cutoff;REAL;T;',            space_charge_com%particle_sigma_cutoff
+  nl=incr(nl); write(li(nl), rmt)  'mesh_growth_factor;REAL;T;',               space_charge_com%mesh_growth_factor
+  nl=incr(nl); write(li(nl), rmt)  'mesh_shrink_factor;REAL;T;',               space_charge_com%mesh_shrink_factor
 
   nl=incr(nl); write(li(nl), iamt) 'space_charge_mesh_size;INT_ARR;T',         (';', space_charge_com%space_charge_mesh_size(j), j = 1, 3)
   nl=incr(nl); write(li(nl), iamt) 'csr3d_mesh_size;INT_ARR;T',                (';', space_charge_com%csr3d_mesh_size(j), j = 1, 3)

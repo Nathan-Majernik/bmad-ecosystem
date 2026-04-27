@@ -31,6 +31,7 @@ use ptc_map_with_radiation_mod, only: ptc_rad_map_struct, ptc_setup_map_with_rad
 use photon_target_mod, only: to_surface_coords
 use expression_mod, only: expression_stack_to_string, split_expression_string
 use beam_utils, only: calc_bunch_params_z_slice
+use bmad_parser_struct, only: bp_com
 
 implicit none
 
@@ -561,6 +562,8 @@ case ('beam')
     nl=nl+1; write(lines(nl), rmt) '  %beam_chamber_height            = ', space_charge_com%beam_chamber_height
     nl=nl+1; write(lines(nl), rmt) '  %lsc_sigma_cutoff               = ', space_charge_com%lsc_sigma_cutoff
     nl=nl+1; write(lines(nl), rmt) '  %particle_sigma_cutoff          = ', space_charge_com%particle_sigma_cutoff
+    nl=nl+1; write(lines(nl), rmt) '  %mesh_growth_factor             = ', space_charge_com%mesh_growth_factor
+    nl=nl+1; write(lines(nl), rmt) '  %mesh_shrink_factor             = ', space_charge_com%mesh_shrink_factor
     nl=nl+1; write(lines(nl), imt) '  %space_charge_mesh_size         = ', space_charge_com%space_charge_mesh_size
     nl=nl+1; write(lines(nl), imt) '  %csr3d_mesh_size                = ', space_charge_com%csr3d_mesh_size
     nl=nl+1; write(lines(nl), imt) '  %n_bin                          = ', space_charge_com%n_bin
@@ -743,7 +746,7 @@ case ('branch')
 
     nl=nl+1; write(lines(nl), fmt) i, ': ', branch%name, branch%n_ele_track, branch%n_ele_max, &
               trim(species_name(branch%param%particle)), trim(species_name(branch%param%default_tracking_species)), &
-              trim(geometry_name(branch%param%geometry)), branch%param%live_branch, ele_name, branch%ele(branch%ix_fixer)%name
+              trim(geometry_name(branch%param%geometry)), branch%param%live_branch, ele_name, ele_full_name(branch%ele(branch%ix_fixer))
   enddo
 
   nl=nl+1; lines(nl) = ''
@@ -2111,14 +2114,15 @@ case ('global')
   what_to_show = 'global'
 
   do
-    call tao_next_switch (what2, [character(20):: '-optimization', '-bmad_com', &
+    call tao_next_switch (what2, [character(20):: '-optimization', '-bmad_com', '-environment', &
                     '-csr_param', '-space_charge_com', '-ran_state', '-ptc_com', '-internal'], .true., switch, err)
     if (err) return
 
     select case (switch)
     case ('')
       exit
-    case ('-optimization', '-bmad_com', '-csr_param', '-space_charge_com', '-ran_state', '-ptc_com', '-internal')
+    case ('-optimization', '-bmad_com', '-csr_param', '-space_charge_com', '-ran_state', &
+          '-ptc_com', '-internal', '-environment')
       what_to_show = switch
     case default
       call out_io (s_error$, r_name, 'EXTRA STUFF ON LINE: ' // switch)
@@ -2127,6 +2131,11 @@ case ('global')
   enddo
 
   select case (what_to_show)
+  case ('-environment')
+    do j = 1, size(bp_com%env_var_name)
+      nl=nl+1; lines(nl) = trim(bp_com%env_var_name(j)) // '=' // trim(bp_com%env_var_value(j))
+    enddo
+
   case ('global')
     nl=nl+1; lines(nl) = 'Tao Global parameters [Note: To print optimizer globals use: "show optimizer"]'
     nl=nl+1; write(lines(nl), lmt) '  %beam_timer_on                 = ', s%global%beam_timer_on
@@ -2307,6 +2316,8 @@ case ('global')
     nl=nl+1; write(lines(nl), rmt) '  %beam_chamber_height            = ', space_charge_com%beam_chamber_height
     nl=nl+1; write(lines(nl), rmt) '  %lsc_sigma_cutoff               = ', space_charge_com%lsc_sigma_cutoff
     nl=nl+1; write(lines(nl), rmt) '  %particle_sigma_cutoff          = ', space_charge_com%particle_sigma_cutoff
+    nl=nl+1; write(lines(nl), rmt) '  %mesh_growth_factor             = ', space_charge_com%mesh_growth_factor
+    nl=nl+1; write(lines(nl), rmt) '  %mesh_shrink_factor             = ', space_charge_com%mesh_shrink_factor
     nl=nl+1; write(lines(nl), imt) '  %space_charge_mesh_size         = ', space_charge_com%space_charge_mesh_size
     nl=nl+1; write(lines(nl), imt) '  %csr3d_mesh_size                = ', space_charge_com%csr3d_mesh_size
     nl=nl+1; write(lines(nl), imt) '  %n_bin                          = ', space_charge_com%n_bin

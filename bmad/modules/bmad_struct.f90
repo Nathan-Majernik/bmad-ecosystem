@@ -19,7 +19,7 @@ private next_in_branch
 ! IF YOU CHANGE THE LAT_STRUCT OR ANY ASSOCIATED STRUCTURES YOU MUST INCREASE THE VERSION NUMBER !!!
 ! THIS IS USED BY BMAD_PARSER TO MAKE SURE DIGESTED FILES ARE OK.
 
-integer, parameter :: bmad_inc_version$ = 355
+integer, parameter :: bmad_inc_version$ = 358
 
 !+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 !+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -141,7 +141,7 @@ integer, parameter :: minor_slave$ = 1, super_slave$ = 2, free$ = 3
 integer, parameter :: group_lord$ = 4, super_lord$ = 5, overlay_lord$ = 6
 integer, parameter :: girder_lord$ = 7, multipass_lord$ = 8, multipass_slave$ = 9
 integer, parameter :: not_a_lord$ = 10, slice_slave$ = 11, control_lord$ = 12, ramper_lord$ = 13
-integer, parameter :: governor$ = 14, field_lord$ = 15    ! governor$ = Union of overlay and group lords.
+integer, parameter :: governor$ = 14, field_lord$ = 15, field_slave$ = 16  ! governor$ = Union of overlay and group lords.
 integer, parameter :: multipole_source$ = -1   ! Used with pointer_to_lord(...)
 
 character(20), parameter :: control_name(13) = [character(20):: &
@@ -817,17 +817,17 @@ end type
 ! For each plane a taylor series is used to calculate the field components.
 ! The 2-vector of %expn(2) is (x, y).
 
-type em_taylor_term_struct
+type gg_taylor_term_struct
   real(rp) :: coef = 0
   integer :: expn(2) = 0
 end type
 
-type em_taylor_struct
+type gg_taylor_struct
   real (rp) :: ref = 0
-  type (em_taylor_term_struct), allocatable :: term(:)
+  type (gg_taylor_term_struct), allocatable :: term(:)
 end type
 
-! Gfortran bug: "field(3) = em_taylor_struct()" not accepted.
+! Gfortran bug: "field(3) = gg_taylor_struct()" not accepted.
 
 ! Unit and S-Matrices
 
@@ -1787,7 +1787,7 @@ integer, parameter :: gradient$ = 6, k3$ = 6, noise$ = 6, new_branch$ = 6, ix_br
                       g$ = 6, symmetry$ = 6, field_scale_factor$ = 6, pc_out_max$ = 6
 integer, parameter :: dg$ = 7, bbi_const$ = 7, osc_amplitude$ = 7, ix_to_branch$ = 7, angle_out_max$ = 7, &
                       gradient_err$ = 7, critical_angle$ = 7, bragg_angle_in$ = 7, spin_dn_dpz_x$ = 7
-integer, parameter :: delta_e_ref$ = 8, interpolation$ = 8, bragg_angle_out$ = 8, k1x$ = 8, spin_dn_dpz_y$ = 8, &
+integer, parameter :: interpolation$ = 8, bragg_angle_out$ = 8, k1x$ = 8, spin_dn_dpz_y$ = 8, &
                       charge$ = 8, x_gain_calib$ = 8, ix_to_element$ = 8, voltage$ = 8, g_tot$ = 8
 integer, parameter :: rho$ = 9, voltage_err$ = 9, bragg_angle$ = 9, k1y$ = 9, n_particle$ = 9, spin_dn_dpz_z$ = 9
 integer, parameter :: fringe_type$ = 10, dbragg_angle_de$ = 10
@@ -1834,7 +1834,7 @@ integer, parameter :: cmat_12$ = 30, dtheta_origin$ = 30, b_param$ = 30, l_chord
                       scale_field_to_one$ = 30, voltage_tot$ = 30, scatter_method$ = 30
 integer, parameter :: cmat_21$ = 31, l_active$ = 31, dphi_origin$ = 31, split_id$ = 31, ref_cap_gamma$ = 31, &
                       l_soft_edge$ = 31, transverse_sigma_cut$ = 31, pz_aperture_center$ = 31, &
-                      mean_excitation_energy$ = 31, fiducial_pt$ = 31
+                      mean_excitation_energy$ = 31, fiducial_pt$ = 31, delta_e_ref$ = 31
 integer, parameter :: cmat_22$ = 32, dpsi_origin$ = 32, t_offset$ = 32, ds_slice$ = 32, &
                       use_reflectivity_table$ = 32, init_needed$ = 32, longitudinal_mode$ = 32
 integer, parameter :: angle$ = 33, n_cell$ = 33, mode_flip$ = 33, crossing_time$ = 33, x_kick$ = 33
@@ -2169,6 +2169,10 @@ type space_charge_common_struct                   ! Common block for space charg
                                                   !   If a bin sigma is < cutoff * sigma_ave then ignore.
   real(rp) :: particle_sigma_cutoff = -1          ! 3D SC calc cutoff for particles with (x,y,z) position far from the center.
                                                   !  Negative or zero means ignore.
+  real(rp) :: mesh_growth_factor = 0.1             ! Fractional padding when growing SC mesh (default: 10%).
+                                                  !  Set to 0 for tight-fit (no caching speedup).
+  real(rp) :: mesh_shrink_factor = 0.1             ! Fractional threshold for shrinking SC mesh (default: 10%).
+                                                  !  Mesh shrinks when bunch fills < (1-this) of the mesh range.
   integer :: space_charge_mesh_size(3) = [32, 32, 64]  ! Gird size for fft_3d space charge calc.
   integer :: csr3d_mesh_size(3) = [32, 32, 64]         ! Gird size for CSR.
   integer :: n_bin = 0                            ! Number of bins used
@@ -2689,16 +2693,16 @@ end function is_attribute
 !------------------------------------------------------------------------
 !------------------------------------------------------------------------
 !+
-! Function pointer_to_slave (lord, ix_slave, control, lord_type, ix_lord_back, ix_control, ix_ic) result (slave_ptr)
+! Function pointer_to_slave (lord, ix_slave, control, slave_type, ix_lord_back, ix_control, ix_ic) result (slave_ptr)
 !
 ! Function to point to a slave of a lord.
 ! Note: Ramper lords do not have any associated slaves (slaves are assigned dynamically at run time).
 !
-! If lord_type = all$ (the default) the range for ix_slave is:
+! If slave_type = all$ (the default) the range for ix_slave is:
 !   1 to lord%n_slave                                 for "regular" slaves.
 !   lord%n_slave+1 to lord%n_slave+lord%n_slave_field for field overlap slaves.
 !
-! If lord_type = field_lord$, only the field overlap slaves may be accessed and the range for ix_slave is:
+! If slave_type = field_slave$, only the field overlap slaves may be accessed and the range for ix_slave is:
 !   1 to lord%n_slave_field  
 !
 ! Also see:
@@ -2710,7 +2714,7 @@ end function is_attribute
 ! Input:
 !   lord             -- ele_struct: Lord element
 !   ix_slave         -- integer: Index of the slave in the list of slaves controled by the lord.. 
-!   lord_type        -- integer, optional: See above.
+!   slave_type        -- integer, optional: See above.
 !
 ! Output:
 !   slave_ptr      -- ele_struct, pointer: Pointer to the slave.
@@ -2723,7 +2727,7 @@ end function is_attribute
 !   ix_ic          -- integer, optional: Index of the lat%ic(:) element associated with the control argument.
 !-
 
-function pointer_to_slave (lord, ix_slave, control, lord_type, ix_lord_back, ix_control, ix_ic) result (slave_ptr)
+function pointer_to_slave (lord, ix_slave, control, slave_type, ix_lord_back, ix_control, ix_ic) result (slave_ptr)
 
 implicit none
 
@@ -2733,17 +2737,25 @@ type (ele_struct), pointer :: slave_ptr
 type (control_struct), pointer :: con
 type (lat_struct), pointer :: lat
 
-integer, optional :: ix_lord_back, lord_type, ix_control, ix_ic
-integer i, ix, ix_slave, icon, ixs
+integer, optional :: ix_lord_back, slave_type, ix_control, ix_ic
+integer i, ix, ix_slave, icon, ixs, s_type
+character(*), parameter :: r_name = 'pointer_to_slave'
 
 !
 
-ixs = ix_slave
 if (present(ix_control)) ix_control = -1
 if (present(ix_ic)) ix_ic = -1
 if (present(ix_lord_back)) ix_lord_back = -1
 
-if (integer_option(all$, lord_type) == field_lord$) ixs = ixs + lord%n_slave
+s_type = integer_option(all$, slave_type)
+if (s_type == field_slave$) then
+  ixs = ix_slave + lord%n_slave
+elseif (s_type == all$) then
+  ixs = ix_slave
+else
+  call out_io(s_fatal$, r_name, 'LOGIC BUG. PLEASE REPORT.')
+  stop
+endif
 
 if (ixs > lord%n_slave+lord%n_slave_field .or. ix_slave < 1) then
   nullify(slave_ptr)
