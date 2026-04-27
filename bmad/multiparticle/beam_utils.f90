@@ -2,6 +2,7 @@ module beam_utils
 
 use beam_file_io
 use wake_mod
+use gpu_tracking_mod
 
 private init_random_distribution, init_grid_distribution
 private init_ellipse_distribution, init_kv_distribution
@@ -45,14 +46,31 @@ type (branch_struct), pointer :: branch
 real(rp) charge, ds_wake
 
 integer, optional :: direction
-integer i, j, n, jj
+integer i, j, n
 logical err_flag, finished, thread_safe
+logical gpu_did_track
 
 character(*), parameter :: r_name = 'track1_bunch_hom'
 
 ! Note: PTC tracking is not not thread safe.
 
 branch => pointer_to_branch(ele)
+
+! GPU eligibility: common predicate for persistent and per-element paths.
+! Excludes spin tracking, high-energy SC, backward tracking, and CSR/SC sub-stepping.
+gpu_did_track = .false.
+if (bmad_com%gpu_tracking_on .and. &
+    .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
+    .not. (bmad_com%csr_and_space_charge_on .and. &
+           (ele%csr_method /= off$ .or. ele%space_charge_method /= off$)) .and. &
+    bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+
+  ! Fast path: try persistent GPU session (data already on device from previous element).
+  ! Skips all O(N_particle) CPU setup (direction assignment, wake check, SoA conversion).
+  call gpu_persistent_track_element(bunch, ele, branch%param, gpu_did_track)
+  if (gpu_did_track) return
+endif
+
 bunch%particle%direction = integer_option(1, direction)
 if (ele%tracking_method == taylor$ .and. .not. associated(ele%taylor(1)%term)) call ele_to_taylor(ele)
 thread_safe = (ele%tracking_method /= symp_lie_ptc$ .and. global_com%mp_threading_is_safe)
@@ -64,6 +82,52 @@ call save_a_bunch_step (ele, bunch, bunch_track, 0.0_rp)
 
 wake_ele => pointer_to_wake_ele(ele, ds_wake)
 if (.not. associated (wake_ele) .or. (.not. bmad_com%sr_wakes_on .and. .not. bmad_com%lr_wakes_on)) then
+
+  ! Per-element GPU path: persistent path declined (element can't stay on device).
+  ! The outer GPU eligibility was already checked above (lines 62-72).
+  if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
+      .not. bmad_com%spin_tracking_on .and. &
+      bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+      call check_entrance_aperture_for_gpu(bunch, ele, branch%param)
+
+      select case (ele%key)
+      case (drift$)
+        call track_bunch_thru_drift_gpu(bunch, ele, gpu_did_track)
+      case (quadrupole$)
+        call track_bunch_thru_quad_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (sextupole$, octupole$, thick_multipole$, elseparator$)
+        call track_bunch_thru_sextupole_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (sbend$, rf_bend$)
+        call track_bunch_thru_bend_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (lcavity$)
+        call track_bunch_thru_lcavity_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (pipe$, monitor$, instrument$)
+        call track_bunch_thru_pipe_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (kicker$, hkicker$, vkicker$)
+        call track_bunch_thru_sextupole_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (solenoid$)
+        call track_bunch_thru_solenoid_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (sol_quad$)
+        call track_bunch_thru_sol_quad_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (wiggler$, undulator$)
+        call track_bunch_thru_wiggler_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (patch$)
+        call track_bunch_thru_patch_gpu(bunch, ele, branch%param, gpu_did_track)
+      case (marker$)
+        gpu_did_track = .true.  ! Zero-length, no tracking needed
+      end select
+
+      if (gpu_did_track) then
+        call check_apertures_after_gpu(bunch, ele, branch%param)
+        do j = 1, size(bunch%particle)
+          if (bunch%particle(j)%state == alive$) then
+            if (orbit_too_large(bunch%particle(j), branch%param)) cycle
+          endif
+        enddo
+        bunch%charge_live = sum(bunch%particle(:)%charge, mask = (bunch%particle(:)%state == alive$))
+        return
+      endif
+  endif
 
   if (bmad_com%radiation_damping_on .or. bmad_com%radiation_fluctuations_on) call radiation_map_setup(ele, err_flag)
   !$OMP parallel do if (thread_safe)
@@ -163,7 +227,34 @@ end subroutine track1_bunch_hom
 !--------------------------------------------------------------------------
 !--------------------------------------------------------------------------
 !+
-! Subroutine init_beam_distribution (ele, param, beam_init, beam, err_flag, modes, beam_init_set, 
+! Subroutine check_apertures_after_gpu (bunch, ele, param)
+!
+! After GPU batch tracking, check exit aperture for all alive particles.
+! This replicates the check_aperture_limit call that track1 does at the
+! element exit (second_track_edge$).
+!-
+
+subroutine check_apertures_after_gpu (bunch, ele, param)
+
+type (bunch_struct), intent(inout) :: bunch
+type (ele_struct),   intent(inout) :: ele
+type (lat_param_struct), intent(inout) :: param
+integer :: j
+
+if (.not. bmad_com%aperture_limit_on) return
+
+do j = 1, size(bunch%particle)
+  if (bunch%particle(j)%state /= alive$) cycle
+  call check_aperture_limit(bunch%particle(j), ele, second_track_edge$, param)
+enddo
+
+end subroutine check_apertures_after_gpu
+
+!--------------------------------------------------------------------------
+!--------------------------------------------------------------------------
+!--------------------------------------------------------------------------
+!+
+! Subroutine init_beam_distribution (ele, param, beam_init, beam, err_flag, modes, beam_init_set,
 !                                                                     print_p0c_shift_warning, conserve_momentum)
 !
 ! Subroutine to initialize a beam of particles. 

@@ -185,12 +185,8 @@ case (sextupole$)
     call hard_multipole_edge_kick (hard_ele, param, particle_at, orb, mat6, make_matrix)
   endif
 
-case (sbend$)
+case (sbend$, rf_bend$)
   call bend_edge_kick (hard_ele, param, particle_at, orb, mat6, make_matrix, track_spn)
-
-case (rf_bend$)
-  call out_io (s_fatal$, r_name, 'BMAD BOOKKEEPING ERROR. PLEASE REPORT THIS.')
-  stop
 
 ! Sad_mult edge fields are 
 

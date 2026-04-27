@@ -1,0 +1,18 @@
+no_digested
+
+parameter[lattice] = "GPU tracking quad with elliptical aperture"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+q1: quadrupole, L = 0.5, k1 = 0.7, aperture_type = elliptical,
+    x1_limit = 2e-4, x2_limit = 2e-4,
+    y1_limit = 2e-4, y2_limit = 2e-4
+
+lat: line = (q1)
+
+use, lat

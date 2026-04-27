@@ -2338,6 +2338,12 @@ type bmad_common_struct
   logical :: aperture_limit_on = .true.                ! Use apertures in tracking?
   logical :: spin_n0_direction_user_set = .false.      ! User sets direction of n0 for closed geometry branches?
   logical :: debug = .false.                           ! Used for code debugging.
+  logical :: gpu_tracking_on = .false.                 ! GPU-accelerated batch tracking for supported elements.
+                                                       !   Initialized from ACC_ENABLE_GPU_TRACKING env var.
+                                                       !   Falls back to CPU silently when GPU can't handle an element.
+  logical :: gpu_deferred_flush = .false.              ! Defer GPU→CPU particle download to caller.
+                                                       !   When true, track_bunch does not flush persistent GPU data.
+                                                       !   Caller (e.g. Tao) flushes at save points and end of tracking.
 end type
   
 type (bmad_common_struct), save, target :: bmad_com

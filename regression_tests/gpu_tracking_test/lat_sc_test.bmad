@@ -1,0 +1,16 @@
+no_digested
+
+parameter[lattice] = "GPU space charge test"
+
+beginning[beta_a] = 1
+beginning[beta_b] = 1
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+d1: drift, L = 0.5, space_charge_method = fft_3d
+
+lat: line = (d1)
+
+use, lat

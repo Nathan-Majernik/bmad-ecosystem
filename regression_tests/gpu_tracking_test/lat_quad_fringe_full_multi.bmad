@@ -1,0 +1,22 @@
+no_digested
+
+parameter[lattice] = "GPU quad full fringe — multi-element for device-resident path"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+d1: drift, L = 0.5
+q1: quadrupole, L = 0.6, k1 = 1.2, fringe_type = full,
+    fq1 = 0.15, fq2 = 0.3
+d2: drift, L = 0.3
+q2: quadrupole, L = 0.4, k1 = -0.8, fringe_type = full,
+    fq1 = 0.1, fq2 = 0.2
+d3: drift, L = 0.5
+
+lat: line = (d1, q1, d2, q2, d3)
+
+use, lat

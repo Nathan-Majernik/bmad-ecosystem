@@ -1,0 +1,12 @@
+parameter[geometry] = open
+parameter[particle] = electron
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+beginning[p0c] = 1e9
+
+d1: drift, l = 0.5
+es1: elseparator, l = 0.6, hkick = 0.001, vkick = 0.0005, ds_step = 0.05
+d2: drift, l = 0.5
+
+lat: line = (d1, es1, d2)
+use, lat

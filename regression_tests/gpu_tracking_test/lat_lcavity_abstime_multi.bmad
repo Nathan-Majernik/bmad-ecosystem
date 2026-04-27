@@ -1,0 +1,28 @@
+no_digested
+
+parameter[lattice] = "GPU lcavity absolute time multi-cavity"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+parameter[absolute_time_tracking] = T
+
+! Two cavities separated by a 10m drift.
+! The second cavity has a large ref_time_start (~33ns at c).
+! If the GPU kernel doesn't subtract ref_time_start, the phase
+! for the second cavity will be completely wrong.
+
+d1: drift, L = 10.0
+
+lc1: lcavity, L = 1.0, rf_frequency = 1.3e9, gradient = 1e5,
+    n_rf_steps = 10
+
+lc2: lcavity, L = 1.0, rf_frequency = 1.3e9, gradient = 1e5,
+    n_rf_steps = 10
+
+lat: line = (lc1, d1, lc2)
+
+use, lat

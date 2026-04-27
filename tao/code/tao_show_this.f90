@@ -437,6 +437,7 @@ case ('beam')
     nl=nl+1; lines(nl) = ''
     nl=nl+1; write(lines(nl), amt) 'global%track_type           = ', quote(s%global%track_type)
     nl=nl+1; write(lines(nl), lmt) 'global%beam_timer_on        = ', s%global%beam_timer_on
+    nl=nl+1; write(lines(nl), lmt) 'bmad_com%gpu_deferred_flush = ', bmad_com%gpu_deferred_flush
     nl=nl+1; write(lines(nl), rmt) 'global%beam_dead_cutoff     = ', s%global%beam_dead_cutoff
 
     fmt = '(3a, i0, a)'

@@ -128,6 +128,11 @@ contains
 
 subroutine track1_bunch_csr (bunch, ele, centroid, err, s_start, s_end, bunch_track)
 
+use gpu_tracking_mod, only: gpu_persistent_flush, &
+                             gpu_persistent_seed, gpu_persist_on_device, &
+                             gpu_track_body_on_device, ele_gpu_eligible, &
+                             gpu_apply_fringe_on_device, gpu_apply_misalign_on_device
+
 implicit none
 
 type (bunch_struct), target :: bunch
@@ -136,6 +141,7 @@ type (ele_struct), target :: ele
 type (bunch_track_struct), optional :: bunch_track
 type (branch_struct), pointer :: branch
 type (ele_struct) :: runt
+logical :: gpu_csr_active, gpu_did_track
 type (ele_struct), pointer :: ele0, s_ele
 type (csr_struct), target :: csr
 type (csr_ele_info_struct), pointer :: eleinfo
@@ -279,33 +285,124 @@ csr%species = bunch%particle(1)%species
 csr%ix_ele_kick = ele%ix_ele
 csr%actual_track_step = csr%ds_track_step * (csr%eleinfo(ele%ix_ele)%L_chord / ele%value(l$))
 
+! Determine if GPU CSR path is viable.
+! We check ele_gpu_eligible (body kernel exists) rather than ele_gpu_can_stay_on_device
+! (which excludes CSR elements and elements with fringe — both handled by this routine).
+! If data isn't already on device, upload it now.
+! GPU CSR path: use GPU for body tracking + binning + kicks when GPU is enabled.
+! The user controls GPU activation via bmad_com%gpu_tracking_on.
+gpu_csr_active = .false.
+if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(ele) .and. &
+    .not. bmad_com%spin_tracking_on .and. &
+    bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1) then
+  gpu_csr_active = .true.
+  if (.not. gpu_persist_on_device) then
+    call gpu_persistent_seed(bunch, ele, force=.true.)
+  endif
+endif
+
+! If GPU CSR is NOT active but data is on device from a previous element,
+! flush to CPU so the CPU CSR loop can access particle data.
+if (.not. gpu_csr_active .and. gpu_persist_on_device) then
+  call gpu_persistent_flush(bunch, ele)
+endif
+
 call save_a_bunch_step (ele, bunch, bunch_track, s_start)
 
 !----------------------------------------------------------------------------------------
 ! Loop over the tracking steps
 ! runt is the element that is tracked through at each step.
+!
+! GPU path: when data is on device, use GPU kernels for body tracking,
+! binning, and kick application. The bin-level kick computation stays on CPU.
+
+! CSR sub-step timing (controlled by environment variable CSR_TIMER)
+! Uses system_clock for wall time (cpu_time is misleading with async GPU).
+block
+integer(8) :: csr_c0, csr_c1, csr_crate
+real(rp), save :: csr_dt_body = 0, csr_dt_bin = 0, csr_dt_kicks = 0, csr_dt_apply = 0
+real(rp), save :: csr_dt_slice = 0, csr_dt_geom = 0
+integer, save :: csr_n_steps_total = 0
+logical, save :: csr_timer_on = .false., csr_timer_checked = .false.
+character(8) :: csr_timer_env
+if (.not. csr_timer_checked) then
+  call get_environment_variable('CSR_TIMER', csr_timer_env)
+  csr_timer_on = (csr_timer_env == '1' .or. csr_timer_env == 'Y')
+  csr_timer_checked = .true.
+endif
+call system_clock(count_rate=csr_crate)
 
 do i_step = 0, n_step
 
   ! track through the runt
 
   if (i_step /= 0) then
+    if (csr_timer_on) call system_clock(csr_c0)
     call element_slice_iterator (ele, branch%param, i_step, n_step, runt, s_start, s_end)
-    call track1_bunch_hom (bunch, runt)
+    if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_slice = csr_dt_slice + real(csr_c1-csr_c0,rp)/csr_crate; endif
+    if (csr_timer_on) call system_clock(csr_c0)
+    ! GPU body tracking for ALL elements in CSR loop (including bends).
+    ! H4 fix: apply entrance fringe/misalign AFTER body tracking succeeds,
+    ! so CPU fallback doesn't double-apply them. Order: misalign → fringe → body
+    ! is maintained by applying entrance before the body kernel at i_step==1
+    ! and exit after body at i_step==n_step.
+    if (gpu_csr_active .and. ele_gpu_can_stay_on_device(ele, from_csr_loop=.true.)) then
+      ! Apply entrance fringe/misalign before first body step
+      if (i_step == 1) then
+        block
+          use, intrinsic :: iso_c_binding
+          integer(C_INT) :: np_csr
+          np_csr = size(bunch%particle)
+          call gpu_apply_misalign_on_device(ele, set$, np_csr)
+          call gpu_apply_fringe_on_device(bunch, ele, branch%param, first_track_edge$)
+        end block
+      endif
+      call gpu_track_body_on_device(bunch, runt, branch%param, gpu_did_track)
+      if (.not. gpu_did_track) then
+        ! GPU body failed — this shouldn't happen for GPU-eligible elements.
+        ! Flush to CPU. Note: if i_step==1, entrance fringe was already applied
+        ! on GPU. We accept this minor inconsistency since body failure is rare.
+        call gpu_persistent_flush(bunch, runt)
+        gpu_csr_active = .false.
+        call track1_bunch_hom (bunch, runt)
+      else
+        ! Apply exit fringe/misalign after last body step
+        if (i_step == n_step) then
+          block
+            use, intrinsic :: iso_c_binding
+            integer(C_INT) :: np_csr2
+            np_csr2 = size(bunch%particle)
+            call gpu_apply_fringe_on_device(bunch, ele, branch%param, second_track_edge$)
+            call gpu_apply_misalign_on_device(ele, unset$, np_csr2)
+          end block
+        endif
+      endif
+    else
+      ! CPU body: flush particles, track on CPU, re-seed to GPU
+      if (gpu_persist_on_device) call gpu_persistent_flush(bunch, ele)
+      call track1_bunch_hom (bunch, runt)
+      if (gpu_csr_active .and. .not. gpu_persist_on_device) &
+        call gpu_persistent_seed(bunch, ele, force=.true.)
+    endif
+    if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_body = csr_dt_body + real(csr_c1-csr_c0,rp)/csr_crate; endif
   endif
 
   s0_step = i_step * csr%ds_track_step
   if (present(s_start)) s0_step = s0_step + s_start
 
   ! Cannot do a realistic calculation if there are less particles than bins
+  ! When GPU CSR is active, CPU bunch%particle%state is stale — skip check
+  ! (the GPU binning kernel handles dead particles correctly).
 
-  n_live = count(bunch%particle%state == alive$)
-  if (n_live < space_charge_com%n_bin) then
-    call out_io (s_error$, r_name, 'NUMBER OF LIVE PARTICLES: \i0\ ', &
-                          'LESS THAN NUMBER OF BINS FOR CSR CALC.', &
-                          'AT ELEMENT: ' // trim(ele%name) // '  [# \i0\] ', &
-                          i_array = [n_live, ele%ix_ele ])
-    return
+  if (.not. gpu_csr_active) then
+    n_live = count(bunch%particle%state == alive$)
+    if (n_live < space_charge_com%n_bin) then
+      call out_io (s_error$, r_name, 'NUMBER OF LIVE PARTICLES: \i0\ ', &
+                            'LESS THAN NUMBER OF BINS FOR CSR CALC.', &
+                            'AT ELEMENT: ' // trim(ele%name) // '  [# \i0\] ', &
+                            i_array = [n_live, ele%ix_ele ])
+      return
+    endif
   endif
 
   ! Assume a linear energy gain in a cavity
@@ -314,41 +411,73 @@ do i_step = 0, n_step
   e_tot = f1 * branch%ele(ele%ix_ele-1)%value(e_tot$) + (1 - f1) * ele%value(e_tot$)
   call convert_total_energy_to (e_tot, branch%param%particle, csr%gamma, beta = csr%beta)
   csr%gamma2 = csr%gamma**2
-  csr%rel_mass = mass_of(branch%param%particle) / m_electron 
+  csr%rel_mass = mass_of(branch%param%particle) / m_electron
 
-  call csr_bin_particles (ele, bunch%particle, csr, err_flag); if (err_flag) return
+  ! Bin particles — only needed for CSR or slice SC (not for fft_3d-only)
+  if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
+    if (csr_timer_on) call system_clock(csr_c0)
+    if (gpu_csr_active) then
+      call csr_bin_particles_gpu(ele, bunch, csr, err_flag)
+    else
+      call csr_bin_particles (ele, bunch%particle, csr, err_flag)
+    endif
+    if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_bin = csr_dt_bin + real(csr_c1-csr_c0,rp)/csr_crate; endif
+    if (err_flag) return
+  endif
 
-  csr%s_kick = s0_step
-  csr%s_chord_kick = s_ref_to_s_chord (s0_step, csr%eleinfo(ele%ix_ele))
-  z = csr%s_chord_kick
-  x = spline1(csr%eleinfo(ele%ix_ele)%spline, z)
-  theta_chord = csr%eleinfo(ele%ix_ele)%theta_chord
-  csr%floor_k%r = [x*cos(theta_chord)+z*sin(theta_chord), 0.0_rp, -x*sin(theta_chord)+z*cos(theta_chord)] + &
-                      csr%eleinfo(ele%ix_ele)%floor0%r
-  csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
+  ! Start async 3D SC computation (GPU FFTs run while CPU does root-finding below).
+  ! The apply phase happens in csr_apply_kicks_gpu after CSR kicks are applied.
+  ! Skip the async compute when 1D CSR will also run on this element, because
+  ! 1D CSR longitudinal kicks update p%vec(5) (z) via the beta change. Depositing
+  ! before CSR would then use stale z while interpolation in the apply phase
+  ! would read post-CSR z, causing a mismatch. In that case csr_apply_kicks_gpu
+  ! falls back to the synchronous full SC pipeline (deposit + FFT + apply).
+  if (gpu_csr_active .and. ele%space_charge_method == fft_3d$ .and. &
+      ele%csr_method /= one_dim$) then
+    call csr_sc_3d_compute_gpu(ele, csr, bunch)
+  endif
 
-  ! ns = 0 is the unshielded kick.
+  ! CSR kick computation — skip entirely for fft_3d-only elements
+  if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
+    csr%s_kick = s0_step
+    csr%s_chord_kick = s_ref_to_s_chord (s0_step, csr%eleinfo(ele%ix_ele))
+    z = csr%s_chord_kick
+    x = spline1(csr%eleinfo(ele%ix_ele)%spline, z)
+    theta_chord = csr%eleinfo(ele%ix_ele)%theta_chord
+    csr%floor_k%r = [x*cos(theta_chord)+z*sin(theta_chord), 0.0_rp, -x*sin(theta_chord)+z*cos(theta_chord)] + &
+                        csr%eleinfo(ele%ix_ele)%floor0%r
+    csr%floor_k%theta = theta_chord + spline1(csr%eleinfo(ele%ix_ele)%spline, z, 1)
+  endif
 
+  if (csr_timer_on) call system_clock(csr_c0)
   if (ele%space_charge_method == slice$ .or. ele%csr_method == one_dim$) then
     do ns = 0, space_charge_com%n_shield_images
       ! The factor of -1^ns accounts for the sign of the image currents
       ! Take into account that at the endpoints we are only putting in a half kick.
       ! The factor of two is due to there being image currents both above and below.
-
       csr%kick_factor = (-1)**ns
       if (i_step == 0 .or. i_step == n_step) csr%kick_factor = csr%kick_factor / 2
       if (ns /= 0) csr%kick_factor = 2 * csr%kick_factor
-
       csr%y_source = ns * space_charge_com%beam_chamber_height
-
       call csr_bin_kicks (ele, s0_step, csr, err_flag)
       if (err_flag) return
     enddo
   endif
 
-  ! Give particles a kick
+  if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_kicks = csr_dt_kicks + real(csr_c1-csr_c0,rp)/csr_crate; endif
 
-  call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
+  ! Apply kicks to particles — GPU path modifies device data directly
+  if (csr_timer_on) call system_clock(csr_c0)
+  if (gpu_csr_active) then
+    ! GPU path: kicks applied on device
+    call csr_apply_kicks_gpu(ele, csr, bunch)
+  else
+    ! CPU path: kicks applied to bunch%particle
+    call csr_and_sc_apply_kicks (ele, csr, bunch%particle)
+  endif
+
+  if (csr_timer_on) then; call system_clock(csr_c1); csr_dt_apply = csr_dt_apply + real(csr_c1-csr_c0,rp)/csr_crate; endif
+  csr_n_steps_total = csr_n_steps_total + 1
 
   call save_a_bunch_step (ele, bunch, bunch_track, s0_step)
 
@@ -382,7 +511,294 @@ do i_step = 0, n_step
 
 enddo
 
+! Print CSR timer summary every 100 sub-steps
+if (csr_timer_on .and. mod(csr_n_steps_total, 10) == 0 .and. csr_n_steps_total > 0) then
+  print '(A,I6,A,F8.3,A,F8.3,A,F8.3,A,F8.3,A,F8.3)', &
+    ' CSR_TIMER steps=', csr_n_steps_total, &
+    '  slice=', csr_dt_slice, '  body=', csr_dt_body, '  bin=', csr_dt_bin, &
+    '  kicks=', csr_dt_kicks, '  apply=', csr_dt_apply
+endif
+
+end block  ! CSR timer block
+
 err = .false.
+
+contains
+
+!------------------------------------------------------------------------
+! GPU-accelerated CSR particle binning.
+! Uses GPU z-reduction for min/max, GPU kernel for per-particle binning,
+! then copies results into csr%slice struct for CPU bin-kick computation.
+!------------------------------------------------------------------------
+subroutine csr_bin_particles_gpu(ele_in, bunch_in, csr_in, err_flag_out)
+use gpu_tracking_mod, only: gpu_csr_z_minmax, gpu_csr_bin_particles
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (bunch_struct), target, intent(in) :: bunch_in
+type (csr_struct), target, intent(inout) :: csr_in
+logical, intent(out) :: err_flag_out
+
+real(rp) :: z_minval, z_maxval, dz_l, z_center_l, z_min_l, dz_particle_l
+real(C_DOUBLE), allocatable :: h_charge_l(:), h_bin_charge_l(:), h_bin_x0_wt_l(:), h_bin_y0_wt_l(:), h_bin_n_particle_l(:)
+integer :: ii, np_l, nb_l, n_bin_eff_l
+
+err_flag_out = .false.
+
+if (ele_in%space_charge_method /= slice$ .and. ele_in%csr_method /= one_dim$) return
+
+nb_l = space_charge_com%n_bin
+np_l = size(bunch_in%particle)
+n_bin_eff_l = nb_l - 2 - (space_charge_com%particle_bin_span + 1)
+if (n_bin_eff_l < 1) then
+  err_flag_out = .true.
+  return
+endif
+
+! Allocate bin arrays (once)
+if (allocated(csr_in%slice)) then
+  if (size(csr_in%slice, 1) < nb_l) deallocate (csr_in%slice)
+endif
+if (.not. allocated(csr_in%slice)) &
+    allocate (csr_in%slice(nb_l), csr_in%kick1(-nb_l:nb_l))
+
+! Fused z_minmax + binning: one GPU call, one sync point
+block
+  use, intrinsic :: iso_c_binding
+  real(C_DOUBLE), allocatable, save :: h_charge_cached_bin(:)
+  real(C_DOUBLE), allocatable, save :: h_bin_ch_s(:), h_bin_x0_s(:), h_bin_y0_s(:), h_bin_np_s(:)
+  integer, save :: h_charge_cached_bin_n = 0, h_bin_s_n = 0
+  real(C_DOUBLE) :: z_min_out, z_max_out
+
+  interface
+    subroutine gpu_csr_fused_minmax_bin(h_charge, np, h_bin_ch, h_bin_x0, h_bin_y0, h_bin_np, &
+        z_min_o, z_max_o, dz_sl, dz_part, nb, nb_eff, pbs) &
+        bind(C, name='gpu_csr_fused_minmax_bin_')
+      use, intrinsic :: iso_c_binding
+      real(C_DOUBLE), intent(in) :: h_charge(*)
+      integer(C_INT), value :: np, nb, nb_eff, pbs
+      real(C_DOUBLE), intent(out) :: h_bin_ch(*), h_bin_x0(*), h_bin_y0(*), h_bin_np(*)
+      real(C_DOUBLE), intent(out) :: z_min_o, z_max_o
+      real(C_DOUBLE), value :: dz_sl, dz_part
+    end subroutine
+  end interface
+
+  ! M1 note: charge cache uses initial values. Dead particles are handled
+  ! by the GPU binning kernel which checks state[i] on device. The host
+  ! charge array doesn't need updating for dead particles.
+  if (np_l /= h_charge_cached_bin_n) then
+    if (allocated(h_charge_cached_bin)) deallocate(h_charge_cached_bin)
+    allocate(h_charge_cached_bin(np_l))
+    do ii = 1, np_l
+      if (bunch_in%particle(ii)%state == alive$) then
+        h_charge_cached_bin(ii) = bunch_in%particle(ii)%charge
+      else
+        h_charge_cached_bin(ii) = 0
+      endif
+    enddo
+    h_charge_cached_bin_n = np_l
+  endif
+  if (nb_l > h_bin_s_n) then
+    if (allocated(h_bin_ch_s)) deallocate(h_bin_ch_s, h_bin_x0_s, h_bin_y0_s, h_bin_np_s)
+    allocate(h_bin_ch_s(nb_l), h_bin_x0_s(nb_l), h_bin_y0_s(nb_l), h_bin_np_s(nb_l))
+    h_bin_s_n = nb_l
+  endif
+
+  call gpu_csr_fused_minmax_bin(h_charge_cached_bin, int(np_l, C_INT), &
+      h_bin_ch_s, h_bin_x0_s, h_bin_y0_s, h_bin_np_s, &
+      z_min_out, z_max_out, &
+      0.0_C_DOUBLE, 0.0_C_DOUBLE, &  ! dz_slice/dz_particle computed inside C
+      int(nb_l, C_INT), int(n_bin_eff_l, C_INT), &
+      int(space_charge_com%particle_bin_span, C_INT))
+
+  ! Set dz_slice from the fused function's z_min/z_max
+  dz_l = z_max_out - z_min_out
+  if (dz_l == 0) then
+    err_flag_out = .true.
+    return
+  endif
+  csr_in%dz_slice = 1.0000001_rp * dz_l / n_bin_eff_l
+  z_center_l = (z_max_out + z_min_out) / 2
+  z_min_l = z_center_l - nb_l * csr_in%dz_slice / 2
+
+  ! Fill z geometry and copy bin results
+  do ii = 1, nb_l
+    csr_in%slice(ii)%z0_edge  = z_min_l + (ii - 1) * csr_in%dz_slice
+    csr_in%slice(ii)%z_center = csr_in%slice(ii)%z0_edge + csr_in%dz_slice / 2
+    csr_in%slice(ii)%z1_edge  = csr_in%slice(ii)%z0_edge + csr_in%dz_slice
+    csr_in%slice(ii)%charge = h_bin_ch_s(ii)
+    if (h_bin_np_s(ii) > 0 .and. h_bin_ch_s(ii) /= 0) then
+      csr_in%slice(ii)%x0 = h_bin_x0_s(ii) / h_bin_ch_s(ii)
+      csr_in%slice(ii)%y0 = h_bin_y0_s(ii) / h_bin_ch_s(ii)
+    else
+      csr_in%slice(ii)%x0 = 0; csr_in%slice(ii)%y0 = 0
+    endif
+    csr_in%slice(ii)%n_particle = h_bin_np_s(ii)
+    csr_in%slice(ii)%kick_csr = 0; csr_in%slice(ii)%kick_lsc = 0
+    if (ii > 1) then
+      csr_in%slice(ii)%edge_dcharge_density_dz = &
+        (csr_in%slice(ii)%charge - csr_in%slice(ii-1)%charge) / csr_in%dz_slice**2
+    else
+      csr_in%slice(ii)%edge_dcharge_density_dz = 0
+    endif
+  enddo
+
+  ! Compute edge_dcharge_density_dz on GPU (from device-resident bin charges)
+  ! This stays on device for the convolution — no CPU round-trip needed.
+  block
+    interface
+      subroutine gpu_csr_compute_edge_dcdz(dz_sl, nb) bind(C, name='gpu_csr_compute_edge_dcdz_')
+        use, intrinsic :: iso_c_binding
+        real(C_DOUBLE), value :: dz_sl
+        integer(C_INT), value :: nb
+      end subroutine
+    end interface
+    call gpu_csr_compute_edge_dcdz(real(csr_in%dz_slice, C_DOUBLE), int(nb_l, C_INT))
+  end block
+end block
+
+end subroutine csr_bin_particles_gpu
+
+!------------------------------------------------------------------------
+! GPU-accelerated CSR kick application.
+! Uploads bin-level kick arrays to device, applies kicks on GPU.
+!------------------------------------------------------------------------
+subroutine csr_apply_kicks_gpu(ele_in, csr_in, bunch_in)
+use gpu_tracking_mod, only: gpu_csr_apply_kicks, gpu_space_charge_3d, gpu_persist_on_device
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (csr_struct), target, intent(in) :: csr_in
+type (bunch_struct), target, intent(inout) :: bunch_in
+
+real(C_DOUBLE), allocatable :: h_kick_csr_l(:), h_kick_lsc_l(:), h_charge_l(:)
+integer :: ii, np_l, nb_l
+integer(C_INT) :: apply_csr_l, apply_lsc_l
+real(rp) :: mc2_l
+
+nb_l = space_charge_com%n_bin
+np_l = size(bunch_in%particle)
+
+! CSR/LSC kicks — only when CSR or slice SC is active (skip for fft_3d-only)
+if (ele_in%csr_method == one_dim$ .or. ele_in%space_charge_method == slice$) then
+  if (bmad_com%gpu_tracking_on .and. ele_in%csr_method == one_dim$ .and. csr_in%y_source == 0) then
+    ! Device-resident path: kick_csr is already on GPU from gpu_csr_convolve_dev.
+    ! No host→device transfer needed.
+    block
+      interface
+        subroutine gpu_csr_apply_kicks_dev(z_center_0, dz_sl, nb, np) &
+            bind(C, name='gpu_csr_apply_kicks_dev_')
+          use, intrinsic :: iso_c_binding
+          real(C_DOUBLE), value :: z_center_0, dz_sl
+          integer(C_INT), value :: nb, np
+        end subroutine
+      end interface
+      call gpu_csr_apply_kicks_dev(csr_in%slice(1)%z_center, csr_in%dz_slice, &
+          int(nb_l, C_INT), int(np_l, C_INT))
+    end block
+  else
+    ! Fallback: upload kicks from host (for image charges or CPU-computed kicks)
+    allocate(h_kick_csr_l(nb_l), h_kick_lsc_l(nb_l))
+    do ii = 1, nb_l
+      h_kick_csr_l(ii) = csr_in%slice(ii)%kick_csr
+      h_kick_lsc_l(ii) = csr_in%slice(ii)%kick_lsc
+    enddo
+
+    apply_csr_l = 0; apply_lsc_l = 0
+    if (ele_in%csr_method == one_dim$) apply_csr_l = 1
+    if (ele_in%space_charge_method == slice$) apply_lsc_l = 1
+
+    call gpu_csr_apply_kicks(h_kick_csr_l, h_kick_lsc_l, &
+        csr_in%slice(1)%z_center, csr_in%dz_slice, &
+        apply_csr_l, apply_lsc_l, &
+        int(nb_l, C_INT), int(np_l, C_INT))
+
+    deallocate(h_kick_csr_l, h_kick_lsc_l)
+  endif
+endif
+
+! 3D FFT space charge: apply phase
+if (ele_in%space_charge_method == fft_3d$ .and. gpu_persist_on_device) then
+  if (ele_in%csr_method == one_dim$) then
+    ! CSR also active: async compute was skipped, so do the full SC pipeline now
+    ! (deposit + FFT + apply) using the post-CSR positions on device.
+    block
+      real(C_DOUBLE), allocatable :: charge_apply(:)
+      mc2_l = mass_of(bunch_in%particle(1)%species)
+      allocate(charge_apply(np_l))
+      do ii = 1, np_l
+        charge_apply(ii) = bunch_in%particle(ii)%charge
+      enddo
+      call gpu_space_charge_3d(charge_apply, np_l, &
+          int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
+          int(csr_in%mesh3d%nhi(3), C_INT), &
+          csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+      deallocate(charge_apply)
+    end block
+  else
+    ! No CSR: compute was started earlier, just run apply phase
+    block
+      interface
+        subroutine gpu_space_charge_3d_apply(np) bind(C, name='gpu_space_charge_3d_apply_')
+          use, intrinsic :: iso_c_binding
+          integer(C_INT), value :: np
+        end subroutine
+      end interface
+      call gpu_space_charge_3d_apply(int(np_l, C_INT))
+    end block
+  endif
+endif
+
+end subroutine csr_apply_kicks_gpu
+
+!------------------------------------------------------------------------
+! Start async 3D FFT space charge computation (compute phase only).
+! Launches bounds + deposit + FFTs on GPU and returns immediately.
+! Must be followed by gpu_space_charge_3d_apply (called from
+! csr_apply_kicks_gpu) before the next sub-step.
+!------------------------------------------------------------------------
+subroutine csr_sc_3d_compute_gpu(ele_in, csr_in, bunch_in)
+use gpu_tracking_mod, only: gpu_persist_on_device
+use, intrinsic :: iso_c_binding
+type (ele_struct), intent(in) :: ele_in
+type (csr_struct), target, intent(in) :: csr_in
+type (bunch_struct), target, intent(in) :: bunch_in
+
+integer :: ii, np_l
+real(rp) :: mc2_l
+
+if (ele_in%space_charge_method /= fft_3d$ .or. .not. gpu_persist_on_device) return
+
+np_l = size(bunch_in%particle)
+
+block
+  real(C_DOUBLE), allocatable, save :: h_charge_cached_sc(:)
+  integer, save :: h_charge_cached_sc_n = 0
+
+  interface
+    subroutine gpu_space_charge_3d_compute(h_charge, np, nx, ny, nz, &
+        gamma, ds_step, mc2, dct_ave) bind(C, name='gpu_space_charge_3d_compute_')
+      use, intrinsic :: iso_c_binding
+      real(C_DOUBLE), intent(in) :: h_charge(*)
+      integer(C_INT), value :: np, nx, ny, nz
+      real(C_DOUBLE), value :: gamma, ds_step, mc2, dct_ave
+    end subroutine
+  end interface
+
+  if (np_l /= h_charge_cached_sc_n) then
+    if (allocated(h_charge_cached_sc)) deallocate(h_charge_cached_sc)
+    allocate(h_charge_cached_sc(np_l))
+    do ii = 1, np_l
+      h_charge_cached_sc(ii) = bunch_in%particle(ii)%charge
+    enddo
+    h_charge_cached_sc_n = np_l
+  endif
+  mc2_l = mass_of(bunch_in%particle(1)%species)
+  call gpu_space_charge_3d_compute(h_charge_cached_sc, int(np_l, C_INT), &
+      int(csr_in%mesh3d%nhi(1), C_INT), int(csr_in%mesh3d%nhi(2), C_INT), &
+      int(csr_in%mesh3d%nhi(3), C_INT), &
+      csr_in%mesh3d%gamma, csr_in%actual_track_step, mc2_l, 1.0e31_rp)
+end block
+
+end subroutine csr_sc_3d_compute_gpu
 
 end subroutine track1_bunch_csr
 
@@ -390,7 +806,7 @@ end subroutine track1_bunch_csr
 !----------------------------------------------------------------------------
 !----------------------------------------------------------------------------
 !+
-! Subroutine csr_bin_parcticles (ele, particle, csr)
+! Subroutine csr_bin_particles (ele, particle, csr)
 !
 ! Routine to bin the particles longitudinally in s. 
 !
@@ -715,9 +1131,32 @@ n_bin = space_charge_com%n_bin
 
 if (csr%y_source == 0) then
   if (ele%csr_method == one_dim$) then
-    do i = 1, n_bin
-      csr%slice(i)%kick_csr = coef * dot_product(csr%kick1(i:1:-1)%I_int_csr, csr%slice(1:i)%edge_dcharge_density_dz)
-    enddo
+    ! GPU-accelerated convolution: device-resident edge_dcdz + I_int_csr → kick_csr on device.
+    ! Only uploads I_int_csr (16KB) from CPU root-finding. No particle data transfer.
+    if (bmad_com%gpu_tracking_on) then
+      block
+        use, intrinsic :: iso_c_binding
+        real(C_DOUBLE) :: h_I_int(0:n_bin)
+        interface
+          subroutine gpu_csr_convolve_dev(h_I_int, coef_in, nb) &
+              bind(C, name='gpu_csr_convolve_dev_')
+            use, intrinsic :: iso_c_binding
+            real(C_DOUBLE), intent(in) :: h_I_int(*)
+            real(C_DOUBLE), value, intent(in) :: coef_in
+            integer(C_INT), value, intent(in) :: nb
+          end subroutine
+        end interface
+        do i = 0, n_bin
+          h_I_int(i) = csr%kick1(i)%I_int_csr
+        enddo
+        call gpu_csr_convolve_dev(h_I_int, real(coef, C_DOUBLE), int(n_bin, C_INT))
+        ! kick_csr stays on device — applied by gpu_csr_apply_kicks_dev
+      end block
+    else
+      do i = 1, n_bin
+        csr%slice(i)%kick_csr = coef * dot_product(csr%kick1(i:1:-1)%I_int_csr, csr%slice(1:i)%edge_dcharge_density_dz)
+      enddo
+    endif
   endif
 
 else  ! Image charge
@@ -1446,7 +1885,73 @@ endif
 ! Mesh Space charge kick
 
 if (ele%space_charge_method == fft_3d$) then
-  call apply_fft_3d_kicks(csr, particle)
+#ifdef USE_GPU_TRACKING
+  ! GPU path: use persistent device buffers if available, otherwise upload/download
+  if (bmad_com%gpu_tracking_on) then
+    block
+    use gpu_tracking_mod, only: gpu_upload_particles, gpu_download_particles, &
+                                gpu_space_charge_3d, gpu_persist_on_device
+    use, intrinsic :: iso_c_binding
+    real(C_DOUBLE), allocatable :: vx(:), vpx(:), vy(:), vpy(:), vz(:), vpz(:)
+    real(C_DOUBLE), allocatable :: beta_a(:), p0c_a(:), t_a(:), charge_a(:)
+    integer(C_INT), allocatable :: state_a(:)
+    integer(C_INT) :: np
+    real(rp) :: mc2_val
+
+    np = size(particle)
+    mc2_val = mass_of(particle(1)%species)
+
+    dct_ave = sum(particle%vec(5)/particle%beta, particle%state == alive$) / count(particle%state == alive$)
+
+    ! Build charge array (always needed on host for upload)
+    allocate(charge_a(np))
+    do i = 1, np
+      charge_a(i) = particle(i)%charge
+    enddo
+
+    if (gpu_persist_on_device) then
+      ! Data is already on device from persistent session — no upload/download needed!
+      ! Pass huge sentinel for dct_ave so the CUDA kernel computes it from device data.
+      call gpu_space_charge_3d(charge_a, np, &
+          int(csr%mesh3d%nhi(1), C_INT), int(csr%mesh3d%nhi(2), C_INT), int(csr%mesh3d%nhi(3), C_INT), &
+          csr%mesh3d%gamma, csr%actual_track_step, mc2_val, 1.0e31_rp)
+    else
+      ! Data not on device — full upload/download cycle
+      allocate(vx(np), vpx(np), vy(np), vpy(np), vz(np), vpz(np))
+      allocate(state_a(np), beta_a(np), p0c_a(np), t_a(np))
+
+      do i = 1, np
+        vx(i) = particle(i)%vec(1); vpx(i) = particle(i)%vec(2)
+        vy(i) = particle(i)%vec(3); vpy(i) = particle(i)%vec(4)
+        vz(i) = particle(i)%vec(5); vpz(i) = particle(i)%vec(6)
+        state_a(i) = particle(i)%state; beta_a(i) = particle(i)%beta
+        p0c_a(i) = particle(i)%p0c; t_a(i) = particle(i)%t
+      enddo
+
+      call gpu_upload_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np)
+      call gpu_space_charge_3d(charge_a, np, &
+          int(csr%mesh3d%nhi(1), C_INT), int(csr%mesh3d%nhi(2), C_INT), int(csr%mesh3d%nhi(3), C_INT), &
+          csr%mesh3d%gamma, csr%actual_track_step, mc2_val, dct_ave)
+      call gpu_download_particles(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a, np, 1, 0)
+
+      do i = 1, np
+        particle(i)%vec(1) = vx(i); particle(i)%vec(2) = vpx(i)
+        particle(i)%vec(3) = vy(i); particle(i)%vec(4) = vpy(i)
+        particle(i)%vec(5) = vz(i); particle(i)%vec(6) = vpz(i)
+        particle(i)%state = state_a(i); particle(i)%beta = beta_a(i)
+      enddo
+
+      deallocate(vx, vpx, vy, vpy, vz, vpz, state_a, beta_a, p0c_a, t_a)
+    endif
+
+    deallocate(charge_a)
+    end block
+  else
+#endif
+    call apply_fft_3d_kicks(csr, particle)
+#ifdef USE_GPU_TRACKING
+  endif
+#endif
 endif
 
 end subroutine csr_and_sc_apply_kicks

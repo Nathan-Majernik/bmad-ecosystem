@@ -95,6 +95,59 @@ util/dist_build_production
 # or util/dist_build_debug
 ```
 
+### GPU-accelerated particle tracking
+
+Bmad supports GPU-accelerated batch particle tracking through supported elements
+via NVIDIA CUDA. This is opt-in at both build time and run time.
+
+**Build time:** In `util/dist_prefs`, set `ACC_ENABLE_GPU_TRACKING` to `Y`.
+The CUDA Toolkit must be available (provides `nvcc` and `libcudart`).
+If the toolkit is not found, the build will proceed without GPU tracking support.
+
+**Run time:** Call `gpu_tracking_init()` at program startup, or set
+`bmad_com%gpu_tracking_on = .true.` directly. The `gpu_tracking_init` routine checks
+for the `ACC_ENABLE_GPU_TRACKING` environment variable and probes for CUDA hardware.
+
+When enabled, eligible elements are tracked on the GPU while unsupported elements
+fall back silently to CPU tracking. GPU tracking is not compatible with spin
+tracking or backward tracking.
+
+**Supported elements:** drift, quadrupole (with fringe), sextupole,
+sbend (with misalignment), lcavity (relative and absolute time tracking), pipe, monitor, and
+instrument. Rectangular and elliptical apertures are checked on device.
+
+**Persistent GPU session:** Particle data stays on the GPU across consecutive
+elements. The first element uploads, subsequent elements run as lightweight
+kernel launches with no host-device transfers, and data is downloaded only when
+a non-GPU element is encountered or tracking completes. This reduces PCIe
+traffic from O(N_elements) round trips to a single round trip.
+
+**Radiation support:** GPU tracking supports both radiation damping
+(`bmad_com%radiation_damping_on`) and radiation fluctuations
+(`bmad_com%radiation_fluctuations_on`). The stochastic and damping matrices from
+Bmad's `radiation_map_setup` are applied on the GPU using cuRAND for Gaussian
+random number generation. Supported elements: quadrupole, sbend, lcavity (drift
+does not produce radiation). The entrance/exit radiation kicks run as separate
+CUDA kernels within the same device session.
+
+**Collective effects:** GPU tracking supports 3D FFT space charge
+(`space_charge_method = fft_3d`) and 1D CSR (`csr_method = 1_dim`).
+The 3D FFT solver uses cuFFT for the convolution, with GPU kernels for
+charge deposition (trilinear with atomicAdd), Green function computation,
+field interpolation, and kick application. CSR particle binning and
+kick application run on GPU while the bin-level kick calculation
+(involving iterative root-finding) remains on CPU.
+
+**Deferred flush:** `bmad_com%gpu_deferred_flush` (default false) skips
+per-element GPU-to-CPU downloads. Tao enables this automatically during beam
+tracking, flushing only at save points. This eliminates the dominant Tao
+overhead and achieves ~22x speedup for large lattices.
+
+```bash
+# Enable GPU tracking at runtime
+export ACC_ENABLE_GPU_TRACKING=Y
+```
+
 ## Contributing to Bmad: Pull Requests
 
 What is a Pull Request? A Pull Request (PR) is a mechanism for requesting that changes that you have made

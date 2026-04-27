@@ -1,0 +1,120 @@
+no_digested
+
+parameter[lattice] = "GPU tracking kitchen sink — all parameters"
+
+beginning[beta_a] = 5
+beginning[beta_b] = 5
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+! FODO-like structure: alternating F/D quads keep beam small.
+! Apertures at 5mm give ~10% loss.
+
+! --- Section 1: Drifts and plain quads ---
+
+d_plain: drift, L = 0.5
+q_plain: quadrupole, L = 0.3, k1 = 2.0
+d_aper: drift, L = 0.3,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+qd1: quadrupole, L = 0.3, k1 = -2.0
+
+! --- Section 2: Quads with features ---
+
+d1: drift, L = 0.3
+q_misalign: quadrupole, L = 0.3, k1 = 2.0,
+    x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005
+d2: drift, L = 0.2
+q_fringe: quadrupole, L = 0.3, k1 = -1.5, fringe_type = full
+d3: drift, L = 0.2
+q_mag_multi: quadrupole, L = 0.3, k1 = 1.5,
+    b2 = 0.1, a2 = 0.02, b3 = 0.05
+d4: drift, L = 0.2
+q_elec: quadrupole, L = 0.3, k1 = -1.5,
+    a0_elec = 200, b1_elec = 100
+
+! --- Section 3: Quad with aperture + combo ---
+
+d5: drift, L = 0.2
+q_aper: quadrupole, L = 0.3, k1 = 1.5,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+d6: drift, L = 0.2
+q_combo: quadrupole, L = 0.3, k1 = -1.5,
+    x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
+    fringe_type = full,
+    b2 = 0.1, a2 = 0.01,
+    a0_elec = 200, b1_elec = 80,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+
+! --- Section 4: Bends (weak, to avoid blowup) ---
+
+d_mid: drift, L = 0.3
+b_plain: sbend, L = 0.5, g = 0.1
+qf_mid: quadrupole, L = 0.3, k1 = 2.0
+b_k1: sbend, L = 0.5, g = 0.08, k1 = 0.3
+qd_mid: quadrupole, L = 0.3, k1 = -2.0
+b_fringe_mis: sbend, L = 0.5, g = 0.1, fringe_type = full,
+    x_offset = 1e-4, y_offset = -1e-4, ref_tilt = 0.003
+qf_mid2: quadrupole, L = 0.3, k1 = 2.0
+b_multi: sbend, L = 0.5, g = 0.1, b2 = 0.1, a2 = 0.02
+
+! --- Section 5: Lcavities ---
+
+d7: drift, L = 0.2
+lc_plain: lcavity, L = 0.5, rf_frequency = 1e9, gradient = 5e4,
+    n_rf_steps = 10
+qd_lc: quadrupole, L = 0.3, k1 = -1.5
+lc_misalign: lcavity, L = 0.5, rf_frequency = 1e9, gradient = 4e4,
+    n_rf_steps = 10,
+    x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
+    phi0 = 0.05, phi0_err = -0.02, voltage_err = 2e3
+
+! --- Section 6: Pipes ---
+
+d8: drift, L = 0.2
+p_plain: pipe, L = 0.5
+p_misalign: pipe, L = 0.5, x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005
+p_aper: pipe, L = 0.5,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+p_combo: pipe, L = 0.5,
+    x_offset = 1e-4, y_offset = -1e-4, tilt = 0.003,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+
+! --- Section 7: Sextupoles ---
+
+d_sext: drift, L = 0.2
+s_plain: sextupole, L = 0.3, k2 = 5.0
+qf_sext: quadrupole, L = 0.3, k1 = 2.0
+s_combo: sextupole, L = 0.3, k2 = -5.0,
+    x_offset = 1e-4, tilt = 0.003,
+    b3 = 50.0, a2 = 3.0
+
+! --- Section 8: Elliptical apertures ---
+
+d9: drift, L = 0.2
+d_ellip: drift, L = 0.3, aperture_type = elliptical,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+qf_end: quadrupole, L = 0.3, k1 = 1.5
+q_ellip: quadrupole, L = 0.3, k1 = -1.5, aperture_type = elliptical,
+    x1_limit = 3e-3, x2_limit = 3e-3,
+    y1_limit = 3e-3, y2_limit = 3e-3
+
+d_final: drift, L = 0.3
+
+lat: line = (d_plain, q_plain, d_aper, qd1,
+             d1, q_misalign, d2, q_fringe, d3, q_mag_multi, d4, q_elec,
+             d5, q_aper, d6, q_combo,
+             d_mid, b_plain, qf_mid, b_k1, qd_mid, b_fringe_mis, qf_mid2, b_multi,
+             d7, lc_plain, qd_lc, lc_misalign,
+             d8, p_plain, p_misalign, p_aper, p_combo,
+             d_sext, s_plain, qf_sext,
+             d9, d_ellip, qf_end, q_ellip, d_final)
+
+use, lat

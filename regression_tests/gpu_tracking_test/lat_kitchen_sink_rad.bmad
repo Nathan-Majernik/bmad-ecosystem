@@ -1,0 +1,33 @@
+no_digested
+
+parameter[lattice] = "GPU radiation kitchen sink — high energy"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 3e9
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+! Drifts
+d1: drift, L = 1.0
+d2: drift, L = 0.5
+
+! Quadrupoles
+q1: quadrupole, L = 0.5, k1 = 0.8
+q2: quadrupole, L = 0.4, k1 = 1.0,
+    x_offset = 2e-4, y_offset = -1e-4, tilt = 0.005,
+    fringe_type = full, b2 = 0.2
+
+! Bends
+b1: sbend, L = 2.0, g = 0.2
+b2: sbend, L = 1.5, g = 0.15, k1 = 0.3, fringe_type = full,
+    x_offset = 1e-4, b2 = 0.1
+
+! Lcavity
+lc1: lcavity, L = 1.0, rf_frequency = 500e6, gradient = 1e6,
+    n_rf_steps = 10
+
+lat: line = (d1, q1, b1, d2, q2, b2, lc1, d1)
+
+use, lat

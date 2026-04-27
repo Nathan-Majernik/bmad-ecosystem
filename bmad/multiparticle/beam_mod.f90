@@ -102,6 +102,8 @@ end subroutine track_beam
 
 subroutine track_bunch (lat, bunch, ele1, ele2, err, centroid, direction, bunch_track)
 
+use gpu_tracking_mod, only: track_bunch_thru_elements_gpu, ele_gpu_eligible, gpu_persistent_flush
+
 implicit none
 
 type (lat_struct), target :: lat
@@ -150,9 +152,31 @@ if (integer_option(1, direction) == -1) then
 
 else
   if (e1%ix_ele < e2%ix_ele) then
-    do i = e1%ix_ele+1, e2%ix_ele
+    i = e1%ix_ele + 1
+    do while (i <= e2%ix_ele)
+      ! Try multi-element GPU batch tracking
+      ! Multi-element GPU dispatch: skip when CSR/SC is active on this element
+      ! or the next, since track_bunch_thru_elements_gpu does not apply CSR or
+      ! space-charge kicks. Such elements must go through track1_bunch_csr.
+      if (bmad_com%gpu_tracking_on .and. ele_gpu_eligible(branch%ele(i)) .and. &
+          .not. bmad_com%spin_tracking_on .and. .not. bmad_com%high_energy_space_charge_on .and. &
+          bunch%particle(1)%direction == 1 .and. bunch%particle(1)%time_dir == 1 .and. &
+          .not. present(bunch_track) .and. &
+          i < e2%ix_ele .and. i+1 <= branch%n_ele_track .and. &
+          ele_gpu_eligible(branch%ele(i+1)) .and. &
+          .not. (bmad_com%csr_and_space_charge_on .and. &
+                 (branch%ele(i)%csr_method /= off$ .or. branch%ele(i)%space_charge_method /= off$ .or. &
+                  branch%ele(i+1)%csr_method /= off$ .or. branch%ele(i+1)%space_charge_method /= off$))) then
+        call track_bunch_thru_elements_gpu(bunch, branch, i, e2%ix_ele, j)
+        if (j >= i) then
+          i = j + 1
+          cycle
+        endif
+      endif
+      ! Fall back to per-element tracking
       call track1_bunch (bunch, branch%ele(i), err, centroid, direction, bunch_track)
       if (err) return
+      i = i + 1
     enddo
 
   else
@@ -165,6 +189,14 @@ else
       if (err) return
     enddo
   endif
+endif
+
+! Flush persistent GPU data back to bunch.
+! When gpu_deferred_flush is on, the caller has explicitly requested deferred
+! flushing and is responsible for flushing when it needs CPU-side data.
+! Respect this even with CSR/SC active — the caller controls flush points.
+if (bmad_com%gpu_tracking_on .and. .not. bmad_com%gpu_deferred_flush) then
+  call gpu_persistent_flush(bunch, branch%ele(e2%ix_ele))
 endif
 
 end subroutine track_bunch
@@ -239,6 +271,7 @@ subroutine track1_bunch (bunch, ele, err, centroid, direction, bunch_track)
 
 use csr_and_space_charge_mod, only: track1_bunch_csr, track1_bunch_csr3d
 use beam_utils, only: track1_bunch_hom
+use gpu_tracking_mod, only: gpu_persistent_flush
 use space_charge_mod, only: track_bunch_to_t, track_bunch_to_s
 
 implicit none
@@ -298,17 +331,28 @@ if (ele%csr_method /= off$ .and. time_rk_tracking) then
   goto 9000  ! Mark all particles as lost and return
 endif
 
-! 
+!
+
+! Flush persistent GPU state before SC paths that aren't GPU-aware.
+! track1_bunch_csr IS GPU-aware and uses persistent device data directly.
+if (csr_sc_on .and. ele%key /= match$ .and. bmad_com%gpu_tracking_on) then
+  if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then
+    call gpu_persistent_flush(bunch, ele)  ! track1_bunch_space_charge not GPU-aware
+  elseif (ele%csr_method == steady_state_3d$) then
+    call gpu_persistent_flush(bunch, ele)  ! track1_bunch_csr3d not GPU-aware
+  endif
+  ! track1_bunch_csr: don't flush — it uses persistent device data for GPU CSR
+endif
 
 if (csr_sc_on .and. ele%key /= match$) then
-  if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then 
+  if (ele%csr_method == off$ .and. sc_fft_on .and. time_rk_tracking) then
     call track1_bunch_space_charge (bunch, ele, err, bunch_track = bunch_track)
     track1_bunch_space_charge_called = .true.
 
   elseif (ele%csr_method == steady_state_3d$) then
     if (bunch%drift_between_t_and_s) call correct_s_t_tracking_conversion(bunch, ele)
     call track1_bunch_csr3d(bunch, ele, centroid, err, bunch_track = bunch_track)
-     
+
   else
     if (.not. present(centroid)) then
       call out_io (s_fatal$, r_name, 'BUNCH CENTROID MUST BE SUPPLIED FOR CSR CALCULATION!')

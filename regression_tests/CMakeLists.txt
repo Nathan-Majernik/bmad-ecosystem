@@ -68,6 +68,22 @@ set (EXE_SPECS
   cmake_files/cmake.perf_lsc
 )
 
+# GPU tracking tests — only built when ACC_ENABLE_GPU_TRACKING=Y
+IF ("$ENV{ACC_ENABLE_GPU_TRACKING}" STREQUAL "Y")
+  list(APPEND EXE_SPECS
+    cmake_files/cmake.gpu_tracking_test
+    cmake_files/cmake.gpu_tracking_stress_test
+    cmake_files/cmake.gpu_bend_benchmark
+    cmake_files/cmake.gpu_rad_test
+    cmake_files/cmake.gpu_sc_test
+    cmake_files/cmake.gpu_sc_bench_drift
+    cmake_files/cmake.gpu_sc_bench_bend
+    cmake_files/cmake.gpu_sc_debug
+    cmake_files/cmake.gpu_fringe_test
+    cmake_files/cmake.gpu_debug_rad
+  )
+ENDIF ()
+
 set(SRC_DIRS
 )
 

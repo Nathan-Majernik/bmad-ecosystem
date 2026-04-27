@@ -31,7 +31,7 @@ type (ele_struct), target :: ele
 type (bunch_track_struct), optional :: bunch_track
 type (branch_struct), pointer :: branch
 type (coord_struct), pointer :: p
-type (em_field_struct) :: sc_field(size(bunch%particle))
+type (em_field_struct), allocatable :: sc_field(:)
 
 integer i, n
 logical err, finished, include_image
@@ -89,7 +89,9 @@ if (n>0) then
 endif
 
 ! Track.
-! sc_field allocated here and passed into sc_step and sc_adaptive_step to save allocating sc_field multiple times.
+! sc_field allocated on the heap (not stack) to avoid stack overflow with large bunches.
+
+allocate(sc_field(size(bunch%particle)))
 
 do
   ! Track a step

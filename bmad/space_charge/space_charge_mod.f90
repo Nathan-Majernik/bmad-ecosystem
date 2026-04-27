@@ -36,9 +36,9 @@ end type
 type (bunch_struct), target :: bunch
 type (branch_struct), target :: branch
 type (coord_struct), pointer :: p
-type (csr_particle_position_struct) :: position(size(bunch%particle))
-type (this_w_struct) :: w(size(bunch%particle))
-type (em_field_struct) :: sc_field(size(bunch%particle))
+type (csr_particle_position_struct), allocatable :: position(:)
+type (this_w_struct), allocatable :: w(:)
+type (em_field_struct) :: sc_field(:)
 type (mesh3d_struct) :: mesh3d, mesh3d_image
 type (bunch_params_struct), optional :: bunch_params
 type (floor_position_struct) pos, pos0
@@ -50,6 +50,10 @@ logical :: include_image, err, bend_here
 ! Arrays for batch interpolation
 real(rp), allocatable :: x_interp(:), y_interp(:), z_interp(:), E_batch(:,:), B_batch(:,:)
 integer, allocatable :: interp_idx(:)
+
+! Allocate large local arrays on heap (not stack) to avoid stack overflow with large bunches
+n = size(bunch%particle)
+allocate(position(n), w(n))
 
 ! Initialize variables
 mesh3d%nhi = space_charge_com%space_charge_mesh_size
@@ -223,7 +227,6 @@ implicit none
 
 type (bunch_struct), target :: bunch
 type (ele_struct) :: ele
-type (em_field_struct) :: extra_field(size(bunch%particle))
 type (coord_struct), pointer :: p
 type (em_field_struct) :: sc_field(:)
 type (bunch_params_struct) :: bunch_params

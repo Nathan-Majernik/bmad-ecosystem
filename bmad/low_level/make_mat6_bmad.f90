@@ -51,7 +51,7 @@ if (.not. ele%is_on) then
     call set_end_orb
     return
 
-  case (ab_multipole$, multipole$, lcavity$, sbend$, patch$)
+  case (ab_multipole$, multipole$, lcavity$, sbend$, rf_bend$, patch$)
     ! Nothing to do here
 
   case default
@@ -64,7 +64,7 @@ if (key == sol_quad$ .and. ele%value(k1$) == 0) key = solenoid$
 !---------------------------------------------------------
 
 select case (key)
-case (ab_multipole$, crab_cavity$, sad_mult$, beambeam$, sbend$, patch$, quadrupole$, drift$, &
+case (ab_multipole$, crab_cavity$, sad_mult$, beambeam$, sbend$, rf_bend$, patch$, quadrupole$, drift$, &
       rcollimator$, ecollimator$, monitor$, instrument$, pipe$, kicker$, hkicker$, vkicker$, &
       elseparator$, rfcavity$, lcavity$, match$, multipole$, octupole$, thick_multipole$, sextupole$, &
       sol_quad$, solenoid$, taylor$, wiggler$, undulator$, ac_kicker$, gkicker$, foil$, pickup$)

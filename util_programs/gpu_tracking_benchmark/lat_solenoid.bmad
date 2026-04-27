@@ -1,0 +1,16 @@
+no_digested
+
+parameter[lattice] = "GPU benchmark: Solenoid"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 10e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+sol1: solenoid, L = 0.5, ks = 0.8
+
+lat: line = (sol1)
+
+use, lat

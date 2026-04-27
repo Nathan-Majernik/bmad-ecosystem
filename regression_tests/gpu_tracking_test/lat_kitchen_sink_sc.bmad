@@ -1,0 +1,32 @@
+no_digested
+
+parameter[lattice] = "GPU kitchen sink with space charge + CSR"
+
+beginning[beta_a] = 10
+beginning[beta_b] = 10
+parameter[e_tot] = 100e6
+parameter[particle] = electron
+
+parameter[geometry] = open
+
+! Drift with space charge
+d_sc: drift, L = 0.5, space_charge_method = fft_3d
+
+! Plain drift (no SC)
+d_plain: drift, L = 0.5
+
+! Quad
+q1: quadrupole, L = 0.3, k1 = 0.8
+
+! Bend with CSR
+b_csr: sbend, L = 1.0, g = 0.3, csr_method = 1_dim
+
+! Bend with CSR + space charge
+b_csr_sc: sbend, L = 0.8, g = 0.2, csr_method = 1_dim, space_charge_method = fft_3d
+
+! Drift with space charge
+d_sc2: drift, L = 0.3, space_charge_method = fft_3d
+
+lat: line = (d_sc, q1, b_csr, d_plain, b_csr_sc, d_sc2)
+
+use, lat
