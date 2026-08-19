@@ -595,9 +595,16 @@ do
         if (ix_slice == n_slice) ix_slice = -1
       endif
 
+      ! A tracking failure for one element is not fatal: keep the beam tracked so far and stop
+      ! gracefully (like the too-many-particles-lost and radiation_map_setup cases) instead of
+      ! discarding everything. Notably, a CSR calculation that gives up because the number of live
+      ! particles has dropped below space_charge_com%n_bin would otherwise throw away the very
+      ! particle loss information the run is trying to measure.
       if (err) then
+        ix_track = ie
+        tao_model_ele(ie)%beam = beam   ! Make sure we save lost info.
         calc_ok = .false.
-        return
+        exit
       endif
     endif
 
