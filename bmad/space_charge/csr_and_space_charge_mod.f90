@@ -220,8 +220,20 @@ n_step = max (1, nint(ele%value(l$) / csr%ds_track_step))
 csr%ds_track_step = ele%value(l$) / n_step
 
 ! Calculate beam centroid info at element edges, etc.
+! Only centroid info at and upstream of the kick element is used in the CSR calculation.
+! If the particle used to generate the centroid orbit was lost, the centroid entries at and
+! downstream of the loss point are not valid trajectory points and must not be used.
 
-n = min(ele%ix_ele+10, branch%n_ele_track)
+n = ele%ix_ele
+
+do i = 0, n
+  if (centroid(i)%state == alive$) cycle
+  call out_io (s_error$, r_name, 'CENTROID ORBIT NOT VALID AT ELEMENT: ' // trim(branch%ele(i)%name) // '  [# \i0\] ', &
+                'PROBABLY THE PARTICLE TRACKED TO GENERATE THE CENTROID ORBIT WAS LOST THERE.', &
+                'CSR CANNOT BE CALCULATED FOR BUNCH TRACKING THROUGH ELEMENT: ' // trim(ele%name), i_array = [i])
+  return
+enddo
+
 allocate (csr%eleinfo(0:n))
 
 do i = 0, n
