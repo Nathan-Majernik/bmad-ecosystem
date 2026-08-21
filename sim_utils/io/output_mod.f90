@@ -211,6 +211,20 @@ character(len(line)+20) line_out
 line_out = line
 if (logic_option(.true., indent)) line_out = blank(1:out_io_com%indent_num(level)) // trim(line_out)
 
+! Emitting a line mutates shared state: the capture buffer (out_io_com%n_buffer_lines and the
+! out_io_com%buffer allocation) and the file/terminal units. out_io is reachable from inside OpenMP
+! parallel regions -- track1_bunch_hom tracks the particles of a bunch in parallel, and a per-particle
+! tracking error will call out_io from each thread. Without serialization two threads can grow the
+! capture buffer at once, which corrupts the heap and aborts the program. Serialize the whole
+! emission so a line is also never interleaved with another thread's.
+!
+! The region MUST be named. All unnamed critical regions in a program share a single lock, and callers
+! already guard their own out_io calls with an unnamed critical (see csr_and_sc_apply_kicks in
+! csr_and_space_charge_mod.f90). An unnamed region here would re-enter that same lock -- critical
+! regions are not reentrant -- and deadlock.
+
+!$OMP critical (out_io_emit)
+
 ! Output to file
 
 if (out_io_direct%file_unit(level) > -1) write (out_io_direct%file_unit(level), '(a)') trim(line_out)
@@ -233,6 +247,8 @@ if (out_io_direct%print_and_capture(level) .and. out_io_com%capture_state == 'UN
   if (out_io_com%capture_lines_null_terminated) line_out = trim(line_out) // char(0)
   call out_io_line(trim(line_out))
 endif
+
+!$OMP end critical (out_io_emit)
 
 end subroutine out_io_line_out
 
