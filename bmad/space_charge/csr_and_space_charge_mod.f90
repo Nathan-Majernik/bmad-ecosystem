@@ -220,18 +220,24 @@ n_step = max (1, nint(ele%value(l$) / csr%ds_track_step))
 csr%ds_track_step = ele%value(l$) / n_step
 
 ! Calculate beam centroid info at element edges, etc.
-! Only centroid info at and upstream of the kick element is used in the CSR calculation.
 ! If the particle used to generate the centroid orbit was lost, the centroid entries at and
 ! downstream of the loss point are not valid trajectory points and must not be used.
+! Entries at and upstream of the kick element are always needed so it is an error if any of
+! them is not valid. The lookahead entries downstream of the kick element are only needed in
+! exceptional cases (see s_source_calc) so just truncate the array at the last valid entry.
 
-n = ele%ix_ele
+n = min(ele%ix_ele+10, branch%n_ele_track)
 
 do i = 0, n
   if (centroid(i)%state == alive$) cycle
-  call out_io (s_error$, r_name, 'CENTROID ORBIT NOT VALID AT ELEMENT: ' // trim(branch%ele(i)%name) // '  [# \i0\] ', &
-                'PROBABLY THE PARTICLE TRACKED TO GENERATE THE CENTROID ORBIT WAS LOST THERE.', &
-                'CSR CANNOT BE CALCULATED FOR BUNCH TRACKING THROUGH ELEMENT: ' // trim(ele%name), i_array = [i])
-  return
+  if (i <= ele%ix_ele) then
+    call out_io (s_error$, r_name, 'CENTROID ORBIT NOT VALID AT ELEMENT: ' // trim(branch%ele(i)%name) // '  [# \i0\] ', &
+                  'PROBABLY THE PARTICLE TRACKED TO GENERATE THE CENTROID ORBIT WAS LOST THERE.', &
+                  'CSR CANNOT BE CALCULATED FOR BUNCH TRACKING THROUGH ELEMENT: ' // trim(ele%name), i_array = [i])
+    return
+  endif
+  n = i - 1
+  exit
 enddo
 
 allocate (csr%eleinfo(0:n))
@@ -891,6 +897,19 @@ csr_csr_ptr => csr
 csr_dr_match_ptr => dr_match
 
 do
+
+  ! The centroid info array may be truncated before the +10 element lookahead if the particle used
+  ! to generate the centroid orbit was lost downstream of the kick element (see track1_bunch_csr).
+  ! If the source point search actually needs an entry that is not there, it is an error.
+
+  if (kick1%ix_ele_source > ubound(csr%eleinfo, 1)) then
+    call out_io (s_error$, r_name, 'CSR SOURCE POINT SEARCH NEEDS BEAM CENTROID INFO AT ELEMENT # \i0\ ', &
+        'WHICH IS PAST THE END OF THE COMPUTED CENTROID INFO ARRAY. POSSIBLY THE PARTICLE TRACKED TO', &
+        'GENERATE THE CENTROID ORBIT WAS LOST THERE. WHILE TRACKING THROUGH ELEMENT: ' // trim(csr%kick_ele%name), &
+        i_array = [kick1%ix_ele_source])
+    err_flag = .true.
+    return
+  endif
 
   einfo_s => csr%eleinfo(kick1%ix_ele_source)
   csr_einfo_s_ptr => einfo_s
