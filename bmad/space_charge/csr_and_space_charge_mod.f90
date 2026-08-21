@@ -1001,9 +1001,13 @@ do
     last_step = 1
     kick1%ix_ele_source = kick1%ix_ele_source + 1
 
-    if (csr%eleinfo(kick1%ix_ele_source)%ele%key == match$) then
-      dr_match = 0
-      kick1%ix_ele_source = kick1%ix_ele_source + 1
+    ! If past the end of the centroid info array, skip the match element check. The bounds
+    ! check at the top of the loop will generate an error.
+    if (kick1%ix_ele_source <= ubound(csr%eleinfo, 1)) then
+      if (csr%eleinfo(kick1%ix_ele_source)%ele%key == match$) then
+        dr_match = 0
+        kick1%ix_ele_source = kick1%ix_ele_source + 1
+      endif
     endif
 
     cycle
