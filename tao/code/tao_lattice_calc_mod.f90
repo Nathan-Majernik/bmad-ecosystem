@@ -457,6 +457,7 @@ type (tao_model_branch_struct), pointer :: model_branch
 type (bunch_params_struct) :: bunch_params
 type (bunch_track_struct), pointer :: bunch_params_comb(:)
 type (rad_map_ele_struct) rad_map_save
+type (coord_struct), allocatable :: cent(:)
 
 real(rp) sig(6,6), significant_length, s_slice_start, s_slice_end, s_travel
 real(rp) :: value1, value2, f, time0, time, old_time, s_start, s_end, s_target, ds_save
@@ -469,7 +470,7 @@ integer, allocatable :: ix_ele(:)
 character(*), parameter :: r_name = "tao_beam_track"
 
 logical calc_ok, print_err, err, new_beam_file, can_save
-logical comb_calc_on, csr_sc_on, radiation_on
+logical comb_calc_on, csr_sc_on, radiation_on, use_meas_cent
 
 ! Initialize 
 
@@ -536,6 +537,22 @@ if (ie_end < ie_start .and. branch%param%geometry == open$) then
   return
 endif
 
+! The CSR / space charge calc needs an approximate beam centroid trajectory. Normally the single
+! particle orbit is handed over. But if that particle was lost, track_all zeroes the orbit array
+! downstream of the loss point (see set_orbit_to_zero) so it is not a trajectory there and the CSR
+! calc cannot use it. This is a common situation when tracking through a lattice with errors since
+! the beam may well outlive the single particle. In this case use the measured bunch centroid
+! instead: elements already tracked have a measured centroid and the elements the CSR calc looks
+! ahead to are filled in by tracking a particle launched from the last measured centroid.
+
+use_meas_cent = (bmad_com%csr_and_space_charge_on .and. &
+                                   any(tao_branch%orbit(0:branch%n_ele_track)%state /= alive$))
+if (use_meas_cent) then
+  if (allocated(cent)) deallocate(cent)
+  allocate (cent(0:ubound(tao_branch%orbit, 1)))
+  cent = tao_branch%orbit
+endif
+
 n_loop = 0    ! Used for debugging
 n_lost_old = 0
 ie = ie_start
@@ -567,7 +584,12 @@ do
             exit
           endif
         endif
-        call track_beam (lat, beam, branch%ele(ie-1), ele, err, centroid = tao_branch%orbit, bunch_tracks = bunch_params_comb)
+        if (use_meas_cent) then
+          call fill_centroid (ie)
+          call track_beam (lat, beam, branch%ele(ie-1), ele, err, centroid = cent, bunch_tracks = bunch_params_comb)
+        else
+          call track_beam (lat, beam, branch%ele(ie-1), ele, err, centroid = tao_branch%orbit, bunch_tracks = bunch_params_comb)
+        endif
 
       else
         if (ix_slice == -1) then
@@ -672,6 +694,12 @@ do
 
   if (ix_slice == -1) tao_branch%bunch_params(ie) = bunch_params
 
+  ! A measured centroid supersedes anything predicted by fill_centroid.
+
+  if (use_meas_cent .and. ix_slice == -1 .and. bunch_params%n_particle_live > 0) then
+    cent(ie) = bunch_params%centroid
+  endif
+
   ! Timer
 
   if (s%global%beam_timer_on) then
@@ -739,6 +767,49 @@ end function point_to_this_ele
 
 ! A radiation_map_setup failure for one element is not fatal: keep the beam tracked so far
 ! and stop gracefully (like the too-many-particles-lost case) instead of discarding everything.
+
+!+
+! Subroutine fill_centroid (ie_now)
+!
+! Fill in the centroid array for the element being tracked and for the elements the CSR calc looks
+! ahead to. A particle is launched from the last measured bunch centroid and tracked forward.
+!
+! Apertures are turned off so this particle is not lost: it stands in for the trajectory of a bunch
+! that is still alive, so stopping it at a wall would put a false endpoint in the centroid array.
+! If it cannot be tracked anyway the remaining entries are left alone. The CSR calc tolerates
+! missing entries downstream of the element being tracked and will flag anything else.
+!-
+
+subroutine fill_centroid (ie_now)
+
+type (coord_struct) orb
+integer ie_now, j, j_end
+logical aperture_save, err_track
+
+!
+
+if (ie_now < 1) return
+if (cent(ie_now-1)%state /= alive$) return   ! No measured centroid to start from.
+
+orb = cent(ie_now-1)
+j_end = min(ie_now+10, branch%n_ele_track)   ! Matches the lookahead of track1_bunch_csr.
+
+aperture_save = bmad_com%aperture_limit_on
+bmad_com%aperture_limit_on = .false.
+
+do j = ie_now, j_end
+  call track1 (orb, branch%ele(j), branch%param, orb, err_flag = err_track)
+  if (err_track) exit
+  if (orb%state /= alive$) exit
+  cent(j) = orb
+enddo
+
+bmad_com%aperture_limit_on = aperture_save
+
+end subroutine fill_centroid
+
+!------------------------------------------------------------------------------
+! contains
 
 subroutine stop_beam_track_on_rad_error ()
 
